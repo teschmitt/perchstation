@@ -31,6 +31,8 @@ async-trait          = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+qrcode   = { workspace = true }
+tokio    = { workspace = true }
 
 [lints]
 workspace = true

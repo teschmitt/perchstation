@@ -53,9 +53,11 @@ perchstation-hw   = { path = "../perchstation-hw" }
 tokio             = { workspace = true }
 clap              = { workspace = true }
 anyhow            = { workspace = true }
+thiserror         = { workspace = true }
 tracing           = { workspace = true }
 tracing-subscriber = { workspace = true }
 sd-notify         = { workspace = true }
+chrono            = { workspace = true }
 
 # Dev-only deps used by the fakepub binary. These are listed in
 # [dependencies] (not [dev-dependencies]) because Cargo only resolves

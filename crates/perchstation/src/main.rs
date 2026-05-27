@@ -9,7 +9,8 @@ use perchstation_core::observability::tracing::{self as obs_tracing, LogFormat};
 
 use crate::cli::{Cli, Command, exit};
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let args = Cli::parse();
 
     // Initialise tracing before we try to load config so config errors are
@@ -34,20 +35,17 @@ fn main() {
     };
 
     let result = match args.command {
-        Command::Enroll(enroll_args) => commands::enroll::run(enroll_args, &config),
-        Command::Serve => commands::serve::run(&config),
-        Command::Status(status_args) => commands::status::run(status_args, &config),
+        Command::Enroll(enroll_args) => commands::enroll::run(enroll_args, &config).await,
+        Command::Serve => commands::serve::run(&config).await,
+        Command::Status(status_args) => commands::status::run(status_args, &config).await,
     };
 
     match result {
         Ok(()) => std::process::exit(exit::OK),
         Err(err) => {
-            tracing::error!(message = %err, "command failed");
-            // Default failure code is `IO`; subcommands that need to signal
-            // a more specific code (CONFIG / TRANSIENT / UNRECOVERABLE)
-            // attach a typed error and re-classify here in their landing
-            // tasks (T027/T038/T057).
-            std::process::exit(exit::IO);
+            let code = err.exit_code();
+            tracing::error!(message = %err, exit_code = code, "command failed");
+            std::process::exit(code);
         }
     }
 }

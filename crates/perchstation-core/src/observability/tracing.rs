@@ -58,6 +58,11 @@ pub fn init(format: LogFormat, level: &str) -> Result<(), TracingInitError> {
         LogFormat::Json => {
             let subscriber = tracing_subscriber::fmt()
                 .json()
+                // Flatten event fields into the JSON root so downstream
+                // tooling can match on `event` / `clip_id` / `station_id`
+                // without unwrapping a `fields` object — matches the schema
+                // documented in `contracts/log-events.md` §Common fields.
+                .flatten_event(true)
                 .with_current_span(true)
                 .with_span_list(false)
                 .with_env_filter(filter)
@@ -99,6 +104,11 @@ pub mod events {
     pub const ENROLLMENT_REFUSED_OVERWRITE: &str = "enrollment.refused_overwrite";
     pub const ENROLLMENT_FAILED: &str = "enrollment.failed";
     pub const ENROLLMENT_SESSION_INVALID: &str = "enrollment.session_invalid";
+    /// Fired in addition to `enrollment.persisted` whenever
+    /// `perchstation enroll --force` overwrote a pre-existing identity.
+    /// Carries `previous_station_id` and `station_id` so the operator
+    /// can audit the substitution in journald.
+    pub const ENROLLMENT_OVERWRITTEN: &str = "enrollment.overwritten";
 
     // Queue
     pub const QUEUE_ENQUEUED: &str = "queue.enqueued";

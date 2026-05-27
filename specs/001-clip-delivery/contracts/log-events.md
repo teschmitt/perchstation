@@ -36,7 +36,9 @@ listed below and changes only with an explicit version bump.
 | `enrollment.persisted`        | info   | `station_id`, `cert_not_after`        | Credentials written to disk                               |
 | `enrollment.refused`          | warn   | `reason`                              | `EnrollmentResponse.success == false`                     |
 | `enrollment.refused_overwrite`| error  | `existing_station_id`                 | `enroll` invoked with credentials present, no `--force`   |
+| `enrollment.overwritten`      | warn   | `previous_station_id`, `station_id`   | `enroll --force` replaced an existing identity (audit trail) |
 | `enrollment.failed`           | error  | `kind`, `message`                     | Network/TLS/validation failure (no credentials written)   |
+| `enrollment.session_invalid`  | error  | `status`                              | perchpub rejected the enrollment session (422); operator must restart enrollment |
 
 ### Queue
 

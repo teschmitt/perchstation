@@ -16,6 +16,8 @@ chrono            = { workspace = true }
 anyhow            = { workspace = true }
 thiserror         = { workspace = true }
 tracing           = { workspace = true }
+async-trait       = { workspace = true }
+tempfile          = { workspace = true }
 
 [lints.rust]
 # `unsafe_code` is the workspace default `deny`. This crate is the documented
