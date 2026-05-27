@@ -14,6 +14,7 @@
 //! `Delivered` from `Undeliverable`.
 
 pub mod inbox;
+pub mod policy;
 pub mod store;
 
 use chrono::{DateTime, Utc};
@@ -85,6 +86,12 @@ pub struct ClipQueueEntry {
     pub delivered_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_classify_status: Option<ClassifyTaskStatus>,
+    /// Set when the classify-task poll observes a 404/422 (T052). The
+    /// upload itself succeeded (`outcome: Delivered`); only the
+    /// post-upload disposition is lost. Once set, the poller stops
+    /// touching this entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classify_lost_at: Option<DateTime<Utc>>,
 }
 
 impl ClipQueueEntry {
@@ -110,6 +117,7 @@ impl ClipQueueEntry {
             classify_task_id: None,
             delivered_at: None,
             last_classify_status: None,
+            classify_lost_at: None,
         }
     }
 
@@ -140,6 +148,30 @@ pub enum QueueError {
     },
     #[error("queue entry `{clip_id}` is missing its `.mp4` media file")]
     MissingMedia { clip_id: String },
+    /// Local filesystem reports `ENOSPC` (`io::ErrorKind::StorageFull`)
+    /// during a queue write. Surfaced to the runner so it can sleep on
+    /// the retry-tier backoff rather than tight-loop.
+    #[error("disk full while writing queue entry at `{path}`")]
+    DiskFull { path: std::path::PathBuf },
+}
+
+/// Surface returned by [`crate::queue::inbox::Inbox`]: store-level
+/// failures (`Queue`) plus the policy-level [`InboxError::QueueFull`]
+/// case the [`crate::queue::policy::PolicyInbox`] wrapper introduces.
+///
+/// Why a separate error type rather than another `QueueError` variant:
+/// queue-full is a *configured* policy refusal that the capture side
+/// (US2 acceptance #3) is expected to handle distinctly from a
+/// filesystem failure, e.g. by dropping the new clip and emitting a
+/// distinct event.
+#[derive(Debug, Error)]
+pub enum InboxError {
+    /// Queue is at its configured `max_clips` / `max_bytes` ceiling and
+    /// the configured eviction policy is `refuse_new`.
+    #[error("queue full ({current_clips}/{max_clips} clips, {current_bytes}/{max_bytes} bytes)")]
+    QueueFull { current_clips: u32, max_clips: u32, current_bytes: u64, max_bytes: u64 },
+    #[error(transparent)]
+    Queue(#[from] QueueError),
 }
 
 #[cfg(test)]

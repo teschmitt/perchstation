@@ -47,7 +47,8 @@ listed below and changes only with an explicit version bump.
 | `queue.enqueued`              | info   | `clip_id`, `byte_size`                | Clip moved into `pending/`                                |
 | `queue.recovered_inflight`    | warn   | `clip_id`                              | Boot reconciliation re-queued an `inflight/` entry        |
 | `queue.evicted`               | warn   | `clip_id`, `reason`, `policy`, `remaining_clips`, `remaining_bytes` | Eviction policy dropped a clip                             |
-| `queue.zero_length_skipped`   | warn   | `clip_id`                              | Local pre-flight detected a zero-length or unreadable clip |
+| `queue.zero_length_skipped`   | warn   | `clip_id`, `kind`                      | Local pre-flight detected a zero-length or unreadable clip |
+| `queue.disk_full`             | error  | `path`                                 | Queue write returned `ENOSPC`; runner backs off            |
 
 ### Delivery
 

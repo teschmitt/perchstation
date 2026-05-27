@@ -4,15 +4,16 @@
 //! [`Inbox::submit`] once per captured clip; the default
 //! [`StoreInbox`] delegates straight to [`super::store::QueueStore::enqueue`].
 //!
-//! Eviction-policy interception (T047) and zero-length / unreadable
-//! pre-flight (T049) wrap this trait in later phases.
+//! Eviction-policy interception (T047) wraps this trait via
+//! [`super::policy::PolicyInbox`]; zero-length / unreadable pre-flight
+//! (T049) lives in the delivery loop on the receiving end.
 
 use std::path::Path;
 
 use async_trait::async_trait;
 
 use super::store::{ClipMeta, QueueStore};
-use super::{ClipQueueEntry, QueueError};
+use super::{ClipQueueEntry, InboxError};
 
 /// Capture → delivery handoff. Implementations are `Send + Sync` so the
 /// capture loop can hold them across `await` points and share them with
@@ -22,7 +23,7 @@ pub trait Inbox: Send + Sync {
     /// Move `clip_path` (and its associated [`ClipMeta`]) into the
     /// `pending/` queue. Returns the resulting [`ClipQueueEntry`] so the
     /// caller can correlate logs with the assigned clip-id.
-    async fn submit(&self, clip_path: &Path, meta: ClipMeta) -> Result<ClipQueueEntry, QueueError>;
+    async fn submit(&self, clip_path: &Path, meta: ClipMeta) -> Result<ClipQueueEntry, InboxError>;
 }
 
 /// Default [`Inbox`] backed by a [`QueueStore`]. Filesystem ops are sync,
@@ -41,12 +42,13 @@ impl StoreInbox {
 
 #[async_trait]
 impl Inbox for StoreInbox {
-    async fn submit(&self, clip_path: &Path, meta: ClipMeta) -> Result<ClipQueueEntry, QueueError> {
+    async fn submit(&self, clip_path: &Path, meta: ClipMeta) -> Result<ClipQueueEntry, InboxError> {
         let store = self.store.clone();
         let path = clip_path.to_path_buf();
-        tokio::task::spawn_blocking(move || store.enqueue(&path, meta))
+        let outcome = tokio::task::spawn_blocking(move || store.enqueue(&path, meta))
             .await
-            .expect("queue enqueue task panicked")
+            .expect("queue enqueue task panicked")?;
+        Ok(outcome)
     }
 }
 

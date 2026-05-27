@@ -47,6 +47,31 @@ name    = "enrollment_session_expired"
 path    = "../../tests/integration/enrollment_session_expired.rs"
 harness = true
 
+[[test]]
+name    = "outage_recovery"
+path    = "../../tests/integration/outage_recovery.rs"
+harness = true
+
+[[test]]
+name    = "queue_eviction"
+path    = "../../tests/integration/queue_eviction.rs"
+harness = true
+
+[[test]]
+name    = "permanent_failure"
+path    = "../../tests/integration/permanent_failure.rs"
+harness = true
+
+[[test]]
+name    = "crash_recovery"
+path    = "../../tests/integration/crash_recovery.rs"
+harness = true
+
+[[test]]
+name    = "clock_skew_tolerance"
+path    = "../../tests/integration/clock_skew_tolerance.rs"
+harness = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }

@@ -1,26 +1,18 @@
-//! Classify-task poller (T037, MVP scope).
+//! Classify-task poller (T037 + T052).
 //!
 //! Scans `<data_dir>/queue/delivered/` for entries whose
-//! `last_classify_status` is non-terminal, calls
-//! [`PerchpubClient::get_classify_task`] for each, and updates the sidecar
-//! with the latest status.
+//! `last_classify_status` is non-terminal and whose `classify_lost_at`
+//! is unset, calls [`PerchpubClient::get_classify_task`] for each, and
+//! updates the sidecar with the latest status.
 //!
-//! ## Cadence (MVP vs production)
+//! Per `contracts/perchpub-api.md` §3, polling errors are classified:
 //!
-//! Production guidance in `contracts/perchpub-api.md` §Polling cadence is
-//! "30 s for `Prepared`/`Queued`/`Processing`". The MVP integration test
-//! (`tests/integration/delivery_happy.rs`) breaks its wait loop the
-//! instant the `delivered/<id>.json` sidecar appears and then SIGKILLs
-//! the process — the poller has, in the worst case, ~100 ms to observe
-//! the sidecar AND fire both `classify.polled` (non-terminal) and
-//! `classify.terminal`. The fake perchpub flips `Prepared` → `Success` on
-//! the second poll of a given task-id, so the loop must issue at least
-//! two `GET /classify-task/{id}` calls inside that window.
-//!
-//! Hence the MVP scan cadence is tight ([`ACTIVE_SCAN_TICK`] = 5 ms while
-//! there's at least one non-terminal entry, [`IDLE_SCAN_TICK`] = 50 ms
-//! otherwise). US2 polish (T052) will introduce a `[classify]
-//! poll_interval_secs` knob and default that to 30 s for production.
+//! - Transient (5xx / network / decode) → emit a warning, leave the
+//!   sidecar untouched, let the next tick try again.
+//! - Terminal (404 / 422 / other 4xx) → emit `classify.lost`, stamp
+//!   `classify_lost_at` on the sidecar so subsequent ticks skip the
+//!   entry, but leave `outcome: Delivered` intact (the upload itself
+//!   succeeded).
 
 use std::fs;
 use std::path::PathBuf;
@@ -37,6 +29,8 @@ use crate::perchpub::types::{ClassifyTaskStatus, ObservationPublic};
 use crate::queue::store::QueueStore;
 use crate::queue::{ClipQueueEntry, QueueError};
 
+use super::retry::{FailureKind, classify_poll_error, error_kind};
+
 const IDLE_SCAN_TICK: Duration = Duration::from_millis(50);
 const ACTIVE_SCAN_TICK: Duration = Duration::from_millis(5);
 
@@ -44,8 +38,6 @@ const ACTIVE_SCAN_TICK: Duration = Duration::from_millis(5);
 enum PollerError {
     #[error(transparent)]
     Queue(#[from] QueueError),
-    #[error(transparent)]
-    Client(#[from] ClientError),
     #[error("could not read delivered/ entry `{path}`: {source}")]
     DeliveredIo {
         path: PathBuf,
@@ -60,13 +52,11 @@ enum PollerError {
     },
 }
 
-/// Owner of the classify-task polling loop. The [`Clock`] is held for the
-/// US2 ceilings (T052) — MVP polling fires on every scan tick regardless
-/// of wall-clock.
+/// Owner of the classify-task polling loop. The [`Clock`] is consulted
+/// when stamping `classify_lost_at`.
 pub struct ClassifyPoller {
     store: QueueStore,
     client: PerchpubClient,
-    #[allow(dead_code, reason = "Clock is used by US2 T052; MVP loop polls on every tick")]
     clock: Arc<dyn Clock>,
 }
 
@@ -127,6 +117,9 @@ impl ClassifyPoller {
             if entry.classify_task_id.is_none() {
                 continue;
             }
+            if entry.classify_lost_at.is_some() {
+                continue;
+            }
             if entry.last_classify_status.is_some_and(ClassifyTaskStatus::is_terminal) {
                 continue;
             }
@@ -139,35 +132,107 @@ impl ClassifyPoller {
         let task_id = entry
             .classify_task_id
             .expect("scan_non_terminal filters out entries without classify_task_id");
-        let task = self.client.get_classify_task(task_id).await?;
+        match self.client.get_classify_task(task_id).await {
+            Ok(task) => {
+                entry.last_classify_status = Some(task.status);
+                self.store.update_delivered_sidecar(&entry)?;
 
-        entry.last_classify_status = Some(task.status);
-        self.store.update_delivered_sidecar(&entry)?;
-
-        if task.status.is_terminal() {
-            let observation_id = task.observation.as_ref().map(|o: &ObservationPublic| o.id);
-            tracing::info!(
-                event = obs_tracing::events::CLASSIFY_TERMINAL,
-                clip_id = %entry.clip_id,
-                classify_task_id = %task_id,
-                status = ?task.status,
-                observation_id = ?observation_id,
-                "classify task reached terminal status",
-            );
-        } else {
-            // Contract `log-events.md` lists `classify.polled` at debug;
-            // emitted at info here so the MVP integration test observes
-            // the event at the default log level. US2 polish (T052)
-            // restores the debug level once the production 30 s cadence
-            // makes info-level too chatty.
-            tracing::info!(
-                event = obs_tracing::events::CLASSIFY_POLLED,
-                clip_id = %entry.clip_id,
-                classify_task_id = %task_id,
-                status = ?task.status,
-                "classify task polled (non-terminal)",
-            );
+                if task.status.is_terminal() {
+                    let observation_id =
+                        task.observation.as_ref().map(|o: &ObservationPublic| o.id);
+                    tracing::info!(
+                        event = obs_tracing::events::CLASSIFY_TERMINAL,
+                        clip_id = %entry.clip_id,
+                        classify_task_id = %task_id,
+                        status = ?task.status,
+                        observation_id = ?observation_id,
+                        "classify task reached terminal status",
+                    );
+                } else {
+                    tracing::info!(
+                        event = obs_tracing::events::CLASSIFY_POLLED,
+                        clip_id = %entry.clip_id,
+                        classify_task_id = %task_id,
+                        status = ?task.status,
+                        "classify task polled (non-terminal)",
+                    );
+                }
+                Ok(())
+            }
+            Err(err) => {
+                let kind = error_kind(&err);
+                let status = match &err {
+                    ClientError::Http { status, .. } => Some(*status),
+                    _ => None,
+                };
+                match classify_poll_error(&err) {
+                    FailureKind::Transient => {
+                        // Leave the sidecar alone; the next tick will retry.
+                        emit_poll_transient(
+                            &entry.clip_id,
+                            task_id,
+                            kind,
+                            status,
+                            &err.to_string(),
+                        );
+                        Ok(())
+                    }
+                    FailureKind::Terminal => {
+                        entry.classify_lost_at = Some(self.clock.now());
+                        self.store.update_delivered_sidecar(&entry)?;
+                        emit_classify_lost(&entry.clip_id, task_id, kind, status);
+                        Ok(())
+                    }
+                }
+            }
         }
-        Ok(())
+    }
+}
+
+fn emit_poll_transient(
+    clip_id: &str,
+    task_id: uuid::Uuid,
+    kind: &str,
+    status: Option<u16>,
+    message: &str,
+) {
+    if let Some(s) = status {
+        tracing::warn!(
+            clip_id = %clip_id,
+            classify_task_id = %task_id,
+            kind = kind,
+            status = s,
+            message = message,
+            "classify poll transient failure; will retry",
+        );
+    } else {
+        tracing::warn!(
+            clip_id = %clip_id,
+            classify_task_id = %task_id,
+            kind = kind,
+            message = message,
+            "classify poll transient failure; will retry",
+        );
+    }
+}
+
+fn emit_classify_lost(clip_id: &str, task_id: uuid::Uuid, kind: &str, status: Option<u16>) {
+    if let Some(s) = status {
+        tracing::error!(
+            event = obs_tracing::events::CLASSIFY_LOST,
+            clip_id = %clip_id,
+            classify_task_id = %task_id,
+            kind = kind,
+            status = s,
+            "classify task lost; stopped polling",
+        );
+    } else {
+        tracing::error!(
+            event = obs_tracing::events::CLASSIFY_LOST,
+            clip_id = %clip_id,
+            classify_task_id = %task_id,
+            kind = kind,
+            "classify task lost; stopped polling",
+        );
     }
 }

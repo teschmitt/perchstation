@@ -5,8 +5,16 @@
 //! `contracts/log-events.md`). Tests capture stderr from the subprocess,
 //! call [`parse_json_events`] to turn it into `Vec<serde_json::Value>`,
 //! then drive assertions via [`find_event`] or [`event_codes`].
+//!
+//! In-process tests (e.g., `queue_eviction.rs`) use [`CaptureBuffer`]
+//! together with `tracing::subscriber::with_default` to collect events
+//! from library calls without spawning a subprocess.
+
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
+use tracing_subscriber::fmt::MakeWriter;
 
 /// Parse every UTF-8 line of `stderr` that decodes as a JSON object.
 /// Lines that aren't valid JSON (e.g., a panic backtrace from
@@ -43,4 +51,52 @@ pub fn event_codes(events: &[Value]) -> Vec<String> {
         .iter()
         .filter_map(|ev| ev.get("event").and_then(Value::as_str).map(str::to_string))
         .collect()
+}
+
+/// Thread-safe buffer that implements [`MakeWriter`], so in-process tests
+/// can install a JSON subscriber that writes into the buffer via
+/// `tracing::subscriber::with_default`. Use [`CaptureBuffer::events`] to
+/// retrieve the structured event stream after the test scope exits.
+#[derive(Clone, Default)]
+pub struct CaptureBuffer {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl CaptureBuffer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parsed JSON events captured during the test scope.
+    #[must_use]
+    pub fn events(&self) -> Vec<Value> {
+        let bytes = self.inner.lock().expect("capture buffer poisoned");
+        parse_json_events(&bytes)
+    }
+
+    /// Raw captured bytes — useful for diagnostic prints when an
+    /// assertion fails.
+    #[must_use]
+    pub fn raw(&self) -> Vec<u8> {
+        self.inner.lock().expect("capture buffer poisoned").clone()
+    }
+}
+
+impl Write for CaptureBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.lock().expect("capture buffer poisoned").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for CaptureBuffer {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }

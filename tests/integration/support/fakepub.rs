@@ -29,12 +29,13 @@ use std::time::Duration;
 use axum::{
     Router,
     extract::{Multipart, Path, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
 };
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
+use chrono::{DateTime, Utc};
 use rcgen::{Certificate, CertificateSigningRequestParams, KeyPair};
 use rustls::{RootCertStore, ServerConfig, pki_types::PrivateKeyDer, server::WebPkiClientVerifier};
 use serde_json::json;
@@ -51,6 +52,10 @@ use super::fixtures;
 pub struct Recorded {
     pub enrollment_requests: Vec<RecordedEnrollment>,
     pub upload_requests: Vec<RecordedUpload>,
+    /// Wall-clock arrival time of each upload, in arrival order. US2 tests
+    /// (`outage_recovery`) use this to verify the backoff schedule observed
+    /// on the wire matches the documented retry table.
+    pub upload_timestamps: Vec<DateTime<Utc>>,
     pub classify_polls: Vec<Uuid>,
 }
 
@@ -79,6 +84,43 @@ pub enum EnrollmentResponseMode {
     SessionExpired,
 }
 
+/// Per-test knobs that control how the upload endpoint replies. Each one
+/// is consulted on every `POST /api/v1/upload/` in this order: terminal
+/// per-filename overrides → rate-limit budget → transient 503 budget →
+/// default Ok.
+#[derive(Default)]
+struct UploadResponseState {
+    /// Filenames (the basename in the multipart `Content-Disposition`)
+    /// that must fail with a specific terminal status forever. Used by
+    /// `permanent_failure.rs` to mark a single clip as 422 while letting
+    /// the rest succeed.
+    terminal_failures: HashMap<String, u16>,
+    /// Remaining transient 503 budget. Decremented on each upload while
+    /// non-zero; once zero, uploads fall through to the next stage.
+    /// Used by `outage_recovery.rs` to simulate perchpub being unreachable.
+    transient_503_remaining: u32,
+    /// Remaining 429 budget + the `Retry-After` value (seconds) to stamp
+    /// on the response. Used by the T050-targeted test in
+    /// `outage_recovery.rs` to verify the station honours the header.
+    rate_limit_remaining: u32,
+    rate_limit_retry_after_secs: u64,
+}
+
+/// Per-test knobs for the classify-task GET endpoint. The default
+/// behaviour is the US1 happy path (first poll returns Prepared, second-
+/// plus flips to Success).
+#[derive(Default)]
+struct ClassifyResponseState {
+    /// Status code to return for the next N polls of *any* task. Drained
+    /// independently of `force_lost`. Used by US2 T052 tests to drive the
+    /// 5xx-transient branch.
+    transient_status_remaining: u32,
+    transient_status_code: u16,
+    /// When true, every poll returns 404. Used by US2 T052 tests to
+    /// drive the `classify.lost` branch.
+    force_404: bool,
+}
+
 struct FakeState {
     ca_cert: Certificate,
     ca_key: KeyPair,
@@ -91,6 +133,8 @@ struct FakeState {
     /// Per-task poll count; the second-plus poll flips status to Success.
     poll_counts: Mutex<HashMap<Uuid, u32>>,
     enrollment_mode: Mutex<EnrollmentResponseMode>,
+    upload_response: Mutex<UploadResponseState>,
+    classify_response: Mutex<ClassifyResponseState>,
 }
 
 pub struct FakePerchpub {
@@ -131,6 +175,8 @@ impl FakePerchpub {
             tasks: Mutex::new(HashMap::new()),
             poll_counts: Mutex::new(HashMap::new()),
             enrollment_mode: Mutex::new(EnrollmentResponseMode::Ok),
+            upload_response: Mutex::new(UploadResponseState::default()),
+            classify_response: Mutex::new(ClassifyResponseState::default()),
         });
 
         let app = Router::new()
@@ -193,6 +239,45 @@ impl FakePerchpub {
     /// (and subsequent) request.
     pub fn set_enrollment_response(&self, mode: EnrollmentResponseMode) {
         *self.state.enrollment_mode.lock().unwrap() = mode;
+    }
+
+    /// Fail the next `n` upload calls with HTTP 503 (Service Unavailable),
+    /// then revert to the default Ok behaviour. Used by `outage_recovery`
+    /// to drive the transient-retry branch of `contracts/perchpub-api.md` §2.
+    pub fn fail_uploads_transient_503(&self, n: u32) {
+        self.state.upload_response.lock().unwrap().transient_503_remaining = n;
+    }
+
+    /// Mark every upload whose multipart `file` filename is `filename`
+    /// as permanently failed with HTTP `status` (e.g., 422). Other uploads
+    /// continue to succeed. Used by `permanent_failure` for the terminal
+    /// branch of `contracts/perchpub-api.md` §2.
+    pub fn fail_uploads_terminal_for(&self, filename: impl Into<String>, status: u16) {
+        let mut guard = self.state.upload_response.lock().unwrap();
+        guard.terminal_failures.insert(filename.into(), status);
+    }
+
+    /// Fail the next `n` upload calls with HTTP 429 and `Retry-After:
+    /// retry_after_secs`. Used by T050 to verify the station treats the
+    /// header as a floor on `next_attempt_after`.
+    pub fn fail_uploads_rate_limited(&self, n: u32, retry_after_secs: u64) {
+        let mut guard = self.state.upload_response.lock().unwrap();
+        guard.rate_limit_remaining = n;
+        guard.rate_limit_retry_after_secs = retry_after_secs;
+    }
+
+    /// Fail the next `n` classify-task polls with `status` (e.g., 503).
+    /// Used by T052 to verify the transient-poll branch.
+    pub fn fail_classify_transient(&self, n: u32, status: u16) {
+        let mut guard = self.state.classify_response.lock().unwrap();
+        guard.transient_status_remaining = n;
+        guard.transient_status_code = status;
+    }
+
+    /// Cause every classify-task poll to return 404 from now on. Used by
+    /// T052 to verify the `classify.lost` branch.
+    pub fn fail_classify_404(&self) {
+        self.state.classify_response.lock().unwrap().force_404 = true;
     }
 
     /// Clone-out the recorded request state for assertions.
@@ -299,35 +384,91 @@ async fn handle_enrollment_confirm(
     }))
 }
 
-async fn handle_upload(
-    State(state): State<Arc<FakeState>>,
-    mut multipart: Multipart,
-) -> Result<Json<ClassifyTaskPublic>, (StatusCode, String)> {
+async fn handle_upload(State(state): State<Arc<FakeState>>, mut multipart: Multipart) -> Response {
     let mut byte_size = 0_usize;
     let mut filename = None;
     let mut content_type = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|err| (StatusCode::BAD_REQUEST, format!("multipart: {err}")))?
-    {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(err) => {
+                return (StatusCode::BAD_REQUEST, format!("multipart: {err}")).into_response();
+            }
+        };
         if field.name() == Some("file") {
             filename = field.file_name().map(str::to_string);
             content_type = field.content_type().map(str::to_string);
-            let bytes = field
-                .bytes()
-                .await
-                .map_err(|err| (StatusCode::BAD_REQUEST, format!("read part: {err}")))?;
+            let bytes = match field.bytes().await {
+                Ok(b) => b,
+                Err(err) => {
+                    return (StatusCode::BAD_REQUEST, format!("read part: {err}")).into_response();
+                }
+            };
             byte_size = bytes.len();
         }
     }
 
-    state.recorded.lock().unwrap().upload_requests.push(RecordedUpload {
-        byte_size,
-        filename: filename.clone(),
-        content_type,
-    });
+    {
+        let mut rec = state.recorded.lock().unwrap();
+        rec.upload_requests.push(RecordedUpload {
+            byte_size,
+            filename: filename.clone(),
+            content_type,
+        });
+        rec.upload_timestamps.push(Utc::now());
+    }
+
+    // Per-filename terminal override takes precedence — it never gets
+    // "drained" because the affected clip is supposed to fail forever.
+    if let Some(name) = filename.as_ref() {
+        let status = state.upload_response.lock().unwrap().terminal_failures.get(name).copied();
+        if let Some(code) = status {
+            let status_code =
+                StatusCode::from_u16(code).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            return (
+                status_code,
+                Json(json!({
+                    "detail": [
+                        {
+                            "loc": ["body", "file"],
+                            "msg": format!("permanent failure for {name}"),
+                            "type": "value_error",
+                        }
+                    ],
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Rate-limit budget: pop one off and emit 429 + Retry-After. Drained
+    // before the 503 budget so a test can layer the two without interaction.
+    {
+        let mut guard = state.upload_response.lock().unwrap();
+        if guard.rate_limit_remaining > 0 {
+            guard.rate_limit_remaining -= 1;
+            let retry_after = guard.rate_limit_retry_after_secs;
+            drop(guard);
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::RETRY_AFTER,
+                retry_after.to_string().parse().expect("retry-after header value"),
+            );
+            return (StatusCode::TOO_MANY_REQUESTS, headers, "rate limited").into_response();
+        }
+    }
+
+    // Transient 503 budget: pop one off, return 503, return early so the
+    // happy-path classify-task minting below doesn't run.
+    {
+        let mut guard = state.upload_response.lock().unwrap();
+        if guard.transient_503_remaining > 0 {
+            guard.transient_503_remaining -= 1;
+            return (StatusCode::SERVICE_UNAVAILABLE, "service unavailable").into_response();
+        }
+    }
 
     let task_id = Uuid::new_v4();
     let object_name = filename.unwrap_or_else(|| format!("clip-{task_id}.mp4"));
@@ -346,7 +487,7 @@ async fn handle_upload(
     };
     state.tasks.lock().unwrap().insert(task_id, task.clone());
 
-    Ok(Json(task))
+    Json(task).into_response()
 }
 
 async fn handle_classify_get(
@@ -354,6 +495,22 @@ async fn handle_classify_get(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ClassifyTaskPublic>, StatusCode> {
     state.recorded.lock().unwrap().classify_polls.push(id);
+
+    // Forced 404: drives the `classify.lost` branch.
+    if state.classify_response.lock().unwrap().force_404 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    // Transient status budget: drives the 5xx-backoff branch.
+    {
+        let mut guard = state.classify_response.lock().unwrap();
+        if guard.transient_status_remaining > 0 {
+            guard.transient_status_remaining -= 1;
+            let code = guard.transient_status_code;
+            drop(guard);
+            return Err(StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    }
 
     let count = {
         let mut counts = state.poll_counts.lock().unwrap();

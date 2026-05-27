@@ -77,12 +77,20 @@ async fn delivery_happy_path() {
         .spawn()
         .expect("spawn perchstation serve");
 
-    // --- poll for the delivered sidecar (or process death, in RED) ---
+    // Wait until the classify poller has driven the entry to a terminal
+    // `last_classify_status` — otherwise SIGKILLing before
+    // `classify.terminal` fires races the test against the poller's 5 ms
+    // active-scan tick. The sidecar transitions to `Success` *before*
+    // the event is emitted, so the small post-observation sleep gives
+    // tracing's unbuffered stderr writer time to flush.
     let delivered_dir = data_dir.path().join("queue/delivered");
     let delivered_sidecar = delivered_dir.join(format!("{clip_id}.json"));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if delivered_sidecar.exists() {
+        if let Ok(bytes) = std::fs::read(&delivered_sidecar)
+            && let Ok(entry) = serde_json::from_slice::<Value>(&bytes)
+            && entry.get("last_classify_status").and_then(Value::as_str) == Some("Success")
+        {
             break;
         }
         if child.try_wait().expect("try_wait").is_some() {
@@ -92,10 +100,12 @@ async fn delivery_happy_path() {
         if Instant::now() >= deadline {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Tiny grace period so the `classify.terminal` log emission completes
+    // before SIGKILL severs the stderr pipe.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Terminate (no-op if already dead from the unimplemented!() panic).
     let _ = child.kill().await;
     let output = child.wait_with_output().await.expect("collect subprocess output");
 

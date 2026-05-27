@@ -195,6 +195,62 @@ impl QueueStore {
         write_sidecar_atomic(&path, entry)
     }
 
+    /// Move an entry from `inflight/` back to `pending/` after a
+    /// transient failure. Persists the updated sidecar (`attempts`,
+    /// `last_error`, `next_attempt_after`) atomically. Idempotent
+    /// against missing files so the runner can call this even after a
+    /// partial transition.
+    pub fn transition_back_to_pending(&self, entry: &ClipQueueEntry) -> Result<(), QueueError> {
+        let clip_id = &entry.clip_id;
+        let inflight_mp4 = self.inflight_dir().join(format!("{clip_id}.mp4"));
+        let inflight_sidecar = self.inflight_dir().join(format!("{clip_id}.json"));
+        let pending_mp4 = self.pending_dir().join(format!("{clip_id}.mp4"));
+        let pending_sidecar = self.pending_dir().join(format!("{clip_id}.json"));
+
+        if inflight_mp4.exists() {
+            fs::rename(&inflight_mp4, &pending_mp4)
+                .map_err(|source| QueueError::Io { path: pending_mp4.clone(), source })?;
+        }
+        write_sidecar_atomic(&pending_sidecar, entry)?;
+        match fs::remove_file(&inflight_sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(QueueError::Io { path: inflight_sidecar, source }),
+        }
+        Ok(())
+    }
+
+    /// Enumerate `inflight/` and move every clip+sidecar pair back into
+    /// `pending/`. Resets `next_attempt_after` so the runner picks the
+    /// re-queued entries up immediately. Called once at process start
+    /// by `commands::serve` before `service.ready`. Idempotent against
+    /// a clean `inflight/`.
+    pub fn reconcile_inflight(&self) -> Result<Vec<ClipQueueEntry>, QueueError> {
+        let inflight = self.inflight_dir();
+        let mut sidecars: Vec<PathBuf> = Vec::new();
+        let read_dir = fs::read_dir(&inflight)
+            .map_err(|source| QueueError::Io { path: inflight.clone(), source })?;
+        for entry in read_dir {
+            let entry =
+                entry.map_err(|source| QueueError::Io { path: inflight.clone(), source })?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                sidecars.push(path);
+            }
+        }
+        sidecars.sort();
+
+        let mut recovered = Vec::with_capacity(sidecars.len());
+        for sidecar in sidecars {
+            let mut entry = read_sidecar(&sidecar)?;
+            entry.next_attempt_after = None;
+            entry.last_error = None;
+            self.transition_back_to_pending(&entry)?;
+            recovered.push(entry);
+        }
+        Ok(recovered)
+    }
+
     /// Move an entry from `inflight/` to `delivered/`.
     ///
     /// The caller pre-populates `entry.outcome`, `classify_task_id`,
@@ -240,10 +296,24 @@ fn next_clip_id(captured_at: DateTime<Utc>) -> String {
 fn write_sidecar_atomic(target: &Path, entry: &ClipQueueEntry) -> Result<(), QueueError> {
     let tmp = target.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(entry).map_err(QueueError::Serialise)?;
-    fs::write(&tmp, &bytes).map_err(|source| QueueError::Io { path: tmp.clone(), source })?;
-    fs::rename(&tmp, target)
-        .map_err(|source| QueueError::Io { path: target.to_path_buf(), source })?;
+    if let Err(err) = fs::write(&tmp, &bytes) {
+        return Err(io_to_queue_err(err, &tmp));
+    }
+    if let Err(err) = fs::rename(&tmp, target) {
+        return Err(io_to_queue_err(err, target));
+    }
     Ok(())
+}
+
+/// Map an `io::Error` to a [`QueueError`], detecting `ENOSPC`
+/// (`io::ErrorKind::StorageFull`) so the runner can react with the
+/// `queue.disk_full` event and back off instead of tight-looping (T049a).
+fn io_to_queue_err(err: io::Error, path: &Path) -> QueueError {
+    if err.kind() == io::ErrorKind::StorageFull {
+        QueueError::DiskFull { path: path.to_path_buf() }
+    } else {
+        QueueError::Io { path: path.to_path_buf(), source: err }
+    }
 }
 
 fn read_sidecar(path: &Path) -> Result<ClipQueueEntry, QueueError> {

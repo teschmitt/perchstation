@@ -23,6 +23,7 @@ use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reqwest::header;
 use reqwest::{Body, Certificate, Client, Identity, StatusCode, Url};
 use thiserror::Error;
 use tokio_util::io::ReaderStream;
@@ -50,7 +51,14 @@ pub enum ClientError {
     #[error("network error talking to `{url}`: {message}")]
     Network { url: String, message: String },
     #[error("perchpub returned HTTP {status} for `{url}`: {message}")]
-    Http { url: String, status: u16, message: String },
+    Http {
+        url: String,
+        status: u16,
+        message: String,
+        /// `Retry-After` header value (in seconds) if present. Used by
+        /// the retry scheduler as a floor on `next_attempt_after` (T050).
+        retry_after: Option<Duration>,
+    },
     #[error("could not decode response from `{url}`: {message}")]
     Decode { url: String, message: String },
     #[error("could not open clip file `{path}`: {source}")]
@@ -181,11 +189,13 @@ impl PerchpubClient {
 
         let status = response.status();
         if status != StatusCode::OK {
+            let retry_after = parse_retry_after(response.headers());
             let message = response.text().await.unwrap_or_default();
             return Err(ClientError::Http {
                 url: url.to_string(),
                 status: status.as_u16(),
                 message,
+                retry_after,
             });
         }
 
@@ -207,11 +217,13 @@ impl PerchpubClient {
 
         let status = response.status();
         if status != StatusCode::OK {
+            let retry_after = parse_retry_after(response.headers());
             let message = response.text().await.unwrap_or_default();
             return Err(ClientError::Http {
                 url: url.to_string(),
                 status: status.as_u16(),
                 message,
+                retry_after,
             });
         }
 
@@ -235,6 +247,14 @@ impl PerchpubClient {
         }
         Ok(())
     }
+}
+
+/// Parse a `Retry-After` header value as a delta-seconds. HTTP-date
+/// form is not supported (perchpub's Traefik front sends seconds).
+fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(Duration::from_secs(secs))
 }
 
 #[cfg(test)]

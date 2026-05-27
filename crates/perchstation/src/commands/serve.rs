@@ -24,6 +24,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use perchstation_core::config::Config;
 use perchstation_core::delivery::classify::ClassifyPoller;
+use perchstation_core::delivery::retry::BackoffSchedule;
 use perchstation_core::delivery::runner::DeliveryRunner;
 use perchstation_core::hw_traits::Clock;
 use perchstation_core::identity::{IdentityError, StationIdentity};
@@ -64,6 +65,19 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     let store = QueueStore::open(&config.data_dir)
         .map_err(|err| CommandError::Io(anyhow!("queue init: {err}")))?;
 
+    // Boot reconciliation: move any leftover `inflight/` entries back to
+    // `pending/` so a previous crash mid-upload resumes cleanly (T048).
+    let recovered = store
+        .reconcile_inflight()
+        .map_err(|err| CommandError::Io(anyhow!("boot reconciliation: {err}")))?;
+    for entry in &recovered {
+        tracing::warn!(
+            event = obs_tracing::events::QUEUE_RECOVERED_INFLIGHT,
+            clip_id = %entry.clip_id,
+            "re-queued inflight entry after crash",
+        );
+    }
+
     let pending_at_start =
         count_pending(&store).map_err(|err| CommandError::Io(anyhow!("count pending: {err}")))?;
 
@@ -77,8 +91,9 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let schedule = BackoffSchedule::from_config(&config.retry);
 
-    let runner = DeliveryRunner::new(store.clone(), client.clone(), clock.clone());
+    let runner = DeliveryRunner::new(store.clone(), client.clone(), clock.clone(), schedule);
     let poller = ClassifyPoller::new(store, client, clock);
 
     let delivery_handle = tokio::spawn(runner.run());

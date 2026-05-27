@@ -12,4 +12,5 @@
 //! layer on top of the happy-path loops here.
 
 pub mod classify;
+pub mod retry;
 pub mod runner;
