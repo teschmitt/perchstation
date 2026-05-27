@@ -76,8 +76,10 @@ triple.
 - Bounded queue: default 500 clips OR 2 GiB total, whichever first; default
   eviction `drop_oldest_undelivered`, alternate `refuse_new`; both logged
   per eviction (FR-009).
-- Bounded per-clip retry budget: default 12 attempts and 24 h wall-clock
-  (FR-015).
+- Bounded per-clip retry budget: default 12 attempts and 24 h wall-clock;
+  exponential backoff with multiplier 2.0 and ±20 % jitter, initial delay
+  10 s, per-attempt delay capped at 3600 s (FR-007, FR-015; full TOML
+  schema in `research.md` R-10).
 - Outbound destinations restricted to the configured perchpub origin plus
   OS-level DNS / NTP; enforced by CA pinning + URL allowlist; verified by
   integration test (SC-007).
@@ -152,7 +154,7 @@ crates/
 │       │   └── inbox.rs         # Inbox trait (capture-subsystem-facing)
 │       ├── delivery/
 │       │   ├── mod.rs
-│       │   ├── loop.rs          # the long-running delivery loop
+│       │   ├── runner.rs        # the long-running delivery loop
 │       │   ├── retry.rs         # exponential backoff + budgets
 │       │   └── classify.rs      # classify-task poller
 │       ├── observability/
