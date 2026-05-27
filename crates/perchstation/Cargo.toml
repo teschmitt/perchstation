@@ -1,0 +1,50 @@
+[package]
+name          = "perchstation"
+description   = "The perchstation binary: enrollment, delivery loop, and operator status surface."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+version.workspace      = true
+
+[[bin]]
+name = "perchstation"
+path = "src/main.rs"
+
+[[bin]]
+name = "fakepub"
+path = "src/bin/fakepub.rs"
+
+[dependencies]
+perchstation-core = { path = "../perchstation-core" }
+perchstation-hw   = { path = "../perchstation-hw" }
+tokio             = { workspace = true }
+clap              = { workspace = true }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+sd-notify         = { workspace = true }
+
+# Dev-only deps used by the fakepub binary. These are listed in
+# [dependencies] (not [dev-dependencies]) because Cargo only resolves
+# dev-dependencies for the package's own tests/examples/benches — binaries
+# need their deps in [dependencies] proper.
+axum         = { workspace = true }
+axum-server  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
+rcgen        = { workspace = true }
+rustls       = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile   = { workspace = true }
+wiremock   = { workspace = true }
+reqwest    = { workspace = true }
+
+[lints]
+workspace = true

@@ -27,7 +27,7 @@ contract documents, and a host-runnable quickstart.
 
 ## Technical Context
 
-**Language/Version**: Rust, stable toolchain, edition 2021, MSRV 1.75.
+**Language/Version**: Rust, stable toolchain, edition 2024, MSRV 1.95.
 
 **Primary Dependencies**:
 - `tokio` 1.x — single project-wide async runtime (constitution-mandated).
@@ -103,7 +103,7 @@ unattended operation between owner interactions.
 | III. Resource Discipline           | ✅     | Bounded queue (FR-009) with explicit eviction policy; bounded retry budget (FR-015); streaming uploads (reqwest `Body::wrap_stream`); journald-side rotation with documented `SystemMaxUse=200M` (quickstart.md §7); dependency picks are narrow, pure-Rust, single-tokio.                                                                       |
 | IV. Observable, Not Chatty         | ✅     | `tracing` JSON-line events to stderr/journald (contracts/log-events.md); explicit allowlist of outbound destinations (research.md R-12) verified by `outbound_allowlist.rs` integration test; no telemetry endpoint; verbose mode opt-in and field-redaction-disciplined.                                                                              |
 | V. Test-First (non-negotiable)     | ✅     | Every functional requirement maps to at least one host-runnable integration test (test matrix referenced under "Project Structure"). Hardware-bound paths covered by a documented release smoke test (quickstart.md §"What this quickstart does not prove"), not by mocks.                                                                              |
-| Technology & resource constraints  | ✅     | Rust 2021, MSRV 1.75, Tokio sole runtime, no `openssl-sys`, AGPL-3.0+ in the workspace `Cargo.toml`. `unsafe` confined to `perchstation-hw`.                                                                                                                                                                                                  |
+| Technology & resource constraints  | ✅     | Rust 2024, MSRV 1.95, Tokio sole runtime, no `openssl-sys`, AGPL-3.0+ in the workspace `Cargo.toml`. `unsafe` confined to `perchstation-hw`.                                                                                                                                                                                                  |
 | Development workflow               | ✅     | Spec-driven via speckit (this command). CI configuration (`cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace`) is a tasks-level concern, not a plan-level violation. Cross-project coordination with perchpub: the `references/openapi.json` mirror plus the contract-drift test is the coordination surface for this iteration. |
 
 No violations to justify. Complexity Tracking section below is empty.

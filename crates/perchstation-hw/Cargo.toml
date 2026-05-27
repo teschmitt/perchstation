@@ -1,0 +1,31 @@
+[package]
+name          = "perchstation-hw"
+description   = "The hardware-boundary crate for the perchstation: camera, GPIO, system clock. The only place `unsafe` is allowed."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+version.workspace      = true
+
+[dependencies]
+perchstation-core = { path = "../perchstation-core" }
+tokio             = { workspace = true }
+image             = { workspace = true }
+chrono            = { workspace = true }
+anyhow            = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+
+[lints.rust]
+# `unsafe_code` is the workspace default `deny`. This crate is the documented
+# exception per the constitution: each unsafe block carries an invariant comment.
+unsafe_code     = "allow"
+unused_must_use = "deny"
+
+[lints.clippy]
+all      = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"

@@ -1,0 +1,100 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/perchstation-core",
+    "crates/perchstation-hw",
+    "crates/perchstation",
+]
+
+[workspace.package]
+edition       = "2024"
+rust-version  = "1.95"
+license       = "AGPL-3.0-or-later"
+repository    = "https://codeberg.org/perchpub/perchstation"
+authors       = ["perchstation contributors"]
+version       = "0.1.0"
+
+[workspace.dependencies]
+# Async runtime — single project-wide choice (constitution-mandated).
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "fs",
+    "signal",
+    "time",
+    "io-util",
+    "sync",
+    "process",
+] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+
+# HTTP + mTLS + streaming uploads.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+    "multipart",
+    "json",
+] }
+
+# TLS material loading + on-device cert/CSR generation.
+rustls         = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls-pemfile = "2"
+rcgen          = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+
+# QR decoding (pure Rust) + image input.
+rqrr  = "0.8"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Config / serialisation.
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+toml        = "0.8"
+
+# Structured logs.
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["json", "env-filter", "fmt", "std"] }
+
+# CLI.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Errors.
+anyhow    = "1"
+thiserror = "2"
+
+# Misc.
+uuid          = { version = "1", features = ["v4", "serde"] }
+chrono        = { version = "0.4", default-features = false, features = ["serde", "clock"] }
+x509-parser   = "0.16"
+sd-notify     = "0.4"
+
+# Dev-only deps (used by integration tests and the fakepub dev binary).
+axum            = { version = "0.7", default-features = false, features = ["http1", "tokio", "json", "macros", "multipart"] }
+axum-server     = { version = "0.7", features = ["tls-rustls"] }
+assert_cmd      = "2"
+tempfile        = "3"
+wiremock        = "0.6"
+predicates      = "3"
+
+[workspace.lints.rust]
+unsafe_code      = "deny"
+unused_must_use  = "deny"
+
+[workspace.lints.clippy]
+all     = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow common pedantic noise that doesn't pay off in this codebase.
+module_name_repetitions = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+
+[profile.dev]
+opt-level = 0
+debug     = true

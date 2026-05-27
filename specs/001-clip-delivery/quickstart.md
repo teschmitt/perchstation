@@ -10,7 +10,7 @@ end-to-end — all on your laptop.
 
 ## Prerequisites
 
-- Rust stable, MSRV ≥ 1.75 (check with `rustup show`).
+- Rust stable, MSRV ≥ 1.95 (check with `rustup show`).
 - A POSIX-ish dev host (Linux or macOS).
 - `cargo-zigbuild` (only needed for the optional aarch64 cross-build at the
   end). Install with `cargo install cargo-zigbuild`.
