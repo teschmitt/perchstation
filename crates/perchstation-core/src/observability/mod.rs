@@ -1,2 +1,3 @@
-// Sub-modules tracing (T013/T059) and status (T056) are added in their
-// respective tasks.
+pub mod tracing;
+
+// Sub-module `status` (T056) is added in its respective task.

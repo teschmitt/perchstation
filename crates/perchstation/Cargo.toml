@@ -16,6 +16,13 @@ path = "src/main.rs"
 name = "fakepub"
 path = "src/bin/fakepub.rs"
 
+# Workspace-root contract tests live under `tests/contract/`. Each file is
+# attached individually here so `cargo test --workspace` picks them up.
+[[test]]
+name              = "openapi_sync"
+path              = "../../tests/contract/openapi_sync.rs"
+harness           = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }

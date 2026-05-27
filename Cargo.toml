@@ -62,6 +62,10 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow    = "1"
 thiserror = "2"
 
+# Async traits — used by hw_traits::{QrFrameSource, Clock} so they stay
+# dyn-compatible without hand-rolled Box<dyn Future> plumbing.
+async-trait = "0.1"
+
 # Misc.
 uuid          = { version = "1", features = ["v4", "serde"] }
 chrono        = { version = "0.4", default-features = false, features = ["serde", "clock"] }
