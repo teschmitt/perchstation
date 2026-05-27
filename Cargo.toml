@@ -40,7 +40,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 # TLS material loading + on-device cert/CSR generation.
 rustls         = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2"
-rcgen          = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring"] }
+rcgen          = { version = "0.13", default-features = false, features = ["pem", "crypto", "ring", "x509-parser"] }
 
 # QR decoding (pure Rust) + image input.
 rqrr  = "0.8"
@@ -79,6 +79,7 @@ assert_cmd      = "2"
 tempfile        = "3"
 wiremock        = "0.6"
 predicates      = "3"
+qrcode          = { version = "0.14", default-features = false, features = ["image"] }
 
 [workspace.lints.rust]
 unsafe_code      = "deny"
