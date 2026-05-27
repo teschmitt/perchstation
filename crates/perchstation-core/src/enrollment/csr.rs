@@ -14,6 +14,8 @@
 use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use thiserror::Error;
 
+use crate::observability::tracing as obs_tracing;
+
 /// In-memory result of building a fresh enrollment keypair + CSR.
 ///
 /// Hand both off to [`crate::enrollment::confirm`]: `csr_pem` goes on the
@@ -42,7 +44,34 @@ pub fn generate() -> Result<EnrollmentCsr, CsrError> {
         .map_err(|e| CsrError::Build(e.to_string()))?;
     let csr = params.serialize_request(&keypair).map_err(|e| CsrError::Build(e.to_string()))?;
     let csr_pem = csr.pem().map_err(|e| CsrError::Serialise(e.to_string()))?;
+
+    // Register each PEM body line in the redaction registry so any
+    // accidental log emission of the CSR or private key is scrubbed
+    // (T059 / FR-001). The header/footer lines (`-----BEGIN ...-----`)
+    // are public structure; only the base64 body bytes are sensitive.
+    for body_line in pem_body_lines(&csr_pem) {
+        obs_tracing::register_secret(body_line);
+    }
+    let key_pem = keypair.serialize_pem();
+    for body_line in pem_body_lines(&key_pem) {
+        obs_tracing::register_secret(body_line);
+    }
+
     Ok(EnrollmentCsr { keypair, csr_pem })
+}
+
+/// Extract every non-empty body line from a PEM-encoded blob, skipping
+/// the `-----BEGIN/-----END` boundary lines. Each line is a single
+/// 64-character base64 chunk (or shorter on the last line); registering
+/// each line individually lets the redaction layer scrub log lines that
+/// happened to emit a single wrapped row of the PEM.
+fn pem_body_lines(pem: &str) -> Vec<String> {
+    pem.lines()
+        .filter(|line| !line.starts_with("-----"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(test)]

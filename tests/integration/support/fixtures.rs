@@ -85,10 +85,31 @@ pub fn build_station_cert(
     ca: &Certificate,
     ca_key: &KeyPair,
 ) -> String {
+    build_station_cert_with_validity(
+        station_key,
+        station_id,
+        ca,
+        ca_key,
+        (2026, 1, 1),
+        (2099, 1, 1),
+    )
+}
+
+/// Mint a station leaf cert with caller-controlled validity dates. T053
+/// uses this to mint an already-expired cert and exercise the `status`
+/// `enrollment.state = "expired"` branch.
+pub fn build_station_cert_with_validity(
+    station_key: &KeyPair,
+    station_id: Uuid,
+    ca: &Certificate,
+    ca_key: &KeyPair,
+    not_before_ymd: (i32, u8, u8),
+    not_after_ymd: (i32, u8, u8),
+) -> String {
     let mut params =
         CertificateParams::new(vec![format!("station-{station_id}")]).expect("station params");
-    params.not_before = rcgen::date_time_ymd(2026, 1, 1);
-    params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+    params.not_before = rcgen::date_time_ymd(not_before_ymd.0, not_before_ymd.1, not_before_ymd.2);
+    params.not_after = rcgen::date_time_ymd(not_after_ymd.0, not_after_ymd.1, not_after_ymd.2);
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
     let cert = params.signed_by(station_key, ca, ca_key).expect("sign station cert");
     cert.pem()

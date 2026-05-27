@@ -23,12 +23,14 @@
 //! disk-full handling (T049a) is layered on the queue writes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::time::sleep;
 
 use crate::hw_traits::Clock;
+use crate::identity::StationIdentity;
 use crate::observability::tracing as obs_tracing;
 use crate::perchpub::client::{ClientError, PerchpubClient};
 use crate::queue::store::QueueStore;
@@ -39,6 +41,12 @@ use super::retry::{BackoffSchedule, FailureKind, NextAction, classify_upload_err
 /// Idle tick: how long the loop sleeps when there's nothing eligible to
 /// pick up. Keeps us responsive to backoff expiry without hot-looping.
 const IDLE_TICK: Duration = Duration::from_millis(50);
+
+/// How long the loop sleeps between cert-expiry checks once the cert has
+/// expired. We do NOT exit the process — `status` should keep reporting
+/// `expired` until the operator re-enrolls (FR-014) — but we do stop
+/// trying to upload, so this tick is comfortably long.
+const CERT_EXPIRED_TICK: Duration = Duration::from_mins(1);
 
 #[derive(Debug, Error)]
 enum RunnerError {
@@ -56,6 +64,8 @@ pub struct DeliveryRunner {
     client: PerchpubClient,
     clock: Arc<dyn Clock>,
     schedule: BackoffSchedule,
+    identity: StationIdentity,
+    cert_expired_logged: AtomicBool,
 }
 
 impl DeliveryRunner {
@@ -65,8 +75,16 @@ impl DeliveryRunner {
         client: PerchpubClient,
         clock: Arc<dyn Clock>,
         schedule: BackoffSchedule,
+        identity: StationIdentity,
     ) -> Self {
-        Self { store, client, clock, schedule }
+        Self {
+            store,
+            client,
+            clock,
+            schedule,
+            identity,
+            cert_expired_logged: AtomicBool::new(false),
+        }
     }
 
     /// Run until cancelled. Each iteration either makes progress on one
@@ -77,6 +95,21 @@ impl DeliveryRunner {
         // space frees up (T049a).
         let disk_full_backoff = self.schedule.max_attempt_delay;
         loop {
+            // Pre-flight cert expiry check (T058 / FR-014). Halts the
+            // loop's productive work without exiting the process so
+            // `status` continues to surface the expired state.
+            if self.identity.cert_is_expired(self.clock.now()) {
+                if !self.cert_expired_logged.swap(true, Ordering::SeqCst) {
+                    tracing::error!(
+                        event = obs_tracing::events::DELIVERY_CERT_EXPIRED,
+                        cert_not_after = %self.identity.cert_not_after.to_rfc3339(),
+                        "station cert has expired; halting delivery loop until re-enrollment",
+                    );
+                }
+                sleep(CERT_EXPIRED_TICK).await;
+                continue;
+            }
+
             match self.try_once().await {
                 Ok(true) => {}
                 Ok(false) => sleep(IDLE_TICK).await,

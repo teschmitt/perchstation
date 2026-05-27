@@ -132,6 +132,13 @@ impl PerchpubClient {
             .min_tls_version(reqwest::tls::Version::TLS_1_2)
             .https_only(true)
             .identity(identity)
+            // SC-007 / T060: redirects are not followed. A 3xx response
+            // from perchpub becomes a plain HTTP status the caller sees,
+            // not a transparent reconnect to a possibly-rogue Location.
+            // The allowlist gate (`check_authority`) catches caller-
+            // constructed URLs; this no-redirect policy catches
+            // server-driven URL swaps.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_mins(1));
         for root in roots {
             builder = builder.add_root_certificate(root);
@@ -240,6 +247,14 @@ impl PerchpubClient {
 
     fn check_authority(&self, url: &Url) -> Result<(), ClientError> {
         if url.authority() != self.base_url.authority() {
+            // SC-007 / T060 invariant — surface the offending URL so a
+            // future regression is visible in journald rather than hidden
+            // inside the typed error.
+            tracing::error!(
+                actual = %url.authority(),
+                expected = %self.base_url.authority(),
+                "refused outbound request to off-allowlist authority",
+            );
             return Err(ClientError::OutboundDisallowed {
                 actual: url.authority().to_string(),
                 expected: self.base_url.authority().to_string(),

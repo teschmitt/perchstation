@@ -72,6 +72,21 @@ name    = "clock_skew_tolerance"
 path    = "../../tests/integration/clock_skew_tolerance.rs"
 harness = true
 
+[[test]]
+name    = "status_surface"
+path    = "../../tests/integration/status_surface.rs"
+harness = true
+
+[[test]]
+name    = "outbound_allowlist"
+path    = "../../tests/integration/outbound_allowlist.rs"
+harness = true
+
+[[test]]
+name    = "log_redaction"
+path    = "../../tests/integration/log_redaction.rs"
+harness = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }

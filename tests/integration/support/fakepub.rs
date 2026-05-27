@@ -71,6 +71,9 @@ pub struct RecordedUpload {
     pub byte_size: usize,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    /// Full bytes of the multipart `file` part. Captured so T055 can
+    /// assert sensitive material never appears on the wire.
+    pub body_bytes: Vec<u8>,
 }
 
 /// How the enrollment-confirm endpoint should respond on the next call.
@@ -104,6 +107,10 @@ struct UploadResponseState {
     /// `outage_recovery.rs` to verify the station honours the header.
     rate_limit_remaining: u32,
     rate_limit_retry_after_secs: u64,
+    /// When set, every upload responds with `302 Found` carrying this URL
+    /// in the `Location` header. Used by T054 to verify the station's
+    /// HTTP client does NOT follow redirects to off-allowlist hosts.
+    redirect_to: Option<String>,
 }
 
 /// Per-test knobs for the classify-task GET endpoint. The default
@@ -280,6 +287,14 @@ impl FakePerchpub {
         self.state.classify_response.lock().unwrap().force_404 = true;
     }
 
+    /// Cause every upload to respond with `302 Found` and `Location:
+    /// <url>` instead of accepting the multipart body. Used by T054 to
+    /// verify the station refuses to follow redirects to a host outside
+    /// the configured perchpub authority (SC-007).
+    pub fn redirect_uploads_to(&self, url: impl Into<String>) {
+        self.state.upload_response.lock().unwrap().redirect_to = Some(url.into());
+    }
+
     /// Clone-out the recorded request state for assertions.
     #[must_use]
     pub fn recorded(&self) -> Recorded {
@@ -384,10 +399,15 @@ async fn handle_enrollment_confirm(
     }))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "linear multipart-parse → response branches; splitting would obscure the request lifecycle"
+)]
 async fn handle_upload(State(state): State<Arc<FakeState>>, mut multipart: Multipart) -> Response {
     let mut byte_size = 0_usize;
     let mut filename = None;
     let mut content_type = None;
+    let mut body_bytes: Vec<u8> = Vec::new();
 
     loop {
         let field = match multipart.next_field().await {
@@ -407,6 +427,7 @@ async fn handle_upload(State(state): State<Arc<FakeState>>, mut multipart: Multi
                 }
             };
             byte_size = bytes.len();
+            body_bytes = bytes.to_vec();
         }
     }
 
@@ -416,8 +437,21 @@ async fn handle_upload(State(state): State<Arc<FakeState>>, mut multipart: Multi
             byte_size,
             filename: filename.clone(),
             content_type,
+            body_bytes,
         });
         rec.upload_timestamps.push(Utc::now());
+    }
+
+    // Redirect override: short-circuit every upload with a 302. Drained
+    // first so the test can layer it with other modes if it ever wants
+    // to (none currently do).
+    {
+        let redirect = state.upload_response.lock().unwrap().redirect_to.clone();
+        if let Some(url) = redirect {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::LOCATION, url.parse().expect("location header value"));
+            return (StatusCode::FOUND, headers, "redirect").into_response();
+        }
     }
 
     // Per-filename terminal override takes precedence — it never gets

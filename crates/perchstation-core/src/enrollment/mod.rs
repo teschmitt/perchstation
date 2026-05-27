@@ -18,6 +18,8 @@ use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::observability::tracing as obs_tracing;
+
 /// In-memory material decoded from a single enrollment QR frame.
 ///
 /// `data_model.md` §`EnrollmentSessionMaterial` documents the canonical
@@ -96,6 +98,11 @@ pub fn decode_enrollment_session(
     }
     let session_id = Uuid::parse_str(&payload.session_id)
         .map_err(|e| QrDecodeError::BadField { field: "session_id", message: e.to_string() })?;
+
+    // Register the auth_token in the process-wide redaction registry
+    // before any caller logs an enrollment event (T059 / FR-001). The
+    // ca_chain_pem is public CA material; it does not need scrubbing.
+    obs_tracing::register_secret(payload.auth_token.clone());
 
     Ok(EnrollmentSessionMaterial {
         session_id,

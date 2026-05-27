@@ -59,6 +59,12 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
         Err(err) => return Err(CommandError::Io(anyhow!("identity load failed: {err}"))),
     };
 
+    // Register every body line of the on-disk station private key in
+    // the redaction registry so subsequent log emissions cannot leak it
+    // (T059 / FR-001). identity.json/.crt/.ca_chain are non-secret and
+    // do not need scrubbing.
+    register_station_key_secrets(&config.data_dir)?;
+
     let client = PerchpubClient::new(&config.data_dir, perchpub_url)
         .map_err(|err| CommandError::Io(anyhow!("perchpub client init: {err}")))?;
 
@@ -93,7 +99,13 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let schedule = BackoffSchedule::from_config(&config.retry);
 
-    let runner = DeliveryRunner::new(store.clone(), client.clone(), clock.clone(), schedule);
+    let runner = DeliveryRunner::new(
+        store.clone(),
+        client.clone(),
+        clock.clone(),
+        schedule,
+        identity.clone(),
+    );
     let poller = ClassifyPoller::new(store, client, clock);
 
     let delivery_handle = tokio::spawn(runner.run());
@@ -131,4 +143,24 @@ fn count_pending(store: &QueueStore) -> std::io::Result<u32> {
         }
     }
     Ok(count)
+}
+
+/// Read `<data_dir>/credentials/station.key` and register every non-empty
+/// PEM body line in the process-wide redaction registry. Called once at
+/// the start of `serve` so any log line emitted afterwards (under any
+/// `--log-level`) is scrubbed of the key body before reaching stderr.
+fn register_station_key_secrets(data_dir: &std::path::Path) -> Result<(), CommandError> {
+    use perchstation_core::identity::{CREDENTIALS_DIR, STATION_KEY_FILE};
+    use perchstation_core::observability::tracing as obs_tracing;
+
+    let key_path = data_dir.join(CREDENTIALS_DIR).join(STATION_KEY_FILE);
+    let key_pem = std::fs::read_to_string(&key_path)
+        .map_err(|err| CommandError::Io(anyhow!("read `{}`: {err}", key_path.display())))?;
+    for line in key_pem.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("-----") {
+            obs_tracing::register_secret(trimmed.to_string());
+        }
+    }
+    Ok(())
 }

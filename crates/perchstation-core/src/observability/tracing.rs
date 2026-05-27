@@ -1,20 +1,28 @@
 //! Structured logging: format selection, event-code constants, and the
-//! secret-redaction registry stub.
+//! secret-redaction layer.
 //!
 //! Events are emitted via the `tracing` crate's `info!`/`warn!`/`error!`
 //! macros, with `event = events::SOMETHING` keyed against the constants in
 //! the [`events`] module. The contract is `specs/001-clip-delivery/contracts/log-events.md`.
 //!
-//! Redaction: this module currently exposes a [`RedactionRegistry`] that
-//! call-sites can register secrets against. The full filtering [`tracing`]
-//! layer that scans event fields and drops events containing registered
-//! markers is implemented in T059; until then, the registry is a holding
-//! pen and producers stay disciplined about which fields they log (the
-//! contract test `log_redaction.rs` will fail loudly if they don't).
+//! Redaction: the process-wide [`RedactionRegistry`] holds the set of
+//! literal byte sequences (`auth_token`, CSR PEM body, station private-key
+//! PEM body, …) that must never appear in any log line. A
+//! [`RedactingMakeWriter`] sits in front of the actual stderr writer and
+//! scrubs each formatted log line — replacing any registered marker with
+//! `[REDACTED]` — before the bytes leave the process. Producers register
+//! secrets via [`register_secret`] at the moment the material is
+//! constructed (QR decode, CSR generation, identity load); from that
+//! point on, no field, span, panic backtrace, or stray `eprintln!`
+//! routed through the configured writer can leak it.
 
-use std::sync::{Mutex, OnceLock};
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
+
+const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 
 /// Choice between machine-friendly JSON (the default, for journald) and
 /// a human-friendly text format for interactive SSH use.
@@ -54,6 +62,7 @@ pub fn init(format: LogFormat, level: &str) -> Result<(), TracingInitError> {
     }
     let filter =
         EnvFilter::try_new(level).map_err(|e| TracingInitError { message: e.to_string() })?;
+    let writer = RedactingMakeWriter::new(redaction_registry().clone());
     match format {
         LogFormat::Json => {
             let subscriber = tracing_subscriber::fmt()
@@ -66,16 +75,14 @@ pub fn init(format: LogFormat, level: &str) -> Result<(), TracingInitError> {
                 .with_current_span(true)
                 .with_span_list(false)
                 .with_env_filter(filter)
-                .with_writer(std::io::stderr)
+                .with_writer(writer)
                 .finish();
             tracing::subscriber::set_global_default(subscriber)
                 .map_err(|e| TracingInitError { message: e.to_string() })?;
         }
         LogFormat::Text => {
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .finish();
+            let subscriber =
+                tracing_subscriber::fmt().with_env_filter(filter).with_writer(writer).finish();
             tracing::subscriber::set_global_default(subscriber)
                 .map_err(|e| TracingInitError { message: e.to_string() })?;
         }
@@ -138,10 +145,10 @@ pub mod events {
 
 /// In-memory registry of strings that must never appear in any log event.
 ///
-/// T013 ships the registry; T059 hooks it up to a `tracing` layer that
-/// scans every event's recorded field values and drops events containing
-/// any registered marker.
-#[derive(Default)]
+/// Populated incrementally by producers ([`register_secret`]); consumed
+/// by [`RedactingWriter`] on every stderr write to scrub any registered
+/// marker before bytes leave the process.
+#[derive(Debug, Default)]
 pub struct RedactionRegistry {
     secrets: Mutex<Vec<String>>,
 }
@@ -185,6 +192,101 @@ impl RedactionRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Snapshot of every registered secret. Cloned out from under the
+    /// lock so the redaction writer can iterate without holding it.
+    /// Callers should not retain the result across mutations — at most a
+    /// few hundred bytes for this codebase, copied per stderr write.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<String> {
+        self.secrets.lock().expect("registry lock poisoned").clone()
+    }
+}
+
+/// Process-wide redaction registry.
+///
+/// Populated incrementally as secrets are materialised — QR decode adds
+/// the `auth_token`, CSR generation adds the CSR PEM body and the
+/// station private-key PEM body, identity load (in `serve`) adds the
+/// on-disk station-key body. The [`RedactingMakeWriter`] reads from this
+/// registry on every write to stderr, so any secret registered before a
+/// log line is emitted is guaranteed not to appear on the wire.
+pub fn redaction_registry() -> &'static Arc<RedactionRegistry> {
+    static REGISTRY: OnceLock<Arc<RedactionRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Arc::new(RedactionRegistry::new()))
+}
+
+/// Convenience wrapper for `redaction_registry().register(s)`. Accepts
+/// anything that can become a `String` so call-sites can hand in
+/// `&str`/`String` interchangeably.
+pub fn register_secret(s: impl Into<String>) {
+    redaction_registry().register(s);
+}
+
+/// `MakeWriter` that hands out [`RedactingWriter`] instances pointed at
+/// the process-wide redaction registry. Sits in the `tracing-subscriber`
+/// fmt-layer slot the bare `std::io::stderr` would otherwise occupy.
+#[derive(Debug, Clone)]
+pub struct RedactingMakeWriter {
+    registry: Arc<RedactionRegistry>,
+}
+
+impl RedactingMakeWriter {
+    #[must_use]
+    pub fn new(registry: Arc<RedactionRegistry>) -> Self {
+        Self { registry }
+    }
+}
+
+impl<'a> MakeWriter<'a> for RedactingMakeWriter {
+    type Writer = RedactingWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter { registry: self.registry.clone() }
+    }
+}
+
+/// `Write` adapter that scrubs registered secrets from every UTF-8
+/// payload before forwarding to stderr.
+///
+/// Each `tracing-subscriber` fmt event emits one `write_all` call with
+/// the complete formatted line + trailing newline. We snapshot the
+/// registry at the start of `write`, decode the input lossily as UTF-8,
+/// and replace every registered marker with `[REDACTED]`. Non-UTF-8
+/// inputs (impossible for the fmt JSON layer in practice, but theoretically
+/// possible for arbitrary writers) are passed through unchanged — the
+/// `from_utf8_lossy` path already produces a String that can be scanned.
+#[derive(Debug)]
+pub struct RedactingWriter {
+    registry: Arc<RedactionRegistry>,
+}
+
+impl Write for RedactingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let secrets = self.registry.snapshot();
+        let mut stderr = io::stderr().lock();
+        if secrets.is_empty() {
+            stderr.write_all(buf)?;
+            return Ok(buf.len());
+        }
+        let text = String::from_utf8_lossy(buf);
+        let scrubbed = scrub(&text, &secrets);
+        stderr.write_all(scrubbed.as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
+}
+
+fn scrub(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    for secret in secrets {
+        if !secret.is_empty() && out.contains(secret) {
+            out = out.replace(secret, REDACTED_PLACEHOLDER);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
