@@ -214,10 +214,18 @@ these, then boxes them into `Box<dyn MotionSensor>` /
 - `tests/integration/capture_recording_failure.rs` exercises
   `FakeCamera::Mode::FailMidway`, asserting the staging file is removed
   and that no clip enters the queue.
-- `tests/integration/capture_bounded_clip.rs` exercises
-  `FakeCamera::Mode::Hang` to verify the supervisor's outer
-  `tokio::time::timeout` catches a hung adapter (the drop on the
-  `record_clip` future triggers the `FakeCamera`'s cleanup branch).
+- `tests/integration/capture_bounded_clip.rs` exercises the **inner**
+  clip-duration bound: `FakeCamera::Mode::Ok` is used together with
+  `FakeMotionSensor::set_level(Asserted)` and the test asserts the
+  camera returns cleanly when `max_duration` elapses (the recording
+  terminates at `clip_duration_secs` regardless of sensor state).
+- `tests/integration/capture_camera_hang.rs` exercises the **outer**
+  bound — `FakeCamera::Mode::Hang` triggers the supervisor's
+  `tokio::time::timeout(clip_duration + hang_margin)`, and the drop
+  on the `record_clip` future triggers the `FakeCamera`'s cleanup
+  branch. The test asserts no clip enters the queue, the staging file
+  is removed, the `capture.recording_hung` event is emitted, and the
+  loop continues to accept subsequent triggers.
 - `tests/integration/capture_unavailable_sensor.rs` exercises
   `FakeMotionSensor::set_error(...)` to drive `MotionSensorError::Unavailable`
   through both `next_trigger` and `level`, asserting the supervisor

@@ -90,10 +90,13 @@ the fakes:
 | `capture_stuck_sensor.rs`             | `FakeMotionSensor::set_level(Asserted)` continuously past `liveness_stuck_secs`. Assert `capture.sensor_degraded { kind: "stuck_asserted" }`, then a follow-up edge produces a `capture.degraded_skip` event and no clip. Drive `FakeMotionSensor::set_level(Quiescent)`, assert `capture.sensor_recovered`. |
 | `capture_unavailable_sensor.rs`       | `FakeMotionSensor::set_error(Unavailable)` from both `next_trigger` and `level`. Assert recovery once the error is cleared. |
 | `capture_recording_failure.rs`        | `FakeCamera::Mode::FailMidway`. Assert no clip in `pending/`, staging file removed, `capture.recording_failed` event. |
-| `capture_bounded_clip.rs`             | `FakeCamera::Mode::Hang`. Assert outer timeout fires, `capture.recording_hung` event, staging removed.     |
+| `capture_bounded_clip.rs`             | `FakeCamera::Mode::Ok` + `FakeMotionSensor::set_level(Asserted)`. Assert the **inner** clip-duration bound — the camera returns cleanly when `max_duration` elapses and the clip lands in `pending/`. |
+| `capture_camera_hang.rs`              | `FakeCamera::Mode::Hang`. Assert the supervisor's outer `tokio::time::timeout(clip_duration + hang_margin)` fires, `capture.recording_hung` is emitted, staging is removed by drop-cancellation, no clip lands in `pending/`, and the loop accepts a subsequent normal trigger. |
 | `capture_disk_pressure.rs`            | Pre-populate `<data_dir>/capture-staging/` with garbage to exceed `max_staging_bytes`; assert `capture.disk_pressure_skip`. |
 | `capture_queue_full.rs`               | `PolicyInbox` configured with `EvictionPolicy::RefuseNew` and `max_clips=1`. Pre-load one clip, fire trigger, assert `capture.queue_refused { kind: "queue_full" }` and staging removed. |
-| `capture_resilience.rs`               | Spawn `Capture`, fire trigger, drop the task during recording (simulates power loss), restart `Capture` against the same `data_dir`. Assert staging-purge cleans up partial files, queue is intact, supervisor accepts a new trigger. |
+| `capture_resilience.rs`               | Spawn `Capture`, fire trigger, drop the task during recording (simulates power loss), restart `Capture` against the same `data_dir`. Assert staging-purge cleans up partial files, queue is intact, supervisor accepts a new trigger. Also covers the boot/shutdown edge: an edge fired before readiness still produces a clip; an edge after the `CancellationToken` is dropped cleanly. |
+| `capture_concurrent_event.rs`         | `FakeCamera::Mode::Ok` with a small `clip_duration_secs` so a recording is in progress when trigger #2 fires. Assert exactly one `record_clip` invocation and one clip in `pending/`. |
+| `capture_isolation.rs`                | Spawn delivery + capture against shared `data_dir`, pre-load pending clips, inject a panic into the capture task (e.g. `FakeMotionSensor::panic_on_next_trigger`). Assert delivery continues draining. Symmetric direction (panic in delivery, capture continues) covered in the same file. |
 
 ## 4. Driving the binary manually
 

@@ -48,6 +48,9 @@ Variants:
 - When the device has never recorded: `Last recording:  (none)`.
 - When the most recent capture attempt failed:
   `Last failure:    2026-05-27 06:30:12 UTC  recording_failed: io error reading from camera`.
+- When the sensor has never been observed (the capture task has not
+  run a liveness probe yet — e.g. `status` invoked outside of `serve`):
+  `Sensor:          (never observed)`.
 - When the sensor is degraded:
   `Sensor:          stuck_asserted (since 2026-05-27 06:25:00 UTC)`
   or
@@ -55,9 +58,12 @@ Variants:
 
 The capture section MUST be emitted even when every field is `None`
 (so the operator can confirm the capture half is up). When the capture
-task has not run in this process (e.g. `status` is invoked
-outside of `serve`), all capture fields are `None`, which renders as
-the three lines above with `(none)` / `(unknown)` defaults.
+task has not run in this process (e.g. `status` is invoked outside of
+`serve`), `last_recording_at` / `last_clip_id` / `last_failure` render
+as `(none)` and `sensor_liveness` renders as `(never observed)` — the
+latter is the explicit "no data yet" signal so an operator running
+`status` outside of `serve` is not misled into thinking the sensor is
+healthy when nothing has been checked.
 
 ### JSON output (additions)
 
@@ -93,16 +99,21 @@ Field reference:
 | `capture.last_failure.at`          | RFC 3339 UTC timestamp                            | Present iff `last_failure != null`.                                  |
 | `capture.last_failure.kind`        | string                                            | One of `"recording_failed"`, `"camera_hang"`, `"queue_full"`, `"queue_io"`, `"disk_pressure"`. |
 | `capture.last_failure.message`     | string                                            |                                                                       |
-| `capture.sensor_liveness`          | enum `"healthy" \| "stuck_asserted" \| "unavailable"` | Mirrors `SensorLivenessTracker`'s current state.                 |
-| `capture.sensor_degraded_since`    | RFC 3339 UTC timestamp ∣ null                     | Present when `sensor_liveness != "healthy"`.                          |
+| `capture.sensor_liveness`          | enum `"never_observed" \| "healthy" \| "stuck_asserted" \| "unavailable"` | Mirrors `SensorLivenessTracker`'s current state, with `"never_observed"` reserved for the case where the capture task has not yet run a single liveness probe (e.g. `status` invoked outside of `serve`). Once `Capture::run` is past its first probe, the value is one of the remaining three. |
+| `capture.sensor_degraded_since`    | RFC 3339 UTC timestamp ∣ null                     | Present when `sensor_liveness` is `"stuck_asserted"` or `"unavailable"`; `null` when `"healthy"` or `"never_observed"`. |
 
 ### Behaviour
 
 - `status` remains read-only with respect to `data_dir`; the capture
   fields are read from the in-process `Arc<CaptureStateSnapshot>` when
   `status` is invoked from the same process as `serve` (e.g. in
-  integration tests), and default to `None` / `"healthy"` /
-  `"never recorded"` otherwise.
+  integration tests), and default to `last_recording_at = null`,
+  `last_clip_id = null`, `last_failure = null`,
+  `sensor_liveness = "never_observed"`, and `sensor_degraded_since = null`
+  otherwise. The `never_observed` value is deliberately distinct from
+  `healthy`: the supervisor only ever publishes `healthy` after a
+  successful liveness probe, so a `never_observed` reading is the
+  explicit "no data yet" signal.
 - The existing exit-code contract is unchanged; capture state cannot
   produce an exit code other than 0 from `status` (the loop's
   degradation is reflected in the snapshot, not in the exit code).
@@ -164,7 +175,15 @@ Exit codes:
   recording, restarts it, and asserts that
   `<data_dir>/capture-staging/` is empty post-restart and that the
   queue contains no partial clip — the integration-level check that
-  combines FR-017, FR-009, and SC-003.
+  combines FR-017, FR-009, and SC-003. It also covers the spec's
+  "Sensor fires during boot or shutdown" edge case.
+- `tests/integration/capture_isolation.rs` spawns delivery + capture
+  in a single `serve` and asserts the spawn/join wrapper isolates
+  faults in both directions: a panic in the capture task does not
+  stop delivery from draining the queue, and a panic in delivery
+  does not stop capture from recording a fresh trigger. This is the
+  test that closes SC-009 / FR-012 (today T033 implements the wrapper;
+  this test exercises it).
 
 ---
 

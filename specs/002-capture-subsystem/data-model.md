@@ -226,8 +226,8 @@ see `CaptureSnapshot`.
 | `last_recording_at`    | `Option<DateTime<Utc>>`                     | Wall-clock time of the most recent **successful** clip submission. None if the device has never recorded. |
 | `last_clip_id`         | `Option<String>`                            | The `ClipQueueEntry.clip_id` returned by the latest successful `Inbox::submit`. Mirrors the queue clip-id so an operator can grep it. |
 | `last_failure`         | `Option<CaptureFailureSnapshot>`            | Most recent capture failure (recording failed, queue refused, disk pressure, etc.).                       |
-| `sensor_liveness`      | `enum CaptureLivenessSnapshot`              | `healthy` / `stuck_asserted` / `unavailable` — projected from `SensorLivenessTracker`. |
-| `sensor_degraded_since`| `Option<DateTime<Utc>>`                     | Present when `sensor_liveness != healthy`.                |
+| `sensor_liveness`      | `enum CaptureLivenessSnapshot`              | `never_observed` / `healthy` / `stuck_asserted` / `unavailable`. The first three of the latter three are projected from `SensorLivenessTracker`'s current state; `never_observed` is the default before the supervisor's first liveness probe (e.g. when `status` is invoked outside of `serve`). |
+| `sensor_degraded_since`| `Option<DateTime<Utc>>`                     | Present (`Some`) when `sensor_liveness` is `stuck_asserted` or `unavailable`; `None` for `healthy` and `never_observed`. |
 
 **`CaptureFailureSnapshot`**:
 
@@ -250,8 +250,11 @@ and sensor liveness. These are not derivable from the queue (the queue
 knows last *upload* success/failure). The projection bridges the two
 halves cleanly inside the existing `StatusSnapshot`. When the capture
 task is not running (e.g. a tool invokes `status` outside of `serve`),
-the projection defaults to "all None" — consistent with the
-"status is safe to run anywhere" promise from `001/contracts/cli.md`.
+the projection defaults to `None` for every timestamp / failure field
+and to `CaptureLivenessSnapshot::NeverObserved` for `sensor_liveness`
+— consistent with the "status is safe to run anywhere" promise from
+`001/contracts/cli.md`, and explicitly distinct from the `Healthy`
+value the supervisor publishes only after a successful liveness probe.
 
 ---
 

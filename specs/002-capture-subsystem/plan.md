@@ -104,7 +104,10 @@ point. New host-runnable integration tests under `tests/integration/`:
 | `capture_disk_pressure.rs`            | US2 #6, FR-013            |
 | `capture_queue_full.rs`               | US2 #7, FR-018            |
 | `capture_status_surface.rs`           | US3 #1, #2, SC-007        |
-| `capture_resilience.rs`               | US2 #1, FR-009, FR-017, SC-003 (crash-restart with staging purge; queue intact) |
+| `capture_resilience.rs`               | US2 #1, FR-009, FR-017, SC-003 (crash-restart with staging purge; queue intact); Edge Case "Sensor fires during boot or shutdown" (edge before readiness still produces a clip; edge after shutdown signal dropped cleanly) |
+| `capture_camera_hang.rs`              | Edge Case "Camera adapter hangs", FR-005 (outer `tokio::time::timeout` bound), `capture.recording_hung` event |
+| `capture_concurrent_event.rs`         | US2 #5 (no second concurrent recording while a previous recording is in progress) |
+| `capture_isolation.rs`                | SC-009, FR-012 (capture panic does not stop delivery, and vice versa) |
 | `capture_no_network.rs`               | US3 #3 (extends 001's outbound_allowlist with capture loop running) |
 
 On-device verification that genuinely needs a Pi (real GPIO edges, real
@@ -268,7 +271,10 @@ tests/
     ├── capture_disk_pressure.rs         # US2 #6 / FR-013
     ├── capture_queue_full.rs            # US2 #7 / FR-018
     ├── capture_status_surface.rs        # US3 #1, #2 / SC-007
-    ├── capture_resilience.rs            # US2 #1 / FR-009 / FR-017 / SC-003
+    ├── capture_resilience.rs            # US2 #1 / FR-009 / FR-017 / SC-003 / Edge Case "Sensor fires during boot or shutdown"
+    ├── capture_camera_hang.rs           # Edge Case "Camera adapter hangs" / FR-005 outer bound / capture.recording_hung
+    ├── capture_concurrent_event.rs      # US2 #5 (no second concurrent recording)
+    ├── capture_isolation.rs             # SC-009 / FR-012 (capture↔delivery panic isolation)
     ├── capture_no_network.rs            # US3 #3 (extends outbound_allowlist with capture running)
     └── support/
         ├── fake_motion_sensor.rs        # mpsc-backed FakeMotionSensor
