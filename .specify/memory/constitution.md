@@ -151,6 +151,12 @@ honest for the parts of the codebase that don't need a Pi to run.
 - **Spec-driven development via speckit**: Every non-trivial feature has a
   spec → clarify → plan → tasks → implement cycle. Drive-by changes are
   reserved for fixes that don't change behavior.
+- **Subagent-driven implementation**: Tasks are executed by fresh agents
+  with no prior context. All shared types MUST be in `data-model.md` and
+  all interfaces in `contracts/` before implementation begins. Each task
+  MUST be self-contained (context, file paths, acceptance criteria) and
+  touch 1–2 files. Cross-task dependencies MUST be minimised and stated
+  explicitly where unavoidable.
 - **Branching and review**: One feature per branch, reviewed before merge to
   `main`. Commit messages follow the conventions already in the repository.
 - **Continuous integration**: CI MUST run `cargo fmt --check`,
@@ -183,4 +189,4 @@ Runtime development guidance lives in the project's `CLAUDE.md` (and any
 sibling agent-guidance files); those files defer to this constitution where
 they conflict.
 
-**Version**: 1.0.0 | **Ratified**: 2026-05-26 | **Last Amended**: 2026-05-26
+**Version**: 1.1.0 | **Ratified**: 2026-05-26 | **Last Amended**: 2026-05-28
