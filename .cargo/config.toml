@@ -1,0 +1,15 @@
+# Cross-build hints for the Raspberry Pi target.
+#
+# Production aarch64 builds use `cargo-zigbuild`, which supplies its own
+# linker via the bundled zig toolchain — see quickstart.md §6:
+#
+#     rustup target add aarch64-unknown-linux-gnu
+#     cargo zigbuild --release -p perchstation \
+#         --target aarch64-unknown-linux-gnu
+#
+# The `linker` override below is the fallback path for someone using
+# `cargo build` directly with a system-installed cross GCC (e.g.,
+# `gcc-aarch64-linux-gnu` on Debian/Ubuntu). `cargo-zigbuild` ignores it.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

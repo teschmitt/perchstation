@@ -1,0 +1,133 @@
+[package]
+name          = "perchstation"
+description   = "The perchstation binary: enrollment, delivery loop, and operator status surface."
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+version.workspace      = true
+
+[[bin]]
+name = "perchstation"
+path = "src/main.rs"
+
+[[bin]]
+name = "fakepub"
+path = "src/bin/fakepub.rs"
+
+# Workspace-root contract tests live under `tests/contract/`. Each file is
+# attached individually here so `cargo test --workspace` picks them up.
+[[test]]
+name              = "openapi_sync"
+path              = "../../tests/contract/openapi_sync.rs"
+harness           = true
+
+# Workspace-root integration tests live under `tests/integration/`. Each
+# file is its own test binary; shared helpers live under
+# `tests/integration/support/` and each test file does
+# `#[path = "support/mod.rs"] mod support;`.
+[[test]]
+name    = "enrollment_happy"
+path    = "../../tests/integration/enrollment_happy.rs"
+harness = true
+
+[[test]]
+name    = "delivery_happy"
+path    = "../../tests/integration/delivery_happy.rs"
+harness = true
+
+[[test]]
+name    = "reenroll_conflict"
+path    = "../../tests/integration/reenroll_conflict.rs"
+harness = true
+
+[[test]]
+name    = "enrollment_session_expired"
+path    = "../../tests/integration/enrollment_session_expired.rs"
+harness = true
+
+[[test]]
+name    = "outage_recovery"
+path    = "../../tests/integration/outage_recovery.rs"
+harness = true
+
+[[test]]
+name    = "queue_eviction"
+path    = "../../tests/integration/queue_eviction.rs"
+harness = true
+
+[[test]]
+name    = "permanent_failure"
+path    = "../../tests/integration/permanent_failure.rs"
+harness = true
+
+[[test]]
+name    = "crash_recovery"
+path    = "../../tests/integration/crash_recovery.rs"
+harness = true
+
+[[test]]
+name    = "clock_skew_tolerance"
+path    = "../../tests/integration/clock_skew_tolerance.rs"
+harness = true
+
+[[test]]
+name    = "status_surface"
+path    = "../../tests/integration/status_surface.rs"
+harness = true
+
+[[test]]
+name    = "outbound_allowlist"
+path    = "../../tests/integration/outbound_allowlist.rs"
+harness = true
+
+[[test]]
+name    = "log_redaction"
+path    = "../../tests/integration/log_redaction.rs"
+harness = true
+
+[dependencies]
+perchstation-core = { path = "../perchstation-core" }
+perchstation-hw   = { path = "../perchstation-hw" }
+tokio             = { workspace = true }
+clap              = { workspace = true }
+anyhow            = { workspace = true }
+thiserror         = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }
+sd-notify         = { workspace = true }
+chrono            = { workspace = true }
+
+# Dev-only deps used by the fakepub binary. These are listed in
+# [dependencies] (not [dev-dependencies]) because Cargo only resolves
+# dev-dependencies for the package's own tests/examples/benches — binaries
+# need their deps in [dependencies] proper.
+axum         = { workspace = true }
+axum-server  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+uuid         = { workspace = true }
+rcgen        = { workspace = true }
+rustls       = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile   = { workspace = true }
+wiremock   = { workspace = true }
+reqwest    = { workspace = true }
+qrcode     = { workspace = true }
+image      = { workspace = true }
+chrono     = { workspace = true }
+tokio      = { workspace = true }
+axum       = { workspace = true }
+axum-server = { workspace = true }
+rcgen      = { workspace = true }
+rustls     = { workspace = true }
+rustls-pemfile = { workspace = true }
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

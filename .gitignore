@@ -1,0 +1,11 @@
+target/
+**/*.rs.bk
+/tmp/perchstation-*
+tests/integration/fixtures/*.tmp
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/

@@ -1,0 +1,44 @@
+# perchstation operator configuration.
+#
+# This file is loaded by `perchstation enroll`, `serve`, and `status` via
+# the global `--config` flag (default `/etc/perchstation/config.toml`).
+# Every field has a built-in default; override only what you need.
+
+# perchpub mTLS endpoint URL the station uploads to. Fixed at enrollment
+# time — changing it requires re-enrollment so the station's cert chain
+# matches the new authority.
+perchpub_url = "https://perchpub.example.org"
+
+# Filesystem root for credentials/ and queue/{pending,inflight,delivered}/.
+# Under the bundled systemd unit this is `/var/lib/perchstation` via the
+# `StateDirectory=perchstation` directive — change with care.
+data_dir = "/var/lib/perchstation"
+
+[queue]
+# Maximum number of clips kept on disk across pending/, inflight/, and
+# delivered/ combined. Hit either ceiling and eviction runs.
+max_clips = 500
+# Maximum total on-disk byte size of all clips in the queue.
+max_bytes = 2_147_483_648  # 2 GiB
+
+# Eviction policy when the queue saturates:
+#   "drop_oldest_undelivered" — drop oldest entries already marked
+#                               Undeliverable first, then oldest pending
+#                               entries (the operator-friendly default).
+#   "refuse_new"              — reject new submissions while the queue is
+#                               full (Inbox::submit returns QueueFull).
+eviction = "drop_oldest_undelivered"
+
+[retry]
+# Delay before the first retry of a transient upload failure.
+initial_delay_secs = 10
+# Cap on per-attempt sleep. Exponential backoff with multiplier 2.0 and
+# ±20 % jitter, clipped to this ceiling, so the loop wakes at least this
+# often during a long outage.
+max_attempt_delay_secs = 3600  # 1 hour
+# Per-clip attempt count ceiling. After this the clip is marked
+# Undeliverable.
+per_clip_max_attempts = 12
+# Per-clip wall-clock budget. After this the clip is marked Undeliverable
+# even if it hasn't reached the attempt ceiling yet.
+per_clip_max_wallclock_hours = 24
