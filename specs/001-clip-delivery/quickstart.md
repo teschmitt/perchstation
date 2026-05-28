@@ -30,7 +30,9 @@ cargo test --workspace
 - Unit tests inside each crate.
 - The integration tests in `tests/integration/` against a fake perchpub
   (axum) and an in-memory `QrFrameSource` populated from PNG fixtures
-  under `tests/fixtures/`.
+  minted in-process by `tests/integration/support/fixtures.rs` (see
+  `tests/integration/fixtures/README.md` for the no-binary-blobs
+  rationale).
 - The contract-drift test that diff's `references/openapi.json` against
   the schemas the station mirrors.
 
@@ -38,17 +40,43 @@ Expected: green. If anything is red, **stop** and fix before moving on.
 
 ## 2. Smoke-run the binary against a fake perchpub
 
-In one terminal, start the fake perchpub bundled in the dev tools:
+> **Fixtures.** The dev fakepub binary needs four PEM files on disk: a CA
+> certificate + private key (used to sign the station's CSR and to anchor
+> the station's trust chain), and a server leaf certificate + key (the
+> TLS identity the binary presents on `127.0.0.1:8443`). The operator
+> also needs a QR PNG carrying the enrollment session payload (session
+> id, auth token, CA chain) and a `sample.mp4` to hand to delivery.
+>
+> The integration tests mint all of these in-process per test rather
+> than checking them in (see `tests/integration/fixtures/README.md`).
+> For the manual quickstart you have two options:
+>
+> 1. **Recommended**: run the integration test
+>    `tests/integration/delivery_happy.rs` — it exercises end-to-end the
+>    same flow this section walks through (`perchstation enroll` against
+>    the fake perchpub, hand a clip to delivery, observe the
+>    classify-task land on `Success`), and is the validated reference.
+> 2. **Manual**: generate the fixtures yourself with `rcgen` /
+>    `qrcode` / a hand-rolled mp4 stub (the helpers in
+>    `tests/integration/support/fixtures.rs` are the canonical recipe).
+>    Then run the commands below pointing at your generated paths.
+>
+> A `fakepub mint-fixtures` subcommand that emits all six files into a
+> target directory is tracked as a follow-up to this quickstart.
+
+Assuming you have generated fixtures at `$FIXTURES`, start the fake
+perchpub in one terminal:
 
 ```sh
 cargo run -p perchstation --bin fakepub -- --listen 127.0.0.1:8443 \
-    --tls-key tests/fixtures/fakepub.key \
-    --tls-cert tests/fixtures/fakepub.crt \
-    --ca tests/fixtures/fakepub-ca.pem
+    --tls-cert "$FIXTURES/server.crt" \
+    --tls-key  "$FIXTURES/server.key" \
+    --ca       "$FIXTURES/ca.crt" \
+    --ca-key   "$FIXTURES/ca.key"
 ```
 
-In another terminal, pick a temporary data dir and run enrollment off a
-fixture QR PNG (this is the `--qr-source=file` recovery path, since you
+In another terminal, pick a temporary data dir and run enrollment off
+the generated QR PNG (this is the `--qr-source=file` path, since you
 have no camera):
 
 ```sh
@@ -61,7 +89,7 @@ sed -i "s|/REPLACE/ME|$PERCHSTATION_DATA|" "$PERCHSTATION_DATA/config.toml"
 
 cargo run -p perchstation -- \
     --config "$PERCHSTATION_DATA/config.toml" \
-    enroll --qr-source file --qr-file tests/fixtures/enroll-session.png
+    enroll --qr-source file --qr-file "$FIXTURES/enroll-session.png"
 ```
 
 You should see (text format default in TTY mode):
@@ -86,7 +114,7 @@ subsystem will:
 
 ```sh
 mkdir -p "$PERCHSTATION_DATA/queue/pending"
-cp tests/fixtures/sample.mp4 "$PERCHSTATION_DATA/queue/pending/20260527T100000Z-001.mp4"
+cp "$FIXTURES/sample.mp4" "$PERCHSTATION_DATA/queue/pending/20260527T100000Z-001.mp4"
 cat > "$PERCHSTATION_DATA/queue/pending/20260527T100000Z-001.json" <<'EOF'
 {
   "clip_id": "20260527T100000Z-001",
@@ -155,7 +183,7 @@ cargo run -p perchstation -- --config "$PERCHSTATION_DATA/config.toml" status --
 ```sh
 cargo run -p perchstation -- \
     --config "$PERCHSTATION_DATA/config.toml" \
-    enroll --qr-source file --qr-file tests/fixtures/enroll-session.png
+    enroll --qr-source file --qr-file "$FIXTURES/enroll-session.png"
 # exit code 76, message names the existing station_id and cert expiry.
 ```
 

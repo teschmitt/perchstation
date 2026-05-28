@@ -1,0 +1,47 @@
+[Unit]
+Description=perchstation clip delivery subsystem
+Documentation=https://codeberg.org/perchpub/perchstation
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+
+[Service]
+Type=notify
+Environment="RUST_LOG=info"
+ExecStart=/usr/local/bin/perchstation --config /etc/perchstation/config.toml serve
+
+User=perchstation
+Group=perchstation
+StateDirectory=perchstation
+StateDirectoryMode=0750
+
+# Restart policy: panic recovers automatically (constitution Principle I).
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Process hardening — no privileges, no surprise filesystem writes.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Networking — outbound only, no privileged ports.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
