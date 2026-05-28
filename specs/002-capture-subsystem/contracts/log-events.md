@@ -78,6 +78,26 @@ The test obligation from 001 (`tests/integration/log_redaction.rs`)
 remains in force. Capture-side codes do not add any new
 secret-bearing fields, so no new redaction sites are required.
 
+## `kind` on `capture.recording_failed` versus `last_failure.kind`
+
+The field name `kind` is used in two contracts with two different
+vocabularies:
+
+- **`capture.recording_failed { kind, … }`** (this document, log
+  event): values are the underlying `CameraError` variant — one of
+  `"open_failed"`, `"io"`, `"aborted"`, `"empty_output"`. This is the
+  *cause* of the failure, observed at the camera-adapter boundary.
+- **`capture.last_failure.kind`** (see `contracts/cli.md` §JSON
+  output): values are the supervisor's higher-level failure category
+  — one of `"recording_failed"`, `"camera_hang"`, `"queue_full"`,
+  `"queue_io"`, `"disk_pressure"`. This is the *event the operator
+  cares about*, surfaced through the status snapshot.
+
+A single failure may surface in both: a camera I/O error during a
+recording emits `capture.recording_failed { kind: "io", … }` in the
+log and updates the snapshot to `last_failure.kind = "recording_failed"`.
+Implementers MUST keep these vocabularies separate.
+
 ## `recording_id` versus `clip_id`
 
 - `recording_id` is the **capture-side staging-file id**

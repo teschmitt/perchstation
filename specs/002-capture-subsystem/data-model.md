@@ -312,12 +312,33 @@ pub(crate) struct CaptureStateInner {
 ```
 
 `CaptureState` wraps `Arc<RwLock<CaptureStateInner>>`. The
-writer-facing methods (`record_success`, `record_failure`,
-`set_liveness`) take a `&self` and acquire a write-lock;
-`snapshot(&self)` takes a read-lock and clones the inner into a
-`CaptureSnapshot`. `CaptureStateInner::default()` produces
-`sensor_liveness = NeverObserved` and every other field `None`,
-matching the standalone-`status` projection described above.
+writer-facing methods take a `&self` and acquire a write-lock:
+
+```rust
+impl CaptureState {
+    pub fn new() -> Self;
+    pub fn snapshot(&self) -> CaptureSnapshot;
+    pub fn record_success(&self, clip_id: String, at: DateTime<Utc>);
+    pub fn record_failure(&self, at: DateTime<Utc>, kind: &str, message: String);
+    pub fn set_liveness(
+        &self,
+        snapshot: CaptureLivenessSnapshot,
+        since: Option<DateTime<Utc>>,
+    );
+}
+```
+
+`set_liveness` accepts the **projection** type
+(`CaptureLivenessSnapshot`), not the tracker's `SensorLiveness`. The
+runner is responsible for converting from the tracker's enum (which
+has only `Healthy` / `StuckAsserted { since }` / `Unavailable { since, .. }`)
+into the projection variant (which adds `NeverObserved`). The runner
+never writes `NeverObserved`; it is exclusively the initial state set
+by `CaptureStateInner::default()`. `snapshot(&self)` takes a read-lock
+and clones the inner into a `CaptureSnapshot`.
+`CaptureStateInner::default()` produces `sensor_liveness = NeverObserved`
+and every other field `None`, matching the standalone-`status`
+projection described above.
 
 **Why a read-side projection rather than reading the queue**: the
 spec asks `perchstation status` to report **capture-side** state —
