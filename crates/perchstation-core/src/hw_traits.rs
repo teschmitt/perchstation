@@ -128,6 +128,7 @@ pub trait Camera: Send + Sync {
 /// The capture supervisor takes ownership of the file: after
 /// `Inbox::submit`, the staging path no longer exists (the queue
 /// renamed or copied the bytes into `pending/`).
+#[derive(Debug, Clone)]
 pub struct RecordedClip {
     pub clip_path: PathBuf,
     pub started_at: DateTime<Utc>,

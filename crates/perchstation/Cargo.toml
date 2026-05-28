@@ -87,10 +87,26 @@ name    = "log_redaction"
 path    = "../../tests/integration/log_redaction.rs"
 harness = true
 
+[[test]]
+name    = "capture_happy"
+path    = "../../tests/integration/capture_happy.rs"
+harness = true
+
+[[test]]
+name    = "capture_bounded_clip"
+path    = "../../tests/integration/capture_bounded_clip.rs"
+harness = true
+
+[[test]]
+name    = "capture_idle"
+path    = "../../tests/integration/capture_idle.rs"
+harness = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }
 tokio             = { workspace = true }
+tokio-util        = { workspace = true }
 clap              = { workspace = true }
 anyhow            = { workspace = true }
 thiserror         = { workspace = true }
@@ -122,6 +138,7 @@ qrcode     = { workspace = true }
 image      = { workspace = true }
 chrono     = { workspace = true }
 tokio      = { workspace = true }
+tokio-util = { workspace = true }
 axum       = { workspace = true }
 axum-server = { workspace = true }
 rcgen      = { workspace = true }

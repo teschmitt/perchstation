@@ -11,7 +11,8 @@
 //! 6. Emit `service.ready` and call `sd_notify(READY=1)` immediately
 //!    afterwards so systemd `Type=notify` observes a truthful resume
 //!    timestamp (SC-003).
-//! 7. Spawn the [`DeliveryRunner`] and [`ClassifyPoller`] tasks.
+//! 7. Spawn the [`DeliveryRunner`], [`ClassifyPoller`], and capture
+//!    [`Capture`] tasks.
 //! 8. Wait for `SIGTERM` (or `SIGINT`), emit `service.shutdown`, abort
 //!    the worker tasks, and return.
 //!
@@ -22,6 +23,7 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use perchstation_core::capture::{Capture, CaptureState, StagingDir};
 use perchstation_core::config::Config;
 use perchstation_core::delivery::classify::ClassifyPoller;
 use perchstation_core::delivery::retry::BackoffSchedule;
@@ -30,11 +32,16 @@ use perchstation_core::hw_traits::Clock;
 use perchstation_core::identity::{IdentityError, StationIdentity};
 use perchstation_core::observability::tracing as obs_tracing;
 use perchstation_core::perchpub::client::PerchpubClient;
+use perchstation_core::queue::inbox::StoreInbox;
+use perchstation_core::queue::policy::{PolicyInbox, QueuePolicy};
 use perchstation_core::queue::store::QueueStore;
 use perchstation_hw::clock::SystemClock;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio_util::sync::CancellationToken;
 
 use crate::commands::CommandError;
+
+const CAPTURE_STAGING_SUBDIR: &str = "capture-staging";
 
 pub async fn run(config: &Config) -> Result<(), CommandError> {
     let perchpub_url = match config.perchpub_url.as_deref() {
@@ -106,10 +113,19 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
         schedule,
         identity.clone(),
     );
-    let poller = ClassifyPoller::new(store, client, clock);
+    let poller = ClassifyPoller::new(store.clone(), client, clock.clone());
 
     let delivery_handle = tokio::spawn(runner.run());
     let classify_handle = tokio::spawn(poller.run());
+
+    // Build the capture loop's inbox + adapters and spawn its supervised
+    // task alongside delivery / classify. Linux-only: on dev hosts that
+    // are not Linux the production adapters are absent — the capture
+    // task is not spawned, mirroring the pattern feature 001 used for
+    // the QR camera adapter.
+    let capture_shutdown = CancellationToken::new();
+    let capture_handle =
+        spawn_capture_task(config, store.clone(), clock.clone(), capture_shutdown.clone());
 
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|err| CommandError::Io(anyhow!("install SIGTERM handler: {err}")))?;
@@ -127,10 +143,91 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
         "perchstation serve shutting down",
     );
 
+    capture_shutdown.cancel();
     delivery_handle.abort();
     classify_handle.abort();
 
+    if let Some(handle) = capture_handle {
+        // Give the capture loop a brief chance to drain before falling
+        // back to abort. The supervisor exits cleanly when the
+        // CancellationToken fires; abort is the belt-and-braces path.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_capture_task(
+    config: &Config,
+    store: QueueStore,
+    clock: Arc<dyn Clock>,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use perchstation_hw::camera_recorder::LibcameraVidCamera;
+    use perchstation_hw::motion_sensor::GpioMotionSensor;
+
+    let staging_path = config.data_dir.join(CAPTURE_STAGING_SUBDIR);
+    let policy = QueuePolicy::from(&config.queue);
+    let inbox = Arc::new(PolicyInbox::new(StoreInbox::new(store.clone()), store, policy));
+
+    let sensor = match GpioMotionSensor::new(
+        &config.capture.sensor_gpiochip,
+        config.capture.sensor_line,
+        config.capture.sensor_active_high,
+    ) {
+        Ok(s) => s,
+        Err(err) => {
+            // Capture failure must not block delivery (FR-012). Log a
+            // warning so an operator on real hardware sees the
+            // misconfiguration; on dev hosts without /dev/gpiochip0
+            // this is the expected path.
+            tracing::warn!(
+                event = "capture.init_failed",
+                error = %err,
+                chip = %config.capture.sensor_gpiochip.display(),
+                line = config.capture.sensor_line,
+                "capture loop not started: motion sensor unavailable",
+            );
+            return None;
+        }
+    };
+
+    let camera = LibcameraVidCamera::new(
+        &staging_path,
+        config.capture.camera_width,
+        config.capture.camera_height,
+        config.capture.camera_framerate,
+        config.capture.camera_bitrate_bps,
+    );
+
+    let state = Arc::new(CaptureState::new());
+    let capture = Capture::new(
+        Box::new(sensor),
+        Box::new(camera),
+        inbox,
+        state,
+        clock,
+        config.capture.clone(),
+        StagingDir::new(&staging_path),
+    );
+
+    Some(tokio::spawn(capture.run(shutdown)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_capture_task(
+    _config: &Config,
+    _store: QueueStore,
+    _clock: Arc<dyn Clock>,
+    _shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Production hardware adapters are Linux-only; on non-Linux hosts
+    // (dev machines that are not Pi-like) the capture loop is simply
+    // not spawned. Integration tests exercise the supervisor via the
+    // in-memory fakes.
+    tracing::info!(event = "capture.skipped", "capture loop not started: target_os != linux",);
+    None
 }
 
 fn count_pending(store: &QueueStore) -> std::io::Result<u32> {

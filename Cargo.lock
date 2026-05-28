@@ -781,8 +781,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09831ec59b80be69e75d29cf36e16afbbe5fd1af9c1bf4689ad91c77db5aa6a6"
 dependencies = [
  "bitflags",
+ "futures",
  "libc",
  "nix",
+ "tokio",
 ]
 
 [[package]]
@@ -1415,6 +1417,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1455,8 +1458,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
  "gpio-cdev",
  "image",
+ "nix",
  "perchstation-core",
  "tempfile",
  "thiserror 2.0.18",
@@ -2240,6 +2245,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

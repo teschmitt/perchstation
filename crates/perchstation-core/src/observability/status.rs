@@ -147,9 +147,14 @@ pub struct CaptureFailureSnapshot {
 
 /// Sensor-liveness projection. The `serde` representation is
 /// `lower_snake_case` to match the JSON contract in `cli.md`.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+///
+/// `Default` is `NeverObserved` so [`CaptureSnapshot::default`] and
+/// [`crate::capture::state::CaptureState::new`] both produce the
+/// explicit "no liveness probe has run yet" reading.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureLivenessSnapshot {
+    #[default]
     NeverObserved,
     Healthy,
     StuckAsserted,

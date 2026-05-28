@@ -23,7 +23,9 @@ tempfile          = { workspace = true }
 # the capture-loop traits live in perchstation-core and are exercised host-side
 # via the in-memory fakes under tests/integration/support/.
 [target.'cfg(target_os = "linux")'.dependencies]
-gpio-cdev = "0.6"
+gpio-cdev    = { version = "0.6", features = ["async-tokio"] }
+futures-util = { version = "0.3", default-features = false }
+nix          = { version = "0.27", default-features = false, features = ["signal"] }
 
 [lints.rust]
 # `unsafe_code` is the workspace default `deny`. This crate is the documented
