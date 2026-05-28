@@ -183,6 +183,17 @@ async fn drop_oldest_undelivered_falls_back_to_pending_when_no_undeliverable_rem
     };
     let inbox = PolicyInbox::new(StoreInbox::new(store.clone()), store.clone(), policy);
 
+    // Install a scoped subscriber even though we don't assert on events.
+    // Triggering `tracing::warn!(QUEUE_EVICTED, ...)` from a thread without
+    // a default subscriber poisons tracing-core's per-callsite interest
+    // cache to `Never` (via the `Rebuilder::JustOne` fast path that consults
+    // `dispatcher::get_default` on the *registering* thread). That cache is
+    // process-global and would silently break the sibling
+    // `drop_oldest_undelivered_evicts_*` test, which shares this binary and
+    // expects to capture the same event.
+    let buf = CaptureBuffer::new();
+    let _guard = install_json_subscriber(&buf);
+
     inbox
         .submit(&new_clip, ClipMeta { captured_at: Utc::now() })
         .await
