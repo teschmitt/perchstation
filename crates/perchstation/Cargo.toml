@@ -102,6 +102,56 @@ name    = "capture_idle"
 path    = "../../tests/integration/capture_idle.rs"
 harness = true
 
+[[test]]
+name    = "capture_cooldown"
+path    = "../../tests/integration/capture_cooldown.rs"
+harness = true
+
+[[test]]
+name    = "capture_stuck_sensor"
+path    = "../../tests/integration/capture_stuck_sensor.rs"
+harness = true
+
+[[test]]
+name    = "capture_unavailable_sensor"
+path    = "../../tests/integration/capture_unavailable_sensor.rs"
+harness = true
+
+[[test]]
+name    = "capture_recording_failure"
+path    = "../../tests/integration/capture_recording_failure.rs"
+harness = true
+
+[[test]]
+name    = "capture_disk_pressure"
+path    = "../../tests/integration/capture_disk_pressure.rs"
+harness = true
+
+[[test]]
+name    = "capture_queue_full"
+path    = "../../tests/integration/capture_queue_full.rs"
+harness = true
+
+[[test]]
+name    = "capture_resilience"
+path    = "../../tests/integration/capture_resilience.rs"
+harness = true
+
+[[test]]
+name    = "capture_camera_hang"
+path    = "../../tests/integration/capture_camera_hang.rs"
+harness = true
+
+[[test]]
+name    = "capture_concurrent_event"
+path    = "../../tests/integration/capture_concurrent_event.rs"
+harness = true
+
+[[test]]
+name    = "capture_isolation"
+path    = "../../tests/integration/capture_isolation.rs"
+harness = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }

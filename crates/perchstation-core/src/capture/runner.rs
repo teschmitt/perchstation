@@ -1,9 +1,11 @@
 //! Capture supervisor: the single tokio task that owns the motion sensor,
 //! the camera, and the cooldown / liveness gates.
 //!
-//! US1 implements the happy-path trigger → record → submit loop. US2's
-//! liveness, disk-pressure, queue-refusal, and hang-recovery branches
-//! extend [`Capture`] in T032 (Phase 4).
+//! US1 implemented the happy-path trigger → record → submit loop. US2's
+//! T032 extension adds: the [`SensorLivenessTracker`]-driven liveness tick,
+//! the liveness gate (refuse-to-record when degraded), the pre-record
+//! disk-pressure gate, and the routing of `next_trigger` adapter errors
+//! through the tracker.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,11 +14,15 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use crate::capture::cooldown::{CooldownOutcome, CooldownState};
+use crate::capture::liveness::{
+    DegradedKind, SensorLiveness, SensorLivenessTracker, SensorLivenessTransition,
+};
 use crate::capture::recording::{CaptureRecordError, record_into_staging};
-use crate::capture::staging::StagingDir;
+use crate::capture::staging::{StagingDir, staging_bytes};
 use crate::capture::state::CaptureState;
 use crate::config::CaptureConfig;
 use crate::hw_traits::{Camera, CameraError, Clock, MotionSensor, MotionSensorError};
+use crate::observability::status::CaptureLivenessSnapshot;
 use crate::observability::tracing as obs_tracing;
 use crate::queue::InboxError;
 use crate::queue::inbox::Inbox;
@@ -40,6 +46,7 @@ pub struct Capture {
     config: CaptureConfig,
     staging: StagingDir,
     cooldown: CooldownState,
+    liveness: SensorLivenessTracker,
 }
 
 impl Capture {
@@ -55,6 +62,7 @@ impl Capture {
         config: CaptureConfig,
         staging: StagingDir,
     ) -> Self {
+        let liveness = SensorLivenessTracker::new(config.liveness_stuck_secs);
         Self {
             sensor,
             camera,
@@ -64,6 +72,7 @@ impl Capture {
             config,
             staging,
             cooldown: CooldownState::new(),
+            liveness,
         }
     }
 
@@ -87,9 +96,7 @@ impl Capture {
     /// - `MotionSensor::next_trigger` — yields the next quiescent-to-
     ///   asserted edge (cancellation-safe by the trait's contract).
     /// - A liveness-tick `tokio::time::interval` — fires every
-    ///   `liveness_poll_secs`. US1 reads the tick but does nothing with
-    ///   it; US2's T032 extension hooks the `SensorLivenessTracker`
-    ///   probe in here.
+    ///   `liveness_poll_secs`, drives [`Self::update_liveness`].
     /// - `shutdown.cancelled()` — exits cleanly.
     pub(super) async fn run_loop(mut self, shutdown: CancellationToken) {
         let poll_secs = self.config.liveness_poll_secs.max(1);
@@ -105,8 +112,7 @@ impl Capture {
                     self.handle_trigger(trigger).await;
                 }
                 _ = liveness.tick() => {
-                    // US1 has no liveness work to do; US2's T032
-                    // extension injects the level probe here.
+                    self.update_liveness();
                 }
                 () = shutdown.cancelled() => {
                     tracing::info!(
@@ -120,19 +126,73 @@ impl Capture {
         }
     }
 
+    /// Probe the sensor level and feed the result into the
+    /// [`SensorLivenessTracker`]. Emits any resulting transition events
+    /// and updates the [`CaptureState`] projection.
+    fn update_liveness(&mut self) {
+        let now = self.clock.now();
+        let result = self.sensor.level();
+        let transition = self.liveness.observe_level(now, result);
+        self.apply_transition(transition);
+    }
+
+    fn apply_transition(&mut self, transition: SensorLivenessTransition) {
+        match transition {
+            SensorLivenessTransition::NoChange => {}
+            SensorLivenessTransition::Degraded { kind, since, reason } => {
+                Self::emit_degraded(kind, since, reason.as_deref());
+                let snap = match kind {
+                    DegradedKind::StuckAsserted => CaptureLivenessSnapshot::StuckAsserted,
+                    DegradedKind::Unavailable => CaptureLivenessSnapshot::Unavailable,
+                };
+                self.state.set_liveness(snap, Some(since));
+            }
+            SensorLivenessTransition::Recovered { kind } => {
+                Self::emit_recovered(kind);
+                self.state.set_liveness(CaptureLivenessSnapshot::Healthy, None);
+            }
+        }
+    }
+
+    fn emit_degraded(kind: DegradedKind, since: chrono::DateTime<Utc>, reason: Option<&str>) {
+        let since_str = since.to_rfc3339();
+        match reason {
+            Some(r) => {
+                tracing::warn!(
+                    event = obs_tracing::events::CAPTURE_SENSOR_DEGRADED,
+                    kind = kind.as_str(),
+                    since = %since_str,
+                    reason = r,
+                    "sensor liveness degraded",
+                );
+            }
+            None => {
+                tracing::warn!(
+                    event = obs_tracing::events::CAPTURE_SENSOR_DEGRADED,
+                    kind = kind.as_str(),
+                    since = %since_str,
+                    "sensor liveness degraded",
+                );
+            }
+        }
+    }
+
+    fn emit_recovered(kind: DegradedKind) {
+        tracing::info!(
+            event = obs_tracing::events::CAPTURE_SENSOR_RECOVERED,
+            kind = kind.as_str(),
+            "sensor liveness recovered",
+        );
+    }
+
     /// Handle one resolved `next_trigger` future.
     async fn handle_trigger(&mut self, trigger: Result<chrono::DateTime<Utc>, MotionSensorError>) {
         let triggered_at = match trigger {
             Ok(at) => at,
             Err(err) => {
-                // US1 logs the adapter error and continues; US2 (T032)
-                // routes this through the `SensorLivenessTracker`.
-                tracing::warn!(
-                    event = obs_tracing::events::CAPTURE_SENSOR_DEGRADED,
-                    kind = "unavailable",
-                    reason = %err,
-                    "motion sensor returned error",
-                );
+                let now = self.clock.now();
+                let transition = self.liveness.observe_trigger_error(now, &err);
+                self.apply_transition(transition);
                 return;
             }
         };
@@ -144,6 +204,10 @@ impl Capture {
         );
 
         let now = self.clock.now();
+
+        // Cooldown gate. A sustained-asserted sensor or a recent failure
+        // can produce a fresh edge while we are still inside the
+        // cooldown window; the gate short-circuits the loop.
         if self.cooldown.is_active(now) {
             let until = self.cooldown.until().expect("is_active implies Some(until)");
             tracing::debug!(
@@ -154,6 +218,55 @@ impl Capture {
             return;
         }
 
+        // Liveness gate. While the sensor is degraded, the supervisor
+        // refuses to record (US2 #3, US2 #4).
+        if self.liveness.is_degraded() {
+            let snapshot = sensor_liveness_label(self.liveness.state());
+            tracing::warn!(
+                event = obs_tracing::events::CAPTURE_DEGRADED_SKIP,
+                sensor_liveness = snapshot,
+                "trigger arrived while sensor is degraded",
+            );
+            self.start_cooldown(CooldownOutcome::DegradedSkip);
+            return;
+        }
+
+        // Disk-pressure gate. The pre-record check (FR-013) refuses to
+        // start a recording when the staging directory's current
+        // footprint already exceeds the configured ceiling.
+        match staging_bytes(self.staging.as_path()) {
+            Ok(bytes) if bytes >= self.config.max_staging_bytes => {
+                tracing::warn!(
+                    event = obs_tracing::events::CAPTURE_DISK_PRESSURE_SKIP,
+                    staging_bytes = bytes,
+                    max_staging_bytes = self.config.max_staging_bytes,
+                    "trigger refused: staging-side disk pressure",
+                );
+                self.state.record_failure(
+                    self.clock.now(),
+                    "disk_pressure",
+                    format!("{}/{} bytes", bytes, self.config.max_staging_bytes),
+                );
+                self.start_cooldown(CooldownOutcome::DiskPressureSkip);
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                // Fall through to recording; let the camera adapter
+                // surface the I/O error. A failed staging_bytes call
+                // does not by itself justify refusing to record.
+                tracing::warn!(
+                    event = obs_tracing::events::CAPTURE_DISK_PRESSURE_SKIP,
+                    error = %err,
+                    "staging_bytes probe failed; continuing with recording attempt",
+                );
+            }
+        }
+
+        self.record_and_handle(triggered_at).await;
+    }
+
+    async fn record_and_handle(&mut self, triggered_at: chrono::DateTime<Utc>) {
         let recording_id = recording_id(triggered_at);
         let max_duration = Duration::from_secs(self.config.clip_duration_secs);
         let hang_margin = Duration::from_secs(self.config.hang_margin_secs);
@@ -177,47 +290,51 @@ impl Capture {
         match record_result {
             Ok(clip) => self.submit_clip(&recording_id, triggered_at, record_start, clip).await,
             Err(CaptureRecordError::Failed(err)) => {
-                tracing::warn!(
-                    event = obs_tracing::events::CAPTURE_RECORDING_FAILED,
-                    recording_id = %recording_id,
-                    kind = camera_error_kind(&err),
-                    message = %err,
-                    "capture recording failed",
-                );
-                self.state.record_failure(self.clock.now(), "recording_failed", err.to_string());
-                self.start_cooldown(CooldownOutcome::Failed);
+                self.handle_recording_failed(&recording_id, &err);
             }
             Err(CaptureRecordError::EmptyClip { path }) => {
-                tracing::warn!(
-                    event = obs_tracing::events::CAPTURE_RECORDING_FAILED,
-                    recording_id = %recording_id,
-                    kind = "empty_output",
-                    path = %path.display(),
-                    "capture recording produced no bytes",
-                );
-                self.state.record_failure(
-                    self.clock.now(),
-                    "recording_failed",
-                    "empty clip".to_string(),
-                );
-                self.start_cooldown(CooldownOutcome::Failed);
+                self.handle_recording_empty(&recording_id, &path);
             }
             Err(CaptureRecordError::Timeout) => {
-                let max_duration_ms = i64::try_from(max_duration.as_millis()).unwrap_or(i64::MAX);
-                tracing::error!(
-                    event = obs_tracing::events::CAPTURE_RECORDING_HUNG,
-                    recording_id = %recording_id,
-                    max_duration_ms,
-                    "camera adapter hung past clip duration + hang margin",
-                );
-                self.state.record_failure(
-                    self.clock.now(),
-                    "camera_hang",
-                    format!("{max_duration_ms} ms"),
-                );
-                self.start_cooldown(CooldownOutcome::Failed);
+                self.handle_recording_hung(&recording_id, max_duration);
             }
         }
+    }
+
+    fn handle_recording_failed(&mut self, recording_id: &str, err: &CameraError) {
+        tracing::warn!(
+            event = obs_tracing::events::CAPTURE_RECORDING_FAILED,
+            recording_id,
+            kind = camera_error_kind(err),
+            message = %err,
+            "capture recording failed",
+        );
+        self.state.record_failure(self.clock.now(), "recording_failed", err.to_string());
+        self.start_cooldown(CooldownOutcome::Failed);
+    }
+
+    fn handle_recording_empty(&mut self, recording_id: &str, path: &std::path::Path) {
+        tracing::warn!(
+            event = obs_tracing::events::CAPTURE_RECORDING_FAILED,
+            recording_id,
+            kind = "empty_output",
+            path = %path.display(),
+            "capture recording produced no bytes",
+        );
+        self.state.record_failure(self.clock.now(), "recording_failed", "empty clip".to_string());
+        self.start_cooldown(CooldownOutcome::Failed);
+    }
+
+    fn handle_recording_hung(&mut self, recording_id: &str, max_duration: Duration) {
+        let max_duration_ms = i64::try_from(max_duration.as_millis()).unwrap_or(i64::MAX);
+        tracing::error!(
+            event = obs_tracing::events::CAPTURE_RECORDING_HUNG,
+            recording_id,
+            max_duration_ms,
+            "camera adapter hung past clip duration + hang margin",
+        );
+        self.state.record_failure(self.clock.now(), "camera_hang", format!("{max_duration_ms} ms"));
+        self.start_cooldown(CooldownOutcome::Failed);
     }
 
     async fn submit_clip(
@@ -291,5 +408,16 @@ fn camera_error_kind(err: &CameraError) -> &'static str {
         CameraError::Io { .. } => "io",
         CameraError::Aborted(_) => "aborted",
         CameraError::EmptyOutput => "empty_output",
+    }
+}
+
+/// Render the supervisor's current liveness state as the string the
+/// `capture.degraded_skip` event emits. Uses the `snake_case` wire form
+/// from `contracts/cli.md` §JSON output.
+const fn sensor_liveness_label(state: &SensorLiveness) -> &'static str {
+    match state {
+        SensorLiveness::Healthy => "healthy",
+        SensorLiveness::StuckAsserted { .. } => "stuck_asserted",
+        SensorLiveness::Unavailable { .. } => "unavailable",
     }
 }

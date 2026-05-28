@@ -141,6 +141,12 @@ pub mod events {
     pub const SERVICE_READY: &str = "service.ready";
     pub const SERVICE_SHUTDOWN: &str = "service.shutdown";
     pub const SERVICE_CONFIG_INVALID: &str = "service.config_invalid";
+    /// A supervised worker task ended unexpectedly (panic or non-cancellation
+    /// error). The wrapper logs this and intentionally lets the other tasks
+    /// keep running so a capture-side fault cannot stop delivery (and vice
+    /// versa). See `specs/002-capture-subsystem/contracts/cli.md` §Failure
+    /// isolation / FR-012.
+    pub const SERVICE_TASK_PANICKED: &str = "service.task_panicked";
 
     // Capture (see `specs/002-capture-subsystem/contracts/log-events.md`).
     pub const CAPTURE_READY: &str = "capture.ready";

@@ -88,6 +88,34 @@ pub fn purge(staging_dir: &Path) -> io::Result<PurgeReport> {
     Ok(PurgeReport { removed_files, removed_bytes })
 }
 
+/// Sum the size of every regular file directly under `staging_dir`.
+///
+/// Used by the supervisor's pre-record disk-pressure gate (T032) to
+/// compare the current capture-side footprint against
+/// `CaptureConfig::max_staging_bytes` before invoking the camera.
+/// Returns `0` if the directory does not exist yet (the supervisor
+/// creates it during the startup purge).
+pub fn staging_bytes(staging_dir: &Path) -> io::Result<u64> {
+    let read = match fs::read_dir(staging_dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+    let mut total: u64 = 0;
+    for entry in read {
+        let entry = entry?;
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +155,26 @@ mod tests {
         let report = purge(&staging).expect("purge");
         assert_eq!(report.removed_files, 1);
         assert!(staging.join("nested").is_dir());
+    }
+
+    #[test]
+    fn staging_bytes_returns_zero_for_missing_directory() {
+        let dir = TempDir::new().unwrap();
+        let staging = dir.path().join("does-not-exist");
+        let total = staging_bytes(&staging).expect("staging_bytes");
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn staging_bytes_sums_file_sizes_ignoring_subdirectories() {
+        let dir = TempDir::new().unwrap();
+        let staging = dir.path().join("capture-staging");
+        fs::create_dir_all(staging.join("nested")).unwrap();
+        fs::write(staging.join("a.mp4"), vec![0u8; 100]).unwrap();
+        fs::write(staging.join("b.mp4"), vec![0u8; 250]).unwrap();
+        // A nested file is not counted (we only sum top-level files).
+        fs::write(staging.join("nested").join("c.mp4"), vec![0u8; 999]).unwrap();
+        let total = staging_bytes(&staging).expect("staging_bytes");
+        assert_eq!(total, 350);
     }
 }

@@ -10,6 +10,7 @@ pub mod identity;
 pub mod observability;
 pub mod perchpub;
 pub mod queue;
+pub mod supervision;
 
 use thiserror::Error;
 

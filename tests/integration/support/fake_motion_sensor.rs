@@ -13,6 +13,9 @@
 //!   supplied message. Mirrors a disconnected GPIO line.
 //! - [`FakeMotionSensor::clear_error`] — return both surfaces to the
 //!   last `Ok` state. Used by the recovery legs of the liveness tests.
+//! - [`FakeMotionSensor::panic_on_next_trigger`] — schedule a panic to
+//!   run as soon as the supervisor awaits the next trigger. Used by the
+//!   capture↔delivery panic-isolation test (T029c).
 
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +24,15 @@ use chrono::{DateTime, Utc};
 use perchstation_core::hw_traits::{MotionSensor, MotionSensorError, SensorLevel};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-type TriggerItem = Result<DateTime<Utc>, MotionSensorError>;
+/// `next_trigger` produces one of three outcomes when consumed.
+enum TriggerItem {
+    Ok(DateTime<Utc>),
+    Err(MotionSensorError),
+    /// When this is yielded, the `next_trigger` impl panics. Used by
+    /// the panic-isolation test (T029c) to simulate a capture-side
+    /// bug that would otherwise abort the supervisor.
+    Panic(&'static str),
+}
 
 #[derive(Debug, Clone)]
 struct LevelState {
@@ -77,11 +88,16 @@ impl FakeMotionSensor {
     pub fn clear_error(&self) {
         self.handle.clear_error();
     }
+
+    /// Schedule a panic on the next `next_trigger` call.
+    pub fn panic_on_next_trigger(&self, message: &'static str) {
+        self.handle.panic_on_next_trigger(message);
+    }
 }
 
 impl FakeMotionSensorHandle {
     pub fn trigger(&self, at: DateTime<Utc>) {
-        let _ = self.tx.send(Ok(at));
+        let _ = self.tx.send(TriggerItem::Ok(at));
     }
 
     pub fn set_level(&self, level: SensorLevel) {
@@ -95,12 +111,16 @@ impl FakeMotionSensorHandle {
             let mut guard = self.state.lock().expect("fake motion-sensor mutex poisoned");
             guard.error = Some(message.clone());
         }
-        let _ = self.tx.send(Err(MotionSensorError::Unavailable(message)));
+        let _ = self.tx.send(TriggerItem::Err(MotionSensorError::Unavailable(message)));
     }
 
     pub fn clear_error(&self) {
         let mut guard = self.state.lock().expect("fake motion-sensor mutex poisoned");
         guard.error = None;
+    }
+
+    pub fn panic_on_next_trigger(&self, message: &'static str) {
+        let _ = self.tx.send(TriggerItem::Panic(message));
     }
 }
 
@@ -111,9 +131,12 @@ impl MotionSensor for FakeMotionSensor {
         // queued edges in place for the next call. A None return means
         // every handle has been dropped — treat that as Unavailable so
         // the supervisor's liveness tracker can still observe it.
-        self.rx.recv().await.unwrap_or_else(|| {
-            Err(MotionSensorError::Unavailable("fake motion-sensor channel closed".into()))
-        })
+        match self.rx.recv().await {
+            Some(TriggerItem::Ok(at)) => Ok(at),
+            Some(TriggerItem::Err(err)) => Err(err),
+            Some(TriggerItem::Panic(msg)) => panic!("{msg}"),
+            None => Err(MotionSensorError::Unavailable("fake motion-sensor channel closed".into())),
+        }
     }
 
     fn level(&self) -> Result<SensorLevel, MotionSensorError> {

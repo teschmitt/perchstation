@@ -35,6 +35,7 @@ use perchstation_core::perchpub::client::PerchpubClient;
 use perchstation_core::queue::inbox::StoreInbox;
 use perchstation_core::queue::policy::{PolicyInbox, QueuePolicy};
 use perchstation_core::queue::store::QueueStore;
+use perchstation_core::supervision::spawn_supervised;
 use perchstation_hw::clock::SystemClock;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
@@ -115,8 +116,11 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     );
     let poller = ClassifyPoller::new(store.clone(), client, clock.clone());
 
-    let delivery_handle = tokio::spawn(runner.run());
-    let classify_handle = tokio::spawn(poller.run());
+    // Wrap each long-lived worker in `spawn_supervised` so a panic in
+    // one task is logged and isolated rather than aborting the others
+    // (FR-012, SC-009).
+    let delivery_handle = spawn_supervised("delivery", runner.run());
+    let classify_handle = spawn_supervised("classify", poller.run());
 
     // Build the capture loop's inbox + adapters and spawn its supervised
     // task alongside delivery / classify. Linux-only: on dev hosts that
@@ -212,7 +216,7 @@ fn spawn_capture_task(
         StagingDir::new(&staging_path),
     );
 
-    Some(tokio::spawn(capture.run(shutdown)))
+    Some(spawn_supervised("capture", capture.run(shutdown)))
 }
 
 #[cfg(not(target_os = "linux"))]
