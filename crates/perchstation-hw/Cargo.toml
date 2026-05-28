@@ -19,6 +19,12 @@ tracing           = { workspace = true }
 async-trait       = { workspace = true }
 tempfile          = { workspace = true }
 
+# Linux-only GPIO character-device binding (research.md R-2). Production-only;
+# the capture-loop traits live in perchstation-core and are exercised host-side
+# via the in-memory fakes under tests/integration/support/.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpio-cdev = "0.6"
+
 [lints.rust]
 # `unsafe_code` is the workspace default `deny`. This crate is the documented
 # exception per the constitution: each unsafe block carries an invariant comment.

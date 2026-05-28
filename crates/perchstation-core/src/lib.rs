@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 #![deny(clippy::all)]
 
+pub mod capture;
 pub mod config;
 pub mod delivery;
 pub mod enrollment;

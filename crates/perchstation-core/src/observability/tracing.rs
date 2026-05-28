@@ -141,6 +141,22 @@ pub mod events {
     pub const SERVICE_READY: &str = "service.ready";
     pub const SERVICE_SHUTDOWN: &str = "service.shutdown";
     pub const SERVICE_CONFIG_INVALID: &str = "service.config_invalid";
+
+    // Capture (see `specs/002-capture-subsystem/contracts/log-events.md`).
+    pub const CAPTURE_READY: &str = "capture.ready";
+    pub const CAPTURE_SHUTDOWN: &str = "capture.shutdown";
+    pub const CAPTURE_STAGING_PURGED: &str = "capture.staging_purged";
+    pub const CAPTURE_TRIGGER_OBSERVED: &str = "capture.trigger_observed";
+    pub const CAPTURE_RECORDING_STARTED: &str = "capture.recording_started";
+    pub const CAPTURE_RECORDING_COMPLETED: &str = "capture.recording_completed";
+    pub const CAPTURE_RECORDING_FAILED: &str = "capture.recording_failed";
+    pub const CAPTURE_RECORDING_HUNG: &str = "capture.recording_hung";
+    pub const CAPTURE_COOLDOWN_SKIP: &str = "capture.cooldown_skip";
+    pub const CAPTURE_DEGRADED_SKIP: &str = "capture.degraded_skip";
+    pub const CAPTURE_DISK_PRESSURE_SKIP: &str = "capture.disk_pressure_skip";
+    pub const CAPTURE_QUEUE_REFUSED: &str = "capture.queue_refused";
+    pub const CAPTURE_SENSOR_DEGRADED: &str = "capture.sensor_degraded";
+    pub const CAPTURE_SENSOR_RECOVERED: &str = "capture.sensor_recovered";
 }
 
 /// In-memory registry of strings that must never appear in any log event.

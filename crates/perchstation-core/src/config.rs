@@ -48,6 +48,9 @@ pub struct Config {
 
     #[serde(default)]
     pub retry: RetryConfig,
+
+    #[serde(default)]
+    pub capture: CaptureConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +106,64 @@ impl Default for RetryConfig {
     }
 }
 
+/// `[capture]` section — knobs that tune the motion-triggered capture loop.
+///
+/// Defaults from research.md R-4 (cooldown, clip duration), R-7
+/// (`max_staging_bytes`), and R-10 (assembled view). The hardware-specific
+/// `sensor_*` and `camera_*` fields are only consumed by the production
+/// adapters in `perchstation-hw`; the platform-agnostic capture supervisor
+/// in `perchstation-core` does not see them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureConfig {
+    #[serde(default = "default_clip_duration_secs")]
+    pub clip_duration_secs: u64,
+    #[serde(default = "default_hang_margin_secs")]
+    pub hang_margin_secs: u64,
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u64,
+    #[serde(default = "default_liveness_stuck_secs")]
+    pub liveness_stuck_secs: u64,
+    #[serde(default = "default_liveness_poll_secs")]
+    pub liveness_poll_secs: u64,
+    #[serde(default = "default_max_staging_bytes")]
+    pub max_staging_bytes: u64,
+    #[serde(default = "default_sensor_gpiochip")]
+    pub sensor_gpiochip: PathBuf,
+    #[serde(default = "default_sensor_line")]
+    pub sensor_line: u32,
+    #[serde(default = "default_sensor_active_high")]
+    pub sensor_active_high: bool,
+    #[serde(default = "default_camera_width")]
+    pub camera_width: u32,
+    #[serde(default = "default_camera_height")]
+    pub camera_height: u32,
+    #[serde(default = "default_camera_framerate")]
+    pub camera_framerate: u32,
+    #[serde(default = "default_camera_bitrate_bps")]
+    pub camera_bitrate_bps: u64,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            clip_duration_secs: default_clip_duration_secs(),
+            hang_margin_secs: default_hang_margin_secs(),
+            cooldown_secs: default_cooldown_secs(),
+            liveness_stuck_secs: default_liveness_stuck_secs(),
+            liveness_poll_secs: default_liveness_poll_secs(),
+            max_staging_bytes: default_max_staging_bytes(),
+            sensor_gpiochip: default_sensor_gpiochip(),
+            sensor_line: default_sensor_line(),
+            sensor_active_high: default_sensor_active_high(),
+            camera_width: default_camera_width(),
+            camera_height: default_camera_height(),
+            camera_framerate: default_camera_framerate(),
+            camera_bitrate_bps: default_camera_bitrate_bps(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -110,6 +171,7 @@ impl Default for Config {
             data_dir: default_data_dir(),
             queue: QueueConfig::default(),
             retry: RetryConfig::default(),
+            capture: CaptureConfig::default(),
         }
     }
 }
@@ -171,6 +233,58 @@ const fn default_per_clip_max_wallclock_hours() -> u64 {
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("/var/lib/perchstation")
+}
+
+const fn default_clip_duration_secs() -> u64 {
+    8
+}
+
+const fn default_hang_margin_secs() -> u64 {
+    2
+}
+
+const fn default_cooldown_secs() -> u64 {
+    30
+}
+
+const fn default_liveness_stuck_secs() -> u64 {
+    300
+}
+
+const fn default_liveness_poll_secs() -> u64 {
+    5
+}
+
+const fn default_max_staging_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_sensor_gpiochip() -> PathBuf {
+    PathBuf::from("/dev/gpiochip0")
+}
+
+const fn default_sensor_line() -> u32 {
+    17
+}
+
+const fn default_sensor_active_high() -> bool {
+    true
+}
+
+const fn default_camera_width() -> u32 {
+    1280
+}
+
+const fn default_camera_height() -> u32 {
+    720
+}
+
+const fn default_camera_framerate() -> u32 {
+    30
+}
+
+const fn default_camera_bitrate_bps() -> u64 {
+    4_000_000
 }
 
 #[cfg(test)]

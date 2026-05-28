@@ -105,6 +105,57 @@ pub struct StatusSnapshot {
     pub recent: Vec<RecentEntry>,
 }
 
+/// Capture-side projection rendered into `perchstation status` (text +
+/// JSON). See `specs/002-capture-subsystem/contracts/cli.md` §`status`
+/// for the field schema and rendering rules.
+///
+/// The default value represents "the capture task has not run in this
+/// process" — used by `status` invocations outside of `serve`. It is
+/// deliberately distinct from `Healthy`: `NeverObserved` is the
+/// explicit "no data yet" signal, while `Healthy` is only published
+/// after the supervisor's first successful liveness probe.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CaptureSnapshot {
+    #[serde(serialize_with = "serialize_opt_rfc3339_z")]
+    pub last_recording_at: Option<DateTime<Utc>>,
+    pub last_clip_id: Option<String>,
+    pub last_failure: Option<CaptureFailureSnapshot>,
+    pub sensor_liveness: CaptureLivenessSnapshot,
+    #[serde(serialize_with = "serialize_opt_rfc3339_z")]
+    pub sensor_degraded_since: Option<DateTime<Utc>>,
+}
+
+impl Default for CaptureSnapshot {
+    fn default() -> Self {
+        Self {
+            last_recording_at: None,
+            last_clip_id: None,
+            last_failure: None,
+            sensor_liveness: CaptureLivenessSnapshot::NeverObserved,
+            sensor_degraded_since: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CaptureFailureSnapshot {
+    #[serde(serialize_with = "serialize_rfc3339_z")]
+    pub at: DateTime<Utc>,
+    pub kind: String,
+    pub message: String,
+}
+
+/// Sensor-liveness projection. The `serde` representation is
+/// `lower_snake_case` to match the JSON contract in `cli.md`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureLivenessSnapshot {
+    NeverObserved,
+    Healthy,
+    StuckAsserted,
+    Unavailable,
+}
+
 /// Build a snapshot of delivery health from the on-disk state at `data_dir`.
 /// Pure read; never mutates anything under `data_dir`.
 pub fn snapshot(data_dir: &Path, now: DateTime<Utc>) -> Result<StatusSnapshot, StatusError> {
