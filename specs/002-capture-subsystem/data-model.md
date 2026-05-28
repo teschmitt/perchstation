@@ -60,12 +60,19 @@ or in delivery's logs, where the `<clip-id>` minted by
 - Triggers observed while the sensor liveness state is
   `StuckAsserted` or `Unavailable` are similarly ignored.
 - Triggers that arrive during boot (before the capture loop reaches
-  its `select!`) are observed on the first call to `next_trigger` if
-  the adapter's gpiochip subscription was opened before they fired;
-  the supervisor's startup order opens the subscription **after** the
-  staging purge but **before** `service.ready`, so the worst case is
-  one stale edge that may turn into a clip on the very first iteration —
-  acceptable per the Edge Case "Sensor fires during boot or shutdown".
+  its `select!`) are observed on the first call to `next_trigger`.
+  The wiring layer in `perchstation::commands::serve` constructs
+  `GpioMotionSensor` — which opens the cdev edge subscription as a
+  side-effect of `new` — **before** spawning `Capture::run` and
+  therefore before the staging purge runs inside `Capture::run`. Any
+  edge that fires from the moment the subscription opens is
+  kernel-buffered and is yielded on the first iteration of the
+  supervisor's `select!` loop after `capture.ready`. Per the Edge
+  Case "Sensor fires during boot or shutdown", such a stale edge MAY
+  turn into a single bounded clip via the normal trigger path — the
+  staging purge already guarantees no half-state, so producing one
+  clip from a pre-readiness edge is preferable to silently dropping a
+  legitimate sensor event.
 
 ---
 
@@ -102,6 +109,28 @@ either submission completes or the staging file is cleaned up.
                             ▼
                        (back to idle)
 ```
+
+**Error type** (consumed by T016 and T032; not part of the trait
+surface):
+
+```rust
+pub enum CaptureRecordError {
+    /// `Camera::record_clip` returned `Err`. Carries the original
+    /// `CameraError` for logging.
+    Failed(CameraError),
+    /// The supervisor's outer `tokio::time::timeout(
+    /// max_duration + hang_margin)` fired before `record_clip`
+    /// resolved. Drop-cancellation runs the adapter's cleanup path.
+    Timeout,
+}
+```
+
+The recording helper in
+`crates/perchstation-core/src/capture/recording.rs` returns this; the
+supervisor in `runner.rs` matches on it to choose between
+`capture.recording_failed` and `capture.recording_hung` (see
+`contracts/log-events.md`). The error type does not cross the hardware
+boundary — `Camera::record_clip` returns `CameraError` directly.
 
 **Fields** (mostly derived from the `Camera::record_clip` return):
 
@@ -194,6 +223,32 @@ pub enum SensorLiveness {
 | *               | level()/next_trigger() returned Err          | Unavailable              | emit `capture.sensor_degraded { kind: "unavailable", reason }` |
 | Unavailable     | level() returned Ok                          | Healthy                  | emit `capture.sensor_recovered { kind: "unavailable" }` |
 
+**Transition events** (consumed by T030 and T032; emitted by the
+`observe_*` methods):
+
+```rust
+pub enum SensorLivenessTransition {
+    Degraded {
+        kind: DegradedKind,           // "stuck_asserted" | "unavailable"
+        since: DateTime<Utc>,
+        reason: Option<String>,       // Some(_) only for Unavailable
+    },
+    Recovered {
+        kind: DegradedKind,           // matches the prior Degraded
+    },
+    NoChange,
+}
+```
+
+`SensorLivenessTracker::observe_level` and `observe_trigger_error`
+return `SensorLivenessTransition`. The supervisor uses the returned
+enum to (a) emit the corresponding `capture.sensor_degraded` /
+`capture.sensor_recovered` event via the `tracing` constants from
+T005, (b) update `CaptureState::set_liveness`, and (c) decide whether
+to start a cooldown after a `Degraded` transition. `NoChange` is
+returned on every probe that does not move the state — the supervisor
+ignores it.
+
 **Invariants**:
 - `is_degraded()` returns true iff state is `StuckAsserted` or
   `Unavailable`. The supervisor consults this *before* starting a
@@ -242,6 +297,27 @@ that it updates on each handled trigger (start, success, failure,
 liveness transition). `status::snapshot(data_dir, now)` clones the
 inner data via a read-lock acquisition — read-only with respect to
 on-disk state (so it is still safe to run alongside `serve`).
+
+**Mutable inner** (consumed by T015; not part of the projection
+surface):
+
+```rust
+pub(crate) struct CaptureStateInner {
+    pub last_recording_at:     Option<DateTime<Utc>>,
+    pub last_clip_id:          Option<String>,
+    pub last_failure:          Option<CaptureFailureSnapshot>,
+    pub sensor_liveness:       CaptureLivenessSnapshot,
+    pub sensor_degraded_since: Option<DateTime<Utc>>,
+}
+```
+
+`CaptureState` wraps `Arc<RwLock<CaptureStateInner>>`. The
+writer-facing methods (`record_success`, `record_failure`,
+`set_liveness`) take a `&self` and acquire a write-lock;
+`snapshot(&self)` takes a read-lock and clones the inner into a
+`CaptureSnapshot`. `CaptureStateInner::default()` produces
+`sensor_liveness = NeverObserved` and every other field `None`,
+matching the standalone-`status` projection described above.
 
 **Why a read-side projection rather than reading the queue**: the
 spec asks `perchstation status` to report **capture-side** state —
