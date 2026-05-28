@@ -203,7 +203,15 @@ pub enum SensorLiveness {
 
 ---
 
-## Entity: CaptureStateSnapshot (read-side projection)
+## Entity: CaptureSnapshot (read-side projection)
+
+**Naming**: `CaptureState` is the mutable in-process holder (an
+`Arc<RwLock<CaptureStateInner>>`, owned by the supervisor and updated
+on each handled trigger). `CaptureSnapshot` is the immutable projection
+produced by `CaptureState::snapshot()` and joined into the existing
+`StatusSnapshot` as a new `capture: CaptureSnapshot` field. The two
+names are intentionally distinct: writers see `CaptureState`, readers
+see `CaptureSnapshot`.
 
 **Lifetime**: a single read-only snapshot, rebuilt on demand by
 `perchstation status`. Not persisted. Joined into the existing

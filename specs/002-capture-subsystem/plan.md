@@ -104,7 +104,7 @@ point. New host-runnable integration tests under `tests/integration/`:
 | `capture_disk_pressure.rs`            | US2 #6, FR-013            |
 | `capture_queue_full.rs`               | US2 #7, FR-018            |
 | `capture_status_surface.rs`           | US3 #1, #2, SC-007        |
-| `capture_resilience.rs`               | US2 #1, FR-009, SC-003 (crash-restart with staging purge; queue intact) |
+| `capture_resilience.rs`               | US2 #1, FR-009, FR-017, SC-003 (crash-restart with staging purge; queue intact) |
 | `capture_no_network.rs`               | US3 #3 (extends 001's outbound_allowlist with capture loop running) |
 
 On-device verification that genuinely needs a Pi (real GPIO edges, real
@@ -132,6 +132,21 @@ Structure" below.
 - SC-008 — idle device performs no camera I/O; the only log emissions
   are the existing periodic-health cadence from the delivery loop.
 
+**Derived success criteria** (no separate test built):
+
+- SC-002 (bounded clip count over 7 days) is a structural consequence
+  of FR-005 + FR-006: the worst-case rate is
+  `3600 / (clip_duration_secs + cooldown_secs)` per hour, ~95 clips/h
+  with the defaults (already noted in Scale/Scope below). The
+  cooldown enforcement itself is covered by `capture_cooldown.rs`
+  (T023); no 7-day soak is built.
+- SC-006 (capture-side disk footprint within ceiling over 7 days) is
+  a structural consequence of FR-013: the pre-record disk-pressure
+  gate refuses to record before the ceiling is breached. The gate is
+  covered by `capture_disk_pressure.rs` (T027); a 30-minute on-device
+  spot-check is added to `deploy/RELEASE-CHECKLIST.md` (T039) to
+  validate the structural property on real hardware.
+
 **Constraints**:
 
 - Memory ceiling: the capture loop's steady-state RSS contribution is
@@ -150,9 +165,16 @@ Structure" below.
 - Bounded cooldown: `capture.cooldown_secs` (default 30 s).
 - Sensor liveness threshold: `capture.liveness_stuck_secs` (default
   300 s). See research.md R-4.
-- The capture loop produces no network traffic (FR-014, US3 #3); this
-  remains a tested invariant via the existing `outbound_allowlist.rs`
-  test, extended to keep the capture loop running for its duration.
+- Sensor liveness poll cadence: `capture.liveness_poll_secs` (default
+  5 s). Bounds detection latency for SC-004/SC-005: a stuck or
+  unavailable sensor is reflected within ≤ `liveness_poll_secs` of the
+  threshold crossing (or the first failed adapter read), comfortably
+  inside the 60 s budget.
+- The capture loop produces no network traffic (US3 #3); this remains
+  a tested invariant via the existing `outbound_allowlist.rs` test,
+  extended to keep the capture loop running for its duration. (FR-014
+  forbids a new telemetry channel — a related but distinct guarantee
+  enforced by reusing the existing `tracing` JSON channel.)
 - `unsafe` forbidden in `perchstation-core` (Principle II + workspace
   lint); confined to `perchstation-hw`, where any `unsafe` block (the
   `gpio-cdev` crate is itself safe Rust; the camera shell-out is too)
