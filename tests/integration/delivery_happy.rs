@@ -1,12 +1,8 @@
-//! T021 — happy-path delivery, RED.
+//! T021 — happy-path delivery.
 //!
 //! Pre-populates credentials, drops a clip into `queue/pending/`, runs
-//! `perchstation serve` until the clip lands in `queue/delivered/`,
-//! then SIGKILLs the process and inspects on-disk + log state.
-//!
-//! Currently fails because `commands::serve::run` is `unimplemented!()` —
-//! the subprocess panics, the delivered sidecar never appears, and no
-//! events fire.
+//! `perchstation serve` until the `classify.terminal` event is observed
+//! on stderr, then SIGKILLs the process and inspects on-disk + log state.
 //!
 //! Covers spec.md §US1 acceptance #2 and #3.
 
@@ -14,15 +10,17 @@
 mod support;
 
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use uuid::Uuid;
 
 use support::fakepub::FakePerchpub;
 use support::fixtures::{build_station_keypair, sample_mp4_bytes, write_test_credentials};
 use support::harness::{perchstation_bin_path, write_config_toml};
-use support::logs::{event_codes, parse_json_events};
+use support::logs::event_codes;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // linear setup → assert sequence; splitting helps neither
@@ -77,24 +75,50 @@ async fn delivery_happy_path() {
         .spawn()
         .expect("spawn perchstation serve");
 
-    // Wait until the classify poller has driven the entry to a terminal
-    // `last_classify_status` — otherwise SIGKILLing before
-    // `classify.terminal` fires races the test against the poller's 5 ms
-    // active-scan tick. The sidecar transitions to `Success` *before*
-    // the event is emitted, so the small post-observation sleep gives
-    // tracing's unbuffered stderr writer time to flush.
+    // Drain stderr line-by-line in a background task and parse each line as
+    // a JSON event into a shared buffer. Waiting on a specific captured
+    // event (rather than on a sidecar state followed by a fixed grace
+    // sleep) closes the race where SIGKILL severs the pipe before the
+    // poller's `classify.terminal` `write(2)` reaches the kernel buffer.
+    // The production order is sidecar-write → tracing emit, so observing
+    // the event also guarantees the on-disk state has settled.
     let delivered_dir = data_dir.path().join("queue/delivered");
     let delivered_sidecar = delivered_dir.join(format!("{clip_id}.json"));
+    let stderr_pipe = child.stderr.take().expect("stderr piped");
+    let captured_events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_stderr: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let drain_events = captured_events.clone();
+    let drain_stderr = captured_stderr.clone();
+    let drain_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr_pipe);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    drain_stderr.lock().unwrap().extend_from_slice(line.as_bytes());
+                    if let Ok(value) = serde_json::from_str::<Value>(line.trim())
+                        && value.is_object()
+                    {
+                        drain_events.lock().unwrap().push(value);
+                    }
+                }
+            }
+        }
+    });
+
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(bytes) = std::fs::read(&delivered_sidecar)
-            && let Ok(entry) = serde_json::from_slice::<Value>(&bytes)
-            && entry.get("last_classify_status").and_then(Value::as_str) == Some("Success")
-        {
+        let saw_terminal = captured_events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("event").and_then(Value::as_str) == Some("classify.terminal"));
+        if saw_terminal {
             break;
         }
         if child.try_wait().expect("try_wait").is_some() {
-            // RED: serve panicked; no point spinning
             break;
         }
         if Instant::now() >= deadline {
@@ -102,14 +126,13 @@ async fn delivery_happy_path() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // Tiny grace period so the `classify.terminal` log emission completes
-    // before SIGKILL severs the stderr pipe.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let _ = child.kill().await;
-    let output = child.wait_with_output().await.expect("collect subprocess output");
+    let _ = child.wait().await;
+    let _ = drain_task.await;
 
-    let events = parse_json_events(&output.stderr);
+    let events = captured_events.lock().unwrap().clone();
+    let stderr_bytes = captured_stderr.lock().unwrap().clone();
     let codes = event_codes(&events);
 
     // --- on-disk state: clip ended up in delivered/, mp4 unlinked ---
@@ -134,7 +157,7 @@ async fn delivery_happy_path() {
         delivered_sidecar.exists(),
         "delivered sidecar missing\n  events: {codes:?}\n  fs: {}\n  stderr: {}",
         fs_state(),
-        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&stderr_bytes),
     );
     assert!(!pending_mp4.exists(), "pending mp4 still present: {}", pending_mp4.display());
     assert!(!pending_sidecar.exists(), "pending sidecar still present");
@@ -167,7 +190,7 @@ async fn delivery_happy_path() {
         assert!(
             codes.iter().any(|c| c == want),
             "missing event {want} in {codes:?}\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&stderr_bytes),
         );
     }
 
