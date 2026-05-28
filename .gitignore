@@ -9,3 +9,6 @@ Thumbs.db
 *.swp
 .vscode/
 .idea/
+
+# Per-user Claude Code config (hooks, MCP servers, etc.)
+.claude/settings.local.json
