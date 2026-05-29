@@ -165,9 +165,9 @@ fixture and assert zero outbound traffic from any capture-side code.
 **Purpose**: Operator-facing artefacts, on-device verification checklist,
 and final workspace-wide gates.
 
-- [ ] T038 [P] Add a commented `[capture]` section to `deploy/config.example.toml` documenting every field from `CaptureConfig` (defaults from research.md R-4 / R-7 / R-10) — `clip_duration_secs`, `hang_margin_secs`, `cooldown_secs`, `liveness_stuck_secs`, `liveness_poll_secs`, `max_staging_bytes`, `sensor_gpiochip`, `sensor_line`, `sensor_active_high`, `camera_width`, `camera_height`, `camera_framerate`, `camera_bitrate_bps`.
-- [ ] T039 [P] Append capture-side smoke-test items to `deploy/RELEASE-CHECKLIST.md` covering: real GPIO edge from the wired motion sensor produces a clip; `libcamera-vid` produces a playable MP4; `perchstation status` reflects the new recording; sensor disconnected → status shows `unavailable` within ~60 s; sensor held asserted → status shows `stuck_asserted` after `liveness_stuck_secs`; staging directory size stays below `capture.max_staging_bytes` across a 30-minute trigger loop (spot-check of SC-006's structural property).
-- [ ] T040 Run final workspace gates: `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings`, and `cargo test --workspace`. All three MUST pass clean before PR.
+- [X] T038 [P] Add a commented `[capture]` section to `deploy/config.example.toml` documenting every field from `CaptureConfig` (defaults from research.md R-4 / R-7 / R-10) — `clip_duration_secs`, `hang_margin_secs`, `cooldown_secs`, `liveness_stuck_secs`, `liveness_poll_secs`, `max_staging_bytes`, `sensor_gpiochip`, `sensor_line`, `sensor_active_high`, `camera_width`, `camera_height`, `camera_framerate`, `camera_bitrate_bps`.
+- [X] T039 [P] Append capture-side smoke-test items to `deploy/RELEASE-CHECKLIST.md` covering: real GPIO edge from the wired motion sensor produces a clip; `libcamera-vid` produces a playable MP4; `perchstation status` reflects the new recording; sensor disconnected → status shows `unavailable` within ~60 s; sensor held asserted → status shows `stuck_asserted` after `liveness_stuck_secs`; staging directory size stays below `capture.max_staging_bytes` across a 30-minute trigger loop (spot-check of SC-006's structural property).
+- [X] T040 Run final workspace gates: `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings`, and `cargo test --workspace`. All three MUST pass clean before PR.
 
 ---
 
