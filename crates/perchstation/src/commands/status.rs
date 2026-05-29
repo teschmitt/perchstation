@@ -18,7 +18,13 @@ use crate::commands::CommandError;
     reason = "uniform subcommand signature with `enroll` and `serve`, both of which need async"
 )]
 pub async fn run(args: StatusArgs, config: &Config) -> Result<(), CommandError> {
-    let snapshot = status::snapshot(&config.data_dir, Utc::now())
+    // The standalone `status` binary runs in its own process and so has
+    // no access to `serve`'s in-process `CaptureState`. Passing `None`
+    // here makes the capture-side fields fall back to their default
+    // shape (every timestamp null, sensor_liveness = "never_observed"),
+    // which is the explicit "no data yet" signal per
+    // `specs/002-capture-subsystem/contracts/cli.md` §`status`.
+    let snapshot = status::snapshot(&config.data_dir, Utc::now(), None)
         .map_err(|err| CommandError::Io(anyhow!("status snapshot failed: {err}")))?;
 
     let rendered = if args.json {

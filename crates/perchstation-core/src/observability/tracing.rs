@@ -141,6 +141,41 @@ pub mod events {
     pub const SERVICE_READY: &str = "service.ready";
     pub const SERVICE_SHUTDOWN: &str = "service.shutdown";
     pub const SERVICE_CONFIG_INVALID: &str = "service.config_invalid";
+    /// A supervised worker task ended unexpectedly (panic or non-cancellation
+    /// error). The wrapper logs this and intentionally lets the other tasks
+    /// keep running so a capture-side fault cannot stop delivery (and vice
+    /// versa). See `specs/002-capture-subsystem/contracts/cli.md` §Failure
+    /// isolation / FR-012.
+    pub const SERVICE_TASK_PANICKED: &str = "service.task_panicked";
+
+    // Capture (see `specs/002-capture-subsystem/contracts/log-events.md`).
+    pub const CAPTURE_READY: &str = "capture.ready";
+    pub const CAPTURE_SHUTDOWN: &str = "capture.shutdown";
+    /// `serve` could not bring the capture subsystem up at boot (sensor
+    /// open failed, staging purge failed, …). Delivery continues
+    /// regardless (FR-012). Carries `reason` and `error`.
+    pub const CAPTURE_INIT_FAILED: &str = "capture.init_failed";
+    /// Emitted by `serve` on non-Linux hosts where the production
+    /// capture adapters do not exist; the capture supervisor task is
+    /// simply not spawned.
+    pub const CAPTURE_SKIPPED: &str = "capture.skipped";
+    pub const CAPTURE_STAGING_PURGED: &str = "capture.staging_purged";
+    pub const CAPTURE_TRIGGER_OBSERVED: &str = "capture.trigger_observed";
+    pub const CAPTURE_RECORDING_STARTED: &str = "capture.recording_started";
+    pub const CAPTURE_RECORDING_COMPLETED: &str = "capture.recording_completed";
+    pub const CAPTURE_RECORDING_FAILED: &str = "capture.recording_failed";
+    pub const CAPTURE_RECORDING_HUNG: &str = "capture.recording_hung";
+    pub const CAPTURE_COOLDOWN_SKIP: &str = "capture.cooldown_skip";
+    pub const CAPTURE_DEGRADED_SKIP: &str = "capture.degraded_skip";
+    pub const CAPTURE_DISK_PRESSURE_SKIP: &str = "capture.disk_pressure_skip";
+    /// Internal probe failure: the pre-record `staging_bytes` probe
+    /// returned an I/O error (not bytes-over-ceiling). The trigger
+    /// is NOT skipped — the supervisor falls through to the recording
+    /// attempt and lets the camera adapter surface any further error.
+    pub const CAPTURE_STAGING_PROBE_FAILED: &str = "capture.staging_probe_failed";
+    pub const CAPTURE_QUEUE_REFUSED: &str = "capture.queue_refused";
+    pub const CAPTURE_SENSOR_DEGRADED: &str = "capture.sensor_degraded";
+    pub const CAPTURE_SENSOR_RECOVERED: &str = "capture.sensor_recovered";
 }
 
 /// In-memory registry of strings that must never appear in any log event.
@@ -320,5 +355,8 @@ mod tests {
         assert_eq!(events::ENROLLMENT_QR_DECODED, "enrollment.qr_decoded");
         assert_eq!(events::DELIVERY_UPLOAD_SUCCEEDED, "delivery.upload_succeeded");
         assert_eq!(events::SERVICE_READY, "service.ready");
+        assert_eq!(events::CAPTURE_INIT_FAILED, "capture.init_failed");
+        assert_eq!(events::CAPTURE_SKIPPED, "capture.skipped");
+        assert_eq!(events::CAPTURE_STAGING_PROBE_FAILED, "capture.staging_probe_failed");
     }
 }

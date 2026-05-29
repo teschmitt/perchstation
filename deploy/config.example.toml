@@ -42,3 +42,49 @@ per_clip_max_attempts = 12
 # Per-clip wall-clock budget. After this the clip is marked Undeliverable
 # even if it hasn't reached the attempt ceiling yet.
 per_clip_max_wallclock_hours = 24
+
+[capture]
+# Maximum duration of a single clip in seconds. The supervisor passes
+# this to the camera adapter and also wraps the call in an outer
+# `clip_duration_secs + hang_margin_secs` timeout — a hung adapter
+# cannot pin the capture loop past that bound.
+clip_duration_secs = 8
+# Slack added to `clip_duration_secs` for the outer hang-guard timeout.
+# Tune up only if the camera adapter is observed to legitimately need
+# more than a couple of seconds to finalise the MP4.
+hang_margin_secs = 2
+# Minimum wall-clock gap between consecutive recordings, measured from
+# the end of one recording to the next eligible trigger. Bounds the
+# worst-case clip rate during a sustained visit at
+# `3600 / (clip_duration_secs + cooldown_secs)` clips per hour.
+cooldown_secs = 30
+# How long the motion sensor may stay continuously asserted before the
+# liveness tracker flips it to `stuck_asserted` and refuses to record.
+# Tune up only if the wired sensor has long legitimate hold times.
+liveness_stuck_secs = 300
+# Period at which the supervisor probes the sensor level for the
+# liveness tracker. Bounds detection latency for a stuck or
+# unavailable sensor; 5 s gives a comfortable margin under the 60 s
+# SC-004 / SC-005 budget.
+liveness_poll_secs = 5
+# Hard ceiling on bytes the capture-staging directory may consume
+# before a fresh recording is refused (the pre-record disk-pressure
+# gate). Completed clips are handed straight to the delivery queue
+# and never accumulate here in steady state.
+max_staging_bytes = 268_435_456  # 256 MiB
+# Path to the Linux gpiochip character device the motion sensor is
+# wired to. Almost always `/dev/gpiochip0` on a Pi.
+sensor_gpiochip = "/dev/gpiochip0"
+# BCM line number the motion sensor's output is wired to.
+sensor_line = 17
+# Whether the sensor's asserted state is electrical HIGH (`true`) or
+# LOW (`false`). Most PIR breakouts are active-high.
+sensor_active_high = true
+# Camera frame width in pixels passed to libcamera-vid.
+camera_width = 1280
+# Camera frame height in pixels passed to libcamera-vid.
+camera_height = 720
+# Camera frame rate (frames per second) passed to libcamera-vid.
+camera_framerate = 30
+# Camera target bitrate in bits per second passed to libcamera-vid.
+camera_bitrate_bps = 4_000_000  # 4 Mbit/s

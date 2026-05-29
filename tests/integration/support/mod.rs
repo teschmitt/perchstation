@@ -27,7 +27,9 @@
 
 #![allow(dead_code)]
 
+pub mod fake_camera;
 pub mod fake_clock;
+pub mod fake_motion_sensor;
 pub mod fake_qr;
 pub mod fakepub;
 pub mod fixtures;
