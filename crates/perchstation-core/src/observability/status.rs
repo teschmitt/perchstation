@@ -17,6 +17,7 @@ use serde::Serialize;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::capture::state::CaptureState;
 use crate::identity::{CREDENTIALS_DIR, IDENTITY_FILE, IdentityError, StationIdentity};
 use crate::perchpub::types::ClassifyTaskStatus;
 use crate::queue::{ClipQueueEntry, Outcome};
@@ -103,6 +104,7 @@ pub struct StatusSnapshot {
     pub last_success: Option<SuccessSnapshot>,
     pub last_failure: Option<FailureSnapshot>,
     pub recent: Vec<RecentEntry>,
+    pub capture: CaptureSnapshot,
 }
 
 /// Capture-side projection rendered into `perchstation status` (text +
@@ -163,14 +165,29 @@ pub enum CaptureLivenessSnapshot {
 
 /// Build a snapshot of delivery health from the on-disk state at `data_dir`.
 /// Pure read; never mutates anything under `data_dir`.
-pub fn snapshot(data_dir: &Path, now: DateTime<Utc>) -> Result<StatusSnapshot, StatusError> {
+///
+/// `capture` is the in-process [`CaptureState`] the supervisor updates
+/// when `serve` is running in the same process (e.g. integration tests).
+/// When `None` is supplied — the case for the standalone `perchstation
+/// status` binary, which runs in its own process and cannot see serve's
+/// projection — the capture section falls back to
+/// [`CaptureSnapshot::default`], whose `sensor_liveness` is
+/// [`CaptureLivenessSnapshot::NeverObserved`]. That distinction is the
+/// explicit "no data yet" signal documented in `contracts/cli.md`
+/// §`status`.
+pub fn snapshot(
+    data_dir: &Path,
+    now: DateTime<Utc>,
+    capture: Option<&CaptureState>,
+) -> Result<StatusSnapshot, StatusError> {
     let enrollment = enrollment_snapshot(data_dir, now)?;
     let queue = queue_snapshot(data_dir)?;
     let delivered = load_delivered(data_dir)?;
     let last_success = pick_last_success(&delivered);
     let last_failure = pick_last_failure(&delivered);
     let recent = build_recent(&delivered);
-    Ok(StatusSnapshot { enrollment, queue, last_success, last_failure, recent })
+    let capture = capture.map(CaptureState::snapshot).unwrap_or_default();
+    Ok(StatusSnapshot { enrollment, queue, last_success, last_failure, recent, capture })
 }
 
 fn enrollment_snapshot(
@@ -380,7 +397,48 @@ impl StatusSnapshot {
             }
         }
 
+        // Capture section. Emitted even when every field is `None` so the
+        // operator can confirm the capture half is up (per
+        // `contracts/cli.md` §Text output). The three sub-lines align
+        // their values at column 19 so the block reads cleanly.
+        push_line(&mut out, "Capture:");
+        match (&self.capture.last_recording_at, &self.capture.last_clip_id) {
+            (Some(at), Some(clip_id)) => {
+                let when = at.format("%Y-%m-%d %H:%M:%S UTC");
+                push_line(&mut out, &format!("  Last recording:  {when}  {clip_id}"));
+            }
+            _ => push_line(&mut out, "  Last recording:  (none)"),
+        }
+        match &self.capture.last_failure {
+            Some(f) => {
+                let when = f.at.format("%Y-%m-%d %H:%M:%S UTC");
+                push_line(
+                    &mut out,
+                    &format!("  Last failure:    {when}  {}: {}", f.kind, f.message),
+                );
+            }
+            None => push_line(&mut out, "  Last failure:    (none)"),
+        }
+        let sensor_line = match self.capture.sensor_liveness {
+            CaptureLivenessSnapshot::NeverObserved => "(never observed)".to_string(),
+            CaptureLivenessSnapshot::Healthy => "healthy".to_string(),
+            CaptureLivenessSnapshot::StuckAsserted => {
+                format_degraded_sensor("stuck_asserted", self.capture.sensor_degraded_since)
+            }
+            CaptureLivenessSnapshot::Unavailable => {
+                format_degraded_sensor("unavailable", self.capture.sensor_degraded_since)
+            }
+        };
+        push_line(&mut out, &format!("  Sensor:          {sensor_line}"));
+
         out
+    }
+}
+
+fn format_degraded_sensor(kind: &str, since: Option<DateTime<Utc>>) -> String {
+    match since {
+        Some(t) => format!("{kind} (since {})", t.format("%Y-%m-%d %H:%M:%S UTC")),
+        None => kind.to_string(),
     }
 }
 
@@ -460,7 +518,7 @@ mod tests {
     #[test]
     fn missing_credentials_yields_missing_state() {
         let dir = TempDir::new().unwrap();
-        let snap = snapshot(dir.path(), Utc::now()).unwrap();
+        let snap = snapshot(dir.path(), Utc::now(), None).unwrap();
         assert_eq!(snap.enrollment.state, EnrollmentState::Missing);
         assert!(snap.enrollment.station_id.is_none());
         assert!(snap.enrollment.cert_not_after.is_none());
@@ -478,7 +536,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("queue/pending")).unwrap();
         fs::create_dir_all(dir.path().join("queue/inflight")).unwrap();
         fs::create_dir_all(dir.path().join("queue/delivered")).unwrap();
-        let snap = snapshot(dir.path(), Utc::now()).unwrap();
+        let snap = snapshot(dir.path(), Utc::now(), None).unwrap();
         assert_eq!(snap.queue.pending, 0);
         assert_eq!(snap.queue.inflight, 0);
         assert_eq!(snap.queue.bytes_on_disk, 0);

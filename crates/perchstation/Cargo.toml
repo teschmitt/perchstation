@@ -152,6 +152,16 @@ name    = "capture_isolation"
 path    = "../../tests/integration/capture_isolation.rs"
 harness = true
 
+[[test]]
+name    = "capture_status_surface"
+path    = "../../tests/integration/capture_status_surface.rs"
+harness = true
+
+[[test]]
+name    = "capture_no_network"
+path    = "../../tests/integration/capture_no_network.rs"
+harness = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }
