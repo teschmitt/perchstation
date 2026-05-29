@@ -233,7 +233,7 @@ authoritative license declaration.
 
 ## Links
 
-- Source: <https://codeberg.org/perchpub/perchstation>
+- Source: <https://github.com/teschmitt/perchstation>
 - Companion backend: <https://codeberg.org/perchpub/perchpub>
 - Specs and design docs: [`specs/`](specs/)
 - Operator deploy artefacts: [`deploy/`](deploy/)

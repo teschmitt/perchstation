@@ -1,6 +1,6 @@
 [Unit]
 Description=perchstation clip delivery subsystem
-Documentation=https://codeberg.org/perchpub/perchstation
+Documentation=https://github.com/teschmitt/perchstation
 After=network-online.target time-sync.target
 Wants=network-online.target time-sync.target
 
