@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use perchstation_core::capture::staging::{PurgeReport, purge as purge_staging};
-use perchstation_core::capture::{Capture, CaptureState, StagingDir};
 use perchstation_core::config::Config;
 use perchstation_core::delivery::classify::ClassifyPoller;
 use perchstation_core::delivery::retry::BackoffSchedule;
@@ -33,8 +32,6 @@ use perchstation_core::hw_traits::Clock;
 use perchstation_core::identity::{IdentityError, StationIdentity};
 use perchstation_core::observability::tracing as obs_tracing;
 use perchstation_core::perchpub::client::PerchpubClient;
-use perchstation_core::queue::inbox::StoreInbox;
-use perchstation_core::queue::policy::{PolicyInbox, QueuePolicy};
 use perchstation_core::queue::store::QueueStore;
 use perchstation_core::supervision::spawn_supervised;
 use perchstation_hw::clock::SystemClock;
@@ -180,6 +177,9 @@ fn spawn_capture_task(
     clock: Arc<dyn Clock>,
     shutdown: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    use perchstation_core::capture::{Capture, CaptureState, StagingDir};
+    use perchstation_core::queue::inbox::StoreInbox;
+    use perchstation_core::queue::policy::{PolicyInbox, QueuePolicy};
     use perchstation_hw::camera_recorder::LibcameraVidCamera;
     use perchstation_hw::motion_sensor::GpioMotionSensor;
 
