@@ -67,7 +67,11 @@ struct CountingCamera {
 
 #[async_trait]
 impl Camera for CountingCamera {
-    async fn record_clip(&mut self, _: Duration) -> Result<RecordedClip, CameraError> {
+    async fn record_clip(
+        &mut self,
+        _recording_id: &str,
+        _max_duration: Duration,
+    ) -> Result<RecordedClip, CameraError> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         Err(CameraError::EmptyOutput)
     }

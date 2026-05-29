@@ -162,7 +162,11 @@ struct OnceCamera {
 
 #[async_trait]
 impl Camera for OnceCamera {
-    async fn record_clip(&mut self, max_duration: Duration) -> Result<RecordedClip, CameraError> {
+    async fn record_clip(
+        &mut self,
+        recording_id: &str,
+        max_duration: Duration,
+    ) -> Result<RecordedClip, CameraError> {
         let n = self.invocations.fetch_add(1, Ordering::SeqCst);
         if n >= 1 {
             // Any post-first invocation is a test failure for the sustained-
@@ -171,7 +175,7 @@ impl Camera for OnceCamera {
                 "OnceCamera invoked a second time — sustained Asserted produced a forbidden recording".into(),
             ));
         }
-        self.inner.record_clip(max_duration).await
+        self.inner.record_clip(recording_id, max_duration).await
     }
 }
 

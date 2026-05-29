@@ -101,6 +101,15 @@ pub trait Camera: Send + Sync {
     /// complete container-formatted file (MP4 / H.264 in production)
     /// into the staging directory the adapter was constructed with.
     ///
+    /// `recording_id` is the supervisor-minted staging id from
+    /// `data-model.md` §`MotionTriggerEvent` (`<capture_utc_basic>-cap`).
+    /// The adapter MUST use it as the staging filename stem (e.g.
+    /// `<staging>/<recording_id>.mp4`) so the id logged in
+    /// `capture.recording_started`/`completed`/`failed` matches the
+    /// on-disk artefact exactly — an operator grepping a log line by
+    /// `recording_id` can locate the file by name without guessing
+    /// across a wall-clock second boundary.
+    ///
     /// The implementation MUST stop the recording cleanly at the bound
     /// and MUST produce a *valid* container file before returning
     /// `Ok`. On any error the implementation MUST remove its staging
@@ -115,6 +124,7 @@ pub trait Camera: Send + Sync {
     /// hang-recovery mechanism.
     async fn record_clip(
         &mut self,
+        recording_id: &str,
         max_duration: Duration,
     ) -> Result<RecordedClip, CameraError>;
 }

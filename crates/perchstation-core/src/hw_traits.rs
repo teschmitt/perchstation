@@ -120,7 +120,17 @@ pub trait Camera: Send + Sync {
     /// Record a single clip of at most `max_duration`, writing a
     /// complete container-formatted file (MP4 / H.264 in production)
     /// into the staging directory the adapter was constructed with.
-    async fn record_clip(&mut self, max_duration: Duration) -> Result<RecordedClip, CameraError>;
+    ///
+    /// `recording_id` is the supervisor-minted staging id from
+    /// `data-model.md` §`MotionTriggerEvent` (`<capture_utc_basic>-cap`).
+    /// Implementations MUST use it as the staging filename stem so the
+    /// id logged in `capture.recording_started`/`completed`/`failed`
+    /// matches the on-disk artefact exactly.
+    async fn record_clip(
+        &mut self,
+        recording_id: &str,
+        max_duration: Duration,
+    ) -> Result<RecordedClip, CameraError>;
 }
 
 /// A successfully recorded clip staged on the local filesystem.

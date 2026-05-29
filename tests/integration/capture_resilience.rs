@@ -116,6 +116,14 @@ async fn staging_purge_clears_partial_clip_from_previous_run() {
         ..CaptureConfig::default()
     };
 
+    // The startup staging-purge is the wiring layer's responsibility
+    // (`serve` runs it before `service.ready`); this in-process test
+    // calls `Capture::run` directly, so we invoke `purge` here as the
+    // test's stand-in for `serve` and feed the resulting report into
+    // the supervisor the same way `serve` does.
+    let purge_report =
+        perchstation_core::capture::staging::purge(&staging_dir_path).expect("purge");
+
     let inbox: Arc<_> =
         Arc::new(PolicyInbox::new(StoreInbox::new(store.clone()), store.clone(), default_policy()));
     let state = Arc::new(CaptureState::new());
@@ -127,7 +135,8 @@ async fn staging_purge_clears_partial_clip_from_previous_run() {
         clock,
         cfg,
         StagingDir::new(&staging_dir_path),
-    );
+    )
+    .with_purge_report(purge_report);
 
     let shutdown = CancellationToken::new();
     let buf = CaptureBuffer::new();

@@ -46,17 +46,26 @@ pub enum Mode {
     EmptyOutput,
 }
 
+#[derive(Default)]
+struct LastInvocation {
+    recording_id: Option<String>,
+    clip_path: Option<PathBuf>,
+}
+
 pub struct FakeCamera {
     staging_dir: PathBuf,
     mode: Arc<Mutex<Mode>>,
     payload: Vec<u8>,
+    last: Arc<Mutex<LastInvocation>>,
 }
 
 /// Cloneable handle so test code can mutate the fake's mode while the
-/// supervisor task owns the [`FakeCamera`] by `&mut self`.
+/// supervisor task owns the [`FakeCamera`] by `&mut self`, and read
+/// back what `record_clip` was last invoked with.
 #[derive(Clone)]
 pub struct FakeCameraHandle {
     mode: Arc<Mutex<Mode>>,
+    last: Arc<Mutex<LastInvocation>>,
 }
 
 impl FakeCamera {
@@ -66,6 +75,7 @@ impl FakeCamera {
             staging_dir: staging_dir.into(),
             mode: Arc::new(Mutex::new(Mode::Ok)),
             payload: vec![DEFAULT_PAYLOAD_BYTE; DEFAULT_PAYLOAD_LEN],
+            last: Arc::new(Mutex::new(LastInvocation::default())),
         }
     }
 
@@ -77,7 +87,7 @@ impl FakeCamera {
 
     #[must_use]
     pub fn handle(&self) -> FakeCameraHandle {
-        FakeCameraHandle { mode: self.mode.clone() }
+        FakeCameraHandle { mode: self.mode.clone(), last: self.last.clone() }
     }
 
     pub fn set_mode(&self, mode: Mode) {
@@ -88,6 +98,20 @@ impl FakeCamera {
 impl FakeCameraHandle {
     pub fn set_mode(&self, mode: Mode) {
         *self.mode.lock().expect("fake camera mutex poisoned") = mode;
+    }
+
+    /// The `recording_id` `Camera::record_clip` was most recently
+    /// invoked with, or `None` if the camera has never been called.
+    #[must_use]
+    pub fn last_recording_id(&self) -> Option<String> {
+        self.last.lock().expect("fake camera mutex poisoned").recording_id.clone()
+    }
+
+    /// The staging file path the fake constructed on its most recent
+    /// invocation, or `None` if the camera has never been called.
+    #[must_use]
+    pub fn last_clip_path(&self) -> Option<PathBuf> {
+        self.last.lock().expect("fake camera mutex poisoned").clip_path.clone()
     }
 }
 
@@ -124,11 +148,20 @@ fn ensure_staging_dir(staging_dir: &Path) -> Result<(), CameraError> {
 
 #[async_trait]
 impl Camera for FakeCamera {
-    async fn record_clip(&mut self, max_duration: Duration) -> Result<RecordedClip, CameraError> {
+    async fn record_clip(
+        &mut self,
+        recording_id: &str,
+        max_duration: Duration,
+    ) -> Result<RecordedClip, CameraError> {
         let mode = *self.mode.lock().expect("fake camera mutex poisoned");
         let started_at = Utc::now();
-        let recording_id = format!("{}-cap", started_at.format("%Y%m%dT%H%M%SZ"));
         let staging_path = self.staging_dir.join(format!("{recording_id}.mp4"));
+
+        {
+            let mut last = self.last.lock().expect("fake camera mutex poisoned");
+            last.recording_id = Some(recording_id.to_string());
+            last.clip_path = Some(staging_path.clone());
+        }
 
         if matches!(mode, Mode::EmptyOutput) {
             // No file created — already compliant with "remove or never create" on error.

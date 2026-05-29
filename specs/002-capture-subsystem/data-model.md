@@ -61,11 +61,11 @@ or in delivery's logs, where the `<clip-id>` minted by
   `StuckAsserted` or `Unavailable` are similarly ignored.
 - Triggers that arrive during boot (before the capture loop reaches
   its `select!`) are observed on the first call to `next_trigger`.
-  The wiring layer in `perchstation::commands::serve` constructs
-  `GpioMotionSensor` — which opens the cdev edge subscription as a
-  side-effect of `new` — **before** spawning `Capture::run` and
-  therefore before the staging purge runs inside `Capture::run`. Any
-  edge that fires from the moment the subscription opens is
+  The wiring layer in `perchstation::commands::serve` runs the
+  staging purge **before** `service.ready` notifies systemd, then
+  constructs `GpioMotionSensor` — which opens the cdev edge
+  subscription as a side-effect of `new` — and spawns `Capture::run`.
+  Any edge that fires from the moment the subscription opens is
   kernel-buffered and is yielded on the first iteration of the
   supervisor's `select!` loop after `capture.ready`. Per the Edge
   Case "Sensor fires during boot or shutdown", such a stale edge MAY

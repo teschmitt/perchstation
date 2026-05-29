@@ -151,6 +151,14 @@ pub mod events {
     // Capture (see `specs/002-capture-subsystem/contracts/log-events.md`).
     pub const CAPTURE_READY: &str = "capture.ready";
     pub const CAPTURE_SHUTDOWN: &str = "capture.shutdown";
+    /// `serve` could not bring the capture subsystem up at boot (sensor
+    /// open failed, staging purge failed, …). Delivery continues
+    /// regardless (FR-012). Carries `reason` and `error`.
+    pub const CAPTURE_INIT_FAILED: &str = "capture.init_failed";
+    /// Emitted by `serve` on non-Linux hosts where the production
+    /// capture adapters do not exist; the capture supervisor task is
+    /// simply not spawned.
+    pub const CAPTURE_SKIPPED: &str = "capture.skipped";
     pub const CAPTURE_STAGING_PURGED: &str = "capture.staging_purged";
     pub const CAPTURE_TRIGGER_OBSERVED: &str = "capture.trigger_observed";
     pub const CAPTURE_RECORDING_STARTED: &str = "capture.recording_started";
@@ -342,5 +350,7 @@ mod tests {
         assert_eq!(events::ENROLLMENT_QR_DECODED, "enrollment.qr_decoded");
         assert_eq!(events::DELIVERY_UPLOAD_SUCCEEDED, "delivery.upload_succeeded");
         assert_eq!(events::SERVICE_READY, "service.ready");
+        assert_eq!(events::CAPTURE_INIT_FAILED, "capture.init_failed");
+        assert_eq!(events::CAPTURE_SKIPPED, "capture.skipped");
     }
 }

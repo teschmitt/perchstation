@@ -162,6 +162,16 @@ name    = "capture_no_network"
 path    = "../../tests/integration/capture_no_network.rs"
 harness = true
 
+[[test]]
+name    = "capture_recording_id_threading"
+path    = "../../tests/integration/capture_recording_id_threading.rs"
+harness = true
+
+[[test]]
+name    = "capture_purge_report_threading"
+path    = "../../tests/integration/capture_purge_report_threading.rs"
+harness = true
+
 [dependencies]
 perchstation-core = { path = "../perchstation-core" }
 perchstation-hw   = { path = "../perchstation-hw" }

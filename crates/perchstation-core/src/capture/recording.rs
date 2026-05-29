@@ -42,16 +42,20 @@ pub enum CaptureRecordError {
 
 /// Record one bounded clip and return a [`RecordedClip`] on success.
 ///
-/// `staging_path_hint` is used only for the post-error cleanup defence;
-/// the adapter's return value is the authoritative clip path on success.
+/// `recording_id` is the supervisor-minted staging id and is threaded
+/// through to the adapter so the on-disk filename matches the id logged
+/// in `capture.recording_started`. `staging_dir` is used only for the
+/// post-error cleanup defence; the adapter's return value is the
+/// authoritative clip path on success.
 pub async fn record_into_staging(
     camera: &mut dyn Camera,
+    recording_id: &str,
     staging_dir: &Path,
     max_duration: Duration,
     hang_margin: Duration,
 ) -> Result<RecordedClip, CaptureRecordError> {
     let outer = max_duration + hang_margin;
-    let result = tokio::time::timeout(outer, camera.record_clip(max_duration)).await;
+    let result = tokio::time::timeout(outer, camera.record_clip(recording_id, max_duration)).await;
     match result {
         Ok(Ok(clip)) => {
             if clip.byte_size == 0 {
@@ -112,9 +116,10 @@ mod tests {
     impl Camera for OkCamera {
         async fn record_clip(
             &mut self,
+            recording_id: &str,
             _max_duration: Duration,
         ) -> Result<RecordedClip, CameraError> {
-            let path = self.staging.join("ok.mp4");
+            let path = self.staging.join(format!("{recording_id}.mp4"));
             tokio::fs::write(&path, &self.payload)
                 .await
                 .map_err(|source| CameraError::Io { source })?;
@@ -136,11 +141,12 @@ mod tests {
     impl Camera for FailingCamera {
         async fn record_clip(
             &mut self,
+            recording_id: &str,
             _max_duration: Duration,
         ) -> Result<RecordedClip, CameraError> {
             // Write a partial file to simulate a failed adapter that
             // forgot to clean up.
-            let leftover = self.staging.join("partial.mp4");
+            let leftover = self.staging.join(format!("{recording_id}.mp4"));
             tokio::fs::write(&leftover, b"partial")
                 .await
                 .map_err(|source| CameraError::Io { source })?;
@@ -166,9 +172,10 @@ mod tests {
     impl Camera for HangCamera {
         async fn record_clip(
             &mut self,
+            recording_id: &str,
             _max_duration: Duration,
         ) -> Result<RecordedClip, CameraError> {
-            let partial = self.staging.join("hung.mp4");
+            let partial = self.staging.join(format!("{recording_id}.mp4"));
             tokio::fs::write(&partial, b"partial")
                 .await
                 .map_err(|source| CameraError::Io { source })?;
@@ -188,9 +195,10 @@ mod tests {
     impl Camera for EmptyCamera {
         async fn record_clip(
             &mut self,
+            recording_id: &str,
             _max_duration: Duration,
         ) -> Result<RecordedClip, CameraError> {
-            let path = self.staging.join("empty.mp4");
+            let path = self.staging.join(format!("{recording_id}.mp4"));
             tokio::fs::write(&path, b"").await.map_err(|source| CameraError::Io { source })?;
             Ok(RecordedClip {
                 clip_path: path,
@@ -211,6 +219,7 @@ mod tests {
         };
         let clip = record_into_staging(
             &mut cam,
+            "20260528T142312Z-cap",
             dir.path(),
             Duration::from_millis(50),
             Duration::from_millis(50),
@@ -219,6 +228,10 @@ mod tests {
         .expect("ok");
         assert_eq!(clip.byte_size, 1024);
         assert!(clip.clip_path.is_file());
+        assert_eq!(
+            clip.clip_path.file_name().and_then(|s| s.to_str()),
+            Some("20260528T142312Z-cap.mp4")
+        );
     }
 
     #[tokio::test]
@@ -227,6 +240,7 @@ mod tests {
         let mut cam = FailingCamera { staging: dir.path().to_path_buf() };
         let err = record_into_staging(
             &mut cam,
+            "20260528T142312Z-cap",
             dir.path(),
             Duration::from_millis(50),
             Duration::from_millis(50),
@@ -247,6 +261,7 @@ mod tests {
             HangCamera { staging: dir.path().to_path_buf(), observed_drop: observed.clone() };
         let err = record_into_staging(
             &mut cam,
+            "20260528T142312Z-cap",
             dir.path(),
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -267,6 +282,7 @@ mod tests {
         let mut cam = EmptyCamera { staging: dir.path().to_path_buf() };
         let err = record_into_staging(
             &mut cam,
+            "20260528T142312Z-cap",
             dir.path(),
             Duration::from_millis(10),
             Duration::from_millis(10),

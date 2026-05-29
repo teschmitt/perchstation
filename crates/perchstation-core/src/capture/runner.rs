@@ -18,7 +18,7 @@ use crate::capture::liveness::{
     DegradedKind, SensorLiveness, SensorLivenessTracker, SensorLivenessTransition,
 };
 use crate::capture::recording::{CaptureRecordError, record_into_staging};
-use crate::capture::staging::{StagingDir, staging_bytes};
+use crate::capture::staging::{PurgeReport, StagingDir, staging_bytes};
 use crate::capture::state::CaptureState;
 use crate::config::CaptureConfig;
 use crate::hw_traits::{Camera, CameraError, Clock, MotionSensor, MotionSensorError};
@@ -47,11 +47,17 @@ pub struct Capture {
     staging: StagingDir,
     cooldown: CooldownState,
     liveness: SensorLivenessTracker,
+    purge_report: PurgeReport,
 }
 
 impl Capture {
     /// Construct the supervisor. The wiring layer (`perchstation serve`)
     /// owns the lifetime of every input.
+    ///
+    /// The startup staging-purge is the wiring layer's responsibility;
+    /// pass its outcome via [`Capture::with_purge_report`] so the count
+    /// surfaces on `capture.ready`. When absent (most tests), the
+    /// `staging_purged_files` field defaults to `0`.
     #[must_use]
     pub fn new(
         sensor: Box<dyn MotionSensor>,
@@ -73,7 +79,18 @@ impl Capture {
             staging,
             cooldown: CooldownState::new(),
             liveness,
+            purge_report: PurgeReport::default(),
         }
+    }
+
+    /// Attach the report produced by the wiring layer's pre-`service.ready`
+    /// staging purge. The count is echoed on `capture.ready` so an
+    /// operator can correlate the visible info-level event with the
+    /// detailed `capture.staging_purged` debug-level event.
+    #[must_use]
+    pub fn with_purge_report(mut self, report: PurgeReport) -> Self {
+        self.purge_report = report;
+        self
     }
 
     /// The `Arc<CaptureState>` handed in at construction. Useful for
@@ -84,8 +101,10 @@ impl Capture {
         self.state.clone()
     }
 
-    /// Path under which staging files live. Used by [`Capture::run`] in
-    /// `mod.rs` to invoke the startup purge.
+    pub(super) fn purge_report(&self) -> PurgeReport {
+        self.purge_report
+    }
+
     pub(super) fn staging_path(&self) -> &std::path::Path {
         self.staging.as_path()
     }
@@ -281,6 +300,7 @@ impl Capture {
         let record_start = self.clock.now();
         let record_result = record_into_staging(
             self.camera.as_mut(),
+            &recording_id,
             self.staging.as_path(),
             max_duration,
             hang_margin,

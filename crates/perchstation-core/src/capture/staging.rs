@@ -41,7 +41,7 @@ impl AsRef<Path> for StagingDir {
 }
 
 /// Outcome of a [`purge`] call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PurgeReport {
     pub removed_files: u32,
     pub removed_bytes: u64,

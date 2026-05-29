@@ -31,6 +31,8 @@ operator already uses to read delivery and enrollment events.
 | `capture.ready`                  | info   | `staging_purged_files`                      | After staging-purge completes; just before the supervisor enters its `select!` loop. Mirrors `service.ready` but only for the capture half. |
 | `capture.shutdown`               | info   | `reason`                                    | The supervisor's `select!` selected the shutdown branch.                |
 | `capture.staging_purged`         | debug  | `removed_files`, `removed_bytes`            | The staging-purge step at boot. Emitted even if 0 files; `removed_files=0` is a legal value. |
+| `capture.init_failed`            | warn   | `reason`, `error`                           | `serve` could not initialise the capture subsystem (sensor open failed → `reason: "sensor_open_failed"`, staging purge failed → `reason: "staging_purge_failed"`, …). The supervisor task is not spawned; delivery continues regardless (FR-012). |
+| `capture.skipped`                | info   | `reason`                                    | `serve` deliberately did not spawn the capture supervisor (e.g. non-Linux dev host → `reason: "non_linux_host"`). |
 
 ### Recording
 

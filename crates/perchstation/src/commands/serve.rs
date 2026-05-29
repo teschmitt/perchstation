@@ -23,6 +23,7 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use perchstation_core::capture::staging::{PurgeReport, purge as purge_staging};
 use perchstation_core::capture::{Capture, CaptureState, StagingDir};
 use perchstation_core::config::Config;
 use perchstation_core::delivery::classify::ClassifyPoller;
@@ -95,6 +96,9 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     let pending_at_start =
         count_pending(&store).map_err(|err| CommandError::Io(anyhow!("count pending: {err}")))?;
 
+    let staging_path = config.data_dir.join(CAPTURE_STAGING_SUBDIR);
+    let capture_purge_outcome = purge_capture_staging_or_disable(&staging_path);
+
     tracing::info!(
         event = obs_tracing::events::SERVICE_READY,
         station_id = %identity.station_id,
@@ -128,8 +132,14 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     // task is not spawned, mirroring the pattern feature 001 used for
     // the QR camera adapter.
     let capture_shutdown = CancellationToken::new();
-    let capture_handle =
-        spawn_capture_task(config, store.clone(), clock.clone(), capture_shutdown.clone());
+    let capture_handle = spawn_capture_task(
+        config,
+        &staging_path,
+        capture_purge_outcome,
+        store.clone(),
+        clock.clone(),
+        capture_shutdown.clone(),
+    );
 
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|err| CommandError::Io(anyhow!("install SIGTERM handler: {err}")))?;
@@ -164,6 +174,8 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
 #[cfg(target_os = "linux")]
 fn spawn_capture_task(
     config: &Config,
+    staging_path: &std::path::Path,
+    purge_report: Option<PurgeReport>,
     store: QueueStore,
     clock: Arc<dyn Clock>,
     shutdown: CancellationToken,
@@ -171,7 +183,9 @@ fn spawn_capture_task(
     use perchstation_hw::camera_recorder::LibcameraVidCamera;
     use perchstation_hw::motion_sensor::GpioMotionSensor;
 
-    let staging_path = config.data_dir.join(CAPTURE_STAGING_SUBDIR);
+    // Purge failed earlier — `capture.init_failed` was already logged in
+    // `run`. Do not spawn the supervisor; delivery continues regardless.
+    let purge_report = purge_report?;
     let policy = QueuePolicy::from(&config.queue);
     let inbox = Arc::new(PolicyInbox::new(StoreInbox::new(store.clone()), store, policy));
 
@@ -187,7 +201,8 @@ fn spawn_capture_task(
             // misconfiguration; on dev hosts without /dev/gpiochip0
             // this is the expected path.
             tracing::warn!(
-                event = "capture.init_failed",
+                event = obs_tracing::events::CAPTURE_INIT_FAILED,
+                reason = "sensor_open_failed",
                 error = %err,
                 chip = %config.capture.sensor_gpiochip.display(),
                 line = config.capture.sensor_line,
@@ -198,7 +213,7 @@ fn spawn_capture_task(
     };
 
     let camera = LibcameraVidCamera::new(
-        &staging_path,
+        staging_path,
         config.capture.camera_width,
         config.capture.camera_height,
         config.capture.camera_framerate,
@@ -213,8 +228,9 @@ fn spawn_capture_task(
         state,
         clock,
         config.capture.clone(),
-        StagingDir::new(&staging_path),
-    );
+        StagingDir::new(staging_path),
+    )
+    .with_purge_report(purge_report);
 
     Some(spawn_supervised("capture", capture.run(shutdown)))
 }
@@ -222,6 +238,8 @@ fn spawn_capture_task(
 #[cfg(not(target_os = "linux"))]
 fn spawn_capture_task(
     _config: &Config,
+    _staging_path: &std::path::Path,
+    _purge_report: Option<PurgeReport>,
     _store: QueueStore,
     _clock: Arc<dyn Clock>,
     _shutdown: CancellationToken,
@@ -230,8 +248,35 @@ fn spawn_capture_task(
     // (dev machines that are not Pi-like) the capture loop is simply
     // not spawned. Integration tests exercise the supervisor via the
     // in-memory fakes.
-    tracing::info!(event = "capture.skipped", "capture loop not started: target_os != linux",);
+    tracing::info!(
+        event = obs_tracing::events::CAPTURE_SKIPPED,
+        reason = "non_linux_host",
+        "capture loop not started: target_os != linux",
+    );
     None
+}
+
+/// FR-017: purge `<data_dir>/capture-staging/` before `service.ready` so
+/// systemd never observes `READY=1` while the capture-side staging
+/// directory is in an unknown state. Returns `Some(report)` on success
+/// for the supervisor to echo on `capture.ready`; on failure logs
+/// `capture.init_failed` and returns `None` so the caller skips
+/// spawning the capture supervisor (delivery continues regardless,
+/// FR-012).
+fn purge_capture_staging_or_disable(staging_path: &std::path::Path) -> Option<PurgeReport> {
+    match purge_staging(staging_path) {
+        Ok(report) => Some(report),
+        Err(err) => {
+            tracing::warn!(
+                event = obs_tracing::events::CAPTURE_INIT_FAILED,
+                reason = "staging_purge_failed",
+                error = %err,
+                staging_dir = %staging_path.display(),
+                "capture loop not started: startup staging purge failed",
+            );
+            None
+        }
+    }
 }
 
 fn count_pending(store: &QueueStore) -> std::io::Result<u32> {

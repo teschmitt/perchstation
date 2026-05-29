@@ -1,31 +1,22 @@
-//! T029b — US2 #5 / R-5.
-//!
-//! Two synthetic motion edges arrive within a single recording's duration.
-//! The supervisor's `select!` does not advance until `handle_trigger`
-//! returns, so:
-//!
-//! - exactly one `Camera::record_clip` invocation occurs,
-//! - exactly one clip lands in `pending/`.
-//!
-//! Spec mapping: US2 #5 / R-5 (supervisor's `select!` does not advance
-//! until `handle_trigger` returns).
+//! Phase 3 review nit #3 — the `recording_id` the supervisor mints and
+//! logs must be the same id the camera adapter writes to disk, so an
+//! operator grepping a `capture.recording_started` event can locate the
+//! corresponding staging file by exact filename match (instead of
+//! guessing across a second boundary).
 
 #[path = "support/mod.rs"]
 mod support;
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use perchstation_core::capture::{Capture, CaptureState, StagingDir};
 use perchstation_core::config::{CaptureConfig, EvictionPolicy};
-use perchstation_core::hw_traits::{Camera, CameraError, RecordedClip, SensorLevel};
+use perchstation_core::hw_traits::SensorLevel;
 use perchstation_core::observability::tracing::events as ev;
 use perchstation_core::queue::inbox::StoreInbox;
 use perchstation_core::queue::policy::{PolicyInbox, QueuePolicy};
@@ -62,34 +53,8 @@ async fn wait_for_event(buf: &CaptureBuffer, code: &str, timeout: Duration) {
     panic!("timed out waiting for `{code}`; saw events: {codes:?}");
 }
 
-/// Wraps [`FakeCamera`] and counts `record_clip` invocations so the test
-/// can assert that the second edge did not produce a second concurrent
-/// recording.
-struct CountingCamera {
-    inner: FakeCamera,
-    invocations: Arc<AtomicUsize>,
-}
-
-impl CountingCamera {
-    fn new(staging_dir: PathBuf, invocations: Arc<AtomicUsize>) -> Self {
-        Self { inner: FakeCamera::new(staging_dir), invocations }
-    }
-}
-
-#[async_trait]
-impl Camera for CountingCamera {
-    async fn record_clip(
-        &mut self,
-        recording_id: &str,
-        max_duration: Duration,
-    ) -> Result<RecordedClip, CameraError> {
-        self.invocations.fetch_add(1, Ordering::SeqCst);
-        self.inner.record_clip(recording_id, max_duration).await
-    }
-}
-
 #[tokio::test(flavor = "current_thread")]
-async fn second_edge_during_active_recording_does_not_start_a_second_recording() {
+async fn camera_receives_supervisor_minted_recording_id() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = QueueStore::open(dir.path()).expect("open store");
     let staging_dir_path = dir.path().join("capture-staging");
@@ -104,18 +69,16 @@ async fn second_edge_during_active_recording_does_not_start_a_second_recording()
 
     let sensor = FakeMotionSensor::new(SensorLevel::Quiescent);
     let sensor_handle = sensor.handle();
-    let invocations = Arc::new(AtomicUsize::new(0));
-    let camera = CountingCamera::new(staging_dir_path.clone(), invocations.clone());
+    let camera = FakeCamera::new(&staging_dir_path);
+    let camera_handle = camera.handle();
 
     let trigger_at = Utc.with_ymd_and_hms(2026, 5, 28, 14, 23, 12).unwrap();
     let clock = Arc::new(FakeClock::new(trigger_at));
 
-    // 2-second recording window so the second edge clearly arrives while
-    // the first recording is still in progress.
     let cfg = CaptureConfig {
-        clip_duration_secs: 2,
+        clip_duration_secs: 1,
         hang_margin_secs: 1,
-        cooldown_secs: 60,
+        cooldown_secs: 0,
         liveness_stuck_secs: 300,
         liveness_poll_secs: 60,
         ..CaptureConfig::default()
@@ -126,7 +89,7 @@ async fn second_edge_during_active_recording_does_not_start_a_second_recording()
         Box::new(sensor),
         Box::new(camera),
         inbox,
-        state.clone(),
+        state,
         clock,
         cfg,
         StagingDir::new(&staging_dir_path),
@@ -140,36 +103,38 @@ async fn second_edge_during_active_recording_does_not_start_a_second_recording()
     let task = tokio::spawn(async move { capture.run(task_shutdown).await });
 
     wait_for_event(&buf, ev::CAPTURE_READY, Duration::from_secs(2)).await;
-
     sensor_handle.trigger(trigger_at);
-
-    // Wait until the first recording is in progress.
-    wait_for_event(&buf, ev::CAPTURE_RECORDING_STARTED, Duration::from_secs(2)).await;
-    // Give the recording a moment to enter its inner sleep before pushing
-    // the second edge.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Second edge while the first recording is in flight.
-    sensor_handle.trigger(trigger_at + chrono::Duration::milliseconds(500));
-
-    // Wait for the first recording to complete.
     wait_for_event(&buf, ev::CAPTURE_RECORDING_COMPLETED, Duration::from_secs(5)).await;
 
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 
+    // The supervisor mints `recording_id` from `triggered_at` and logs it
+    // on `capture.recording_started`. The camera adapter must use that
+    // same id when naming its staging file, so an operator looking up
+    // the on-disk artefact from the log line gets an exact match.
+    let events = buf.events();
+    let started = events
+        .iter()
+        .find(|e| e.get("event").and_then(Value::as_str) == Some(ev::CAPTURE_RECORDING_STARTED))
+        .expect("capture.recording_started must fire");
+    let logged_recording_id = started
+        .get("recording_id")
+        .and_then(Value::as_str)
+        .expect("recording_id field")
+        .to_string();
+
+    let camera_recording_id = camera_handle.last_recording_id().expect("camera was invoked");
     assert_eq!(
-        invocations.load(Ordering::SeqCst),
-        1,
-        "Camera::record_clip must be invoked exactly once across two overlapping edges",
+        camera_recording_id, logged_recording_id,
+        "FakeCamera::record_clip must receive the supervisor's recording_id",
     );
 
-    let mp4_count = store
-        .pending_dir()
-        .read_dir()
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "mp4"))
-        .count();
-    assert_eq!(mp4_count, 1, "exactly one clip should land in pending/");
+    let last_path = camera_handle.last_clip_path().expect("camera produced a clip path");
+    let expected_filename = format!("{logged_recording_id}.mp4");
+    assert_eq!(
+        last_path.file_name().and_then(|s| s.to_str()),
+        Some(expected_filename.as_str()),
+        "staging filename must be `<recording_id>.mp4` so log↔disk correlation is exact",
+    );
 }

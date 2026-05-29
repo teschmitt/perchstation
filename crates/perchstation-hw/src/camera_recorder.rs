@@ -147,12 +147,15 @@ fn terminate_child(child: &mut Child) {
 
 #[async_trait]
 impl Camera for LibcameraVidCamera {
-    async fn record_clip(&mut self, max_duration: Duration) -> Result<RecordedClip, CameraError> {
+    async fn record_clip(
+        &mut self,
+        recording_id: &str,
+        max_duration: Duration,
+    ) -> Result<RecordedClip, CameraError> {
         tokio::fs::create_dir_all(&self.staging_dir)
             .await
             .map_err(|source| CameraError::Io { source })?;
         let started_at = Utc::now();
-        let recording_id = format!("{}-cap", started_at.format("%Y%m%dT%H%M%SZ"));
         let output = self.staging_dir.join(format!("{recording_id}.mp4"));
 
         let max_duration_ms = u64::try_from(max_duration.as_millis()).unwrap_or(u64::MAX);

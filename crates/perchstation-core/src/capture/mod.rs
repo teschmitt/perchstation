@@ -31,33 +31,34 @@ use crate::observability::tracing as obs_tracing;
 impl Capture {
     /// Run the capture supervisor until `shutdown` fires.
     ///
-    /// Steps performed before the supervisor's `select!` loop begins:
-    /// 1. Purge `<data_dir>/capture-staging/` so a previous run's
-    ///    partial recording cannot leak across reboots (FR-017).
-    /// 2. Emit `capture.ready` with the count of staging files cleaned
-    ///    up by the purge.
-    /// 3. Enter the supervisor loop.
+    /// The startup staging-purge (FR-017) is the wiring layer's
+    /// responsibility — `serve` runs it *before* `service.ready` so
+    /// systemd never observes a `READY=1` until the staging directory
+    /// is clean. The resulting [`staging::PurgeReport`] is fed in via
+    /// [`Capture::with_purge_report`]; this method just emits
+    /// `capture.ready` echoing the report and then enters the
+    /// supervisor's `select!` loop.
+    ///
+    /// The staging directory is `create_dir_all`'d here as a defensive
+    /// no-op so that fake-camera-driven integration tests (which call
+    /// `Capture::run` directly without going through `serve`) can write
+    /// fixture files into it before the first trigger arrives.
     pub async fn run(self, shutdown: CancellationToken) {
-        let staging_path = self.staging_path().to_path_buf();
-        let report = match staging::purge(&staging_path) {
-            Ok(report) => report,
-            Err(err) => {
-                tracing::error!(
-                    event = obs_tracing::events::CAPTURE_SHUTDOWN,
-                    reason = "staging_purge_failed",
-                    error = %err,
-                    "capture supervisor refusing to start: staging purge failed",
-                );
-                return;
-            }
-        };
-
+        if let Err(err) = std::fs::create_dir_all(self.staging_path()) {
+            tracing::warn!(
+                event = obs_tracing::events::CAPTURE_INIT_FAILED,
+                reason = "staging_dir_create_failed",
+                error = %err,
+                staging_dir = %self.staging_path().display(),
+                "capture supervisor refusing to start: staging dir create failed",
+            );
+            return;
+        }
         tracing::info!(
             event = obs_tracing::events::CAPTURE_READY,
-            staging_purged_files = report.removed_files,
+            staging_purged_files = self.purge_report().removed_files,
             "capture supervisor ready",
         );
-
         self.run_loop(shutdown).await;
     }
 }
