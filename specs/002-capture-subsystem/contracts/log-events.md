@@ -52,6 +52,12 @@ operator already uses to read delivery and enrollment events.
 | `capture.degraded_skip`          | warn   | `sensor_liveness`                           | Trigger arrived while sensor liveness ∈ `{StuckAsserted, Unavailable}`. |
 | `capture.disk_pressure_skip`     | warn   | `staging_bytes`, `max_staging_bytes`        | Trigger arrived but pre-record disk-pressure check refused to record.   |
 
+### Internal probe failures (the trigger is NOT skipped)
+
+| `event`                          | Level  | Required fields beyond common              | Triggered when                                                          |
+| -------------------------------- | ------ | ------------------------------------------- | ----------------------------------------------------------------------- |
+| `capture.staging_probe_failed`   | warn   | `error`                                     | The pre-record `staging_bytes` probe itself returned an I/O error (as opposed to bytes-over-ceiling). The supervisor falls through to the recording attempt — a failed probe is not by itself a reason to refuse to record; any further failure surfaces through the camera adapter's own error path. Carries no `staging_bytes` / `max_staging_bytes` fields because neither is known on this branch. |
+
 ### Queue refusal handoff
 
 | `event`                          | Level  | Required fields beyond common              | Triggered when                                                          |

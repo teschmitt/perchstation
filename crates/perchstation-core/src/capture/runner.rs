@@ -275,7 +275,7 @@ impl Capture {
                 // surface the I/O error. A failed staging_bytes call
                 // does not by itself justify refusing to record.
                 tracing::warn!(
-                    event = obs_tracing::events::CAPTURE_DISK_PRESSURE_SKIP,
+                    event = obs_tracing::events::CAPTURE_STAGING_PROBE_FAILED,
                     error = %err,
                     "staging_bytes probe failed; continuing with recording attempt",
                 );

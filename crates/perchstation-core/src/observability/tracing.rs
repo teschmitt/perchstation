@@ -168,6 +168,11 @@ pub mod events {
     pub const CAPTURE_COOLDOWN_SKIP: &str = "capture.cooldown_skip";
     pub const CAPTURE_DEGRADED_SKIP: &str = "capture.degraded_skip";
     pub const CAPTURE_DISK_PRESSURE_SKIP: &str = "capture.disk_pressure_skip";
+    /// Internal probe failure: the pre-record `staging_bytes` probe
+    /// returned an I/O error (not bytes-over-ceiling). The trigger
+    /// is NOT skipped — the supervisor falls through to the recording
+    /// attempt and lets the camera adapter surface any further error.
+    pub const CAPTURE_STAGING_PROBE_FAILED: &str = "capture.staging_probe_failed";
     pub const CAPTURE_QUEUE_REFUSED: &str = "capture.queue_refused";
     pub const CAPTURE_SENSOR_DEGRADED: &str = "capture.sensor_degraded";
     pub const CAPTURE_SENSOR_RECOVERED: &str = "capture.sensor_recovered";
@@ -352,5 +357,6 @@ mod tests {
         assert_eq!(events::SERVICE_READY, "service.ready");
         assert_eq!(events::CAPTURE_INIT_FAILED, "capture.init_failed");
         assert_eq!(events::CAPTURE_SKIPPED, "capture.skipped");
+        assert_eq!(events::CAPTURE_STAGING_PROBE_FAILED, "capture.staging_probe_failed");
     }
 }

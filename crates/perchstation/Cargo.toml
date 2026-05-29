@@ -128,6 +128,11 @@ path    = "../../tests/integration/capture_disk_pressure.rs"
 harness = true
 
 [[test]]
+name    = "capture_staging_probe_failed"
+path    = "../../tests/integration/capture_staging_probe_failed.rs"
+harness = true
+
+[[test]]
 name    = "capture_queue_full"
 path    = "../../tests/integration/capture_queue_full.rs"
 harness = true
