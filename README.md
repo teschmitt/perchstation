@@ -116,8 +116,11 @@ You will need:
    journalctl -u perchstation -f
    ```
 
-For the full release-gate procedure (including the sensor-disconnect /
-stuck-sensor / 7-day soak checks), follow
+This is the condensed path. For a fuller day-to-day dev-loop walkthrough
+— DNS/TLS sanity, cross-build, a troubleshooting table, and a clean-reset
+recipe — see [`deploy/DEPLOYMENT.md`](deploy/DEPLOYMENT.md). For the full
+release-gate procedure (including the sensor-disconnect / stuck-sensor /
+7-day soak checks), follow
 [`deploy/RELEASE-CHECKLIST.md`](deploy/RELEASE-CHECKLIST.md).
 
 ## Operator commands

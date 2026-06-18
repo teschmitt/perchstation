@@ -42,4 +42,6 @@ cargo zigbuild --release -p perchstation --target aarch64-unknown-linux-gnu
 
 - `deploy/systemd/perchstation.service` — systemd unit (Type=notify).
 - `deploy/config.example.toml` — commented operator config template.
+- `deploy/DEPLOYMENT.md` — dev-loop deploy walkthrough (cross-build,
+  install, enrol, run, troubleshoot) on a real Pi.
 - `deploy/RELEASE-CHECKLIST.md` — on-device manual smoke test.
