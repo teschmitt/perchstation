@@ -38,6 +38,11 @@ pub enum CaptureRecordError {
     /// supervisor double-checks the on-disk byte count).
     #[error("camera produced a zero-length clip at `{path}`")]
     EmptyClip { path: std::path::PathBuf },
+    /// `clip_duration + hang_margin` overflowed the maximum representable
+    /// [`Duration`]. Defence in depth — `Config::validate` already rejects
+    /// such a config, so this yields a clean error rather than a panic.
+    #[error("clip_duration + hang_margin overflows the maximum representable duration")]
+    DurationOverflow,
 }
 
 /// Record one bounded clip and return a [`RecordedClip`] on success.
@@ -54,7 +59,9 @@ pub async fn record_into_staging(
     max_duration: Duration,
     hang_margin: Duration,
 ) -> Result<RecordedClip, CaptureRecordError> {
-    let outer = max_duration + hang_margin;
+    let Some(outer) = max_duration.checked_add(hang_margin) else {
+        return Err(CaptureRecordError::DurationOverflow);
+    };
     let result = tokio::time::timeout(outer, camera.record_clip(recording_id, max_duration)).await;
     match result {
         Ok(Ok(clip)) => {
@@ -274,6 +281,28 @@ mod tests {
         assert!(*observed.lock().await, "camera future must be dropped on timeout");
         let leftovers: Vec<_> = fs::read_dir(dir.path()).unwrap().filter_map(Result::ok).collect();
         assert!(leftovers.is_empty(), "staging should be empty; got {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn overflowing_outer_duration_is_clean_error_not_panic() {
+        let dir = TempDir::new().unwrap();
+        let mut cam = OkCamera {
+            staging: dir.path().to_path_buf(),
+            payload: vec![0x42; 16],
+            sleep_for: Duration::from_millis(0),
+        };
+        // `clip_duration + hang_margin` overflows `Duration`; the helper
+        // must return a clean error instead of panicking on the add.
+        let err = record_into_staging(
+            &mut cam,
+            "20260528T142312Z-cap",
+            dir.path(),
+            Duration::MAX,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("overflow");
+        assert!(matches!(err, CaptureRecordError::DurationOverflow));
     }
 
     #[tokio::test]

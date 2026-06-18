@@ -31,6 +31,10 @@ use crate::commands::CommandError;
 /// exit-code lines up with `contracts/cli.md` §Exit codes.
 #[allow(clippy::too_many_lines, reason = "linear orchestration of the enrollment steps")]
 pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> {
+    // Validate the whole config up front (PS-03/PS-08): `perchpub_url`
+    // presence plus every numeric bound, so a malformed config is rejected
+    // before we touch the QR source or generate a keypair.
+    config.ensure_runtime_ready().map_err(|err| CommandError::Config(anyhow!("{err}")))?;
     let perchpub_url =
         config.perchpub_url.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
             CommandError::Config(anyhow!("`perchpub_url` is required for enrollment"))

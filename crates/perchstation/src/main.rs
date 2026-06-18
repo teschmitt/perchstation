@@ -53,7 +53,9 @@ async fn main() {
 fn exit_with(err: &ConfigError) -> ! {
     let code = match err {
         ConfigError::Io { .. } => exit::IO,
-        ConfigError::Parse { .. } | ConfigError::MissingRequired { .. } => exit::CONFIG,
+        ConfigError::Parse { .. }
+        | ConfigError::MissingRequired { .. }
+        | ConfigError::OutOfRange { .. } => exit::CONFIG,
     };
     std::process::exit(code);
 }

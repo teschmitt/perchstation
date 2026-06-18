@@ -43,14 +43,14 @@ use crate::commands::CommandError;
 const CAPTURE_STAGING_SUBDIR: &str = "capture-staging";
 
 pub async fn run(config: &Config) -> Result<(), CommandError> {
-    let perchpub_url = match config.perchpub_url.as_deref() {
-        Some(url) if !url.is_empty() => url,
-        _ => {
-            return Err(CommandError::Config(anyhow!(
-                "`perchpub_url` is required for `perchstation serve`"
-            )));
-        }
-    };
+    // Validate the whole config up front: `perchpub_url` presence plus
+    // every numeric bound (PS-03/PS-08), so a malformed config fails fast
+    // here instead of panicking deep in the capture/retry math later.
+    config.ensure_runtime_ready().map_err(|err| CommandError::Config(anyhow!("{err}")))?;
+    let perchpub_url =
+        config.perchpub_url.as_deref().filter(|url| !url.is_empty()).ok_or_else(|| {
+            CommandError::Config(anyhow!("`perchpub_url` is required for `perchstation serve`"))
+        })?;
 
     let identity = match StationIdentity::load(&config.data_dir) {
         Ok(id) => id,

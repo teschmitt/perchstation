@@ -27,6 +27,8 @@ pub enum ConfigError {
     },
     #[error("config field `{field}` is required but missing")]
     MissingRequired { field: &'static str },
+    #[error("config field `{field}` is out of range: {reason}")]
+    OutOfRange { field: &'static str, reason: String },
 }
 
 /// Parsed operator configuration. See `research.md` R-10 for the canonical
@@ -197,15 +199,88 @@ impl Config {
             .map_err(|source| ConfigError::Parse { path: PathBuf::from("<inline>"), source })
     }
 
-    /// Reject a config that cannot drive `serve` or `enroll`. `status` can
-    /// tolerate a missing [`Config::perchpub_url`] and so does not call this.
+    /// Reject a config that cannot drive `serve` or `enroll`: requires
+    /// `perchpub_url` *and* numerically valid bounds. `status` tolerates a
+    /// missing [`Config::perchpub_url`] and so calls [`Config::validate`]
+    /// directly (or not at all) rather than this.
     pub fn ensure_runtime_ready(&self) -> Result<(), ConfigError> {
         if self.perchpub_url.as_deref().is_none_or(str::is_empty) {
             return Err(ConfigError::MissingRequired { field: "perchpub_url" });
         }
+        self.validate()
+    }
+
+    /// Validate every operator-tunable numeric bound, independent of the
+    /// `perchpub_url` requirement so a caller that tolerates a missing URL
+    /// (e.g. `status`) can still reject a malformed config. The bounds are
+    /// chosen so the downstream arithmetic in the capture, retry, and queue
+    /// subsystems can never overflow or panic (PS-03, PS-08): a clip plus
+    /// its hang margin stays well inside `Duration`, `hours * 3600` cannot
+    /// overflow `u64`, and the backoff math stays inside `from_secs_f64`'s
+    /// representable range.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let oor = |field: &'static str, reason: &str| ConfigError::OutOfRange {
+            field,
+            reason: reason.to_owned(),
+        };
+
+        // Queue ceilings (PS-03): a zero ceiling bricks the queue.
+        if self.queue.max_clips == 0 {
+            return Err(oor("queue.max_clips", "must be >= 1"));
+        }
+        if self.queue.max_bytes == 0 {
+            return Err(oor("queue.max_bytes", "must be >= 1"));
+        }
+
+        // Capture timing. Bounding `clip_duration_secs` to `[1, 3600]` and
+        // `hang_margin_secs` to `<= 600` guarantees their sum (the outer
+        // record timeout) never overflows `Duration`.
+        if !(1..=MAX_CLIP_DURATION_SECS).contains(&self.capture.clip_duration_secs) {
+            return Err(oor("capture.clip_duration_secs", "must be in 1..=3600"));
+        }
+        if self.capture.hang_margin_secs > MAX_HANG_MARGIN_SECS {
+            return Err(oor("capture.hang_margin_secs", "must be <= 600"));
+        }
+        if self.capture.cooldown_secs == 0 {
+            return Err(oor("capture.cooldown_secs", "must be >= 1"));
+        }
+        if self.capture.liveness_stuck_secs == 0 {
+            return Err(oor("capture.liveness_stuck_secs", "must be >= 1"));
+        }
+        if self.capture.liveness_poll_secs == 0 {
+            return Err(oor("capture.liveness_poll_secs", "must be >= 1"));
+        }
+
+        // Retry / backoff. `per_clip_max_wallclock_hours` is capped so the
+        // `* 3600` conversion cannot overflow `u64`; the delay ceiling is
+        // capped so the backoff math stays inside `from_secs_f64`'s range.
+        if self.retry.per_clip_max_attempts == 0 {
+            return Err(oor("retry.per_clip_max_attempts", "must be >= 1"));
+        }
+        if !(1..=MAX_WALLCLOCK_HOURS).contains(&self.retry.per_clip_max_wallclock_hours) {
+            return Err(oor("retry.per_clip_max_wallclock_hours", "must be in 1..=8760"));
+        }
+        if self.retry.max_attempt_delay_secs > MAX_RETRY_DELAY_SECS {
+            return Err(oor("retry.max_attempt_delay_secs", "must be <= 604800 (7 days)"));
+        }
+        if self.retry.initial_delay_secs > self.retry.max_attempt_delay_secs {
+            return Err(oor("retry.initial_delay_secs", "must be <= retry.max_attempt_delay_secs"));
+        }
+
         Ok(())
     }
 }
+
+/// Upper bound on a single clip's recording duration (1 hour).
+const MAX_CLIP_DURATION_SECS: u64 = 3600;
+/// Upper bound on the post-clip hang margin (10 minutes).
+const MAX_HANG_MARGIN_SECS: u64 = 600;
+/// Upper bound on `per_clip_max_wallclock_hours` (1 year) so `* 3600`
+/// cannot overflow `u64`.
+const MAX_WALLCLOCK_HOURS: u64 = 24 * 365;
+/// Upper bound on retry delays (7 days) so the backoff math stays far
+/// below `Duration::from_secs_f64`'s panic threshold.
+const MAX_RETRY_DELAY_SECS: u64 = 7 * 24 * 3600;
 
 const fn default_max_clips() -> u32 {
     500
@@ -356,5 +431,81 @@ mod tests {
         let cfg = Config::load(Path::new("/definitely/does/not/exist.toml")).expect("load ok");
         assert_eq!(cfg.queue.max_clips, 500);
         assert!(cfg.perchpub_url.is_none());
+    }
+
+    #[test]
+    fn validate_accepts_research_r10_defaults() {
+        // The shipped defaults (research.md R-10) must always validate.
+        Config::default().validate().expect("R-10 defaults validate");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_clips() {
+        let mut cfg = Config::default();
+        cfg.queue.max_clips = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "queue.max_clips", .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_bytes() {
+        let mut cfg = Config::default();
+        cfg.queue.max_bytes = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "queue.max_bytes", .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_clip_plus_margin_overflow() {
+        // A clip duration this large would overflow `clip + hang_margin`
+        // in `record_into_staging`; the range bound rejects it up front.
+        let mut cfg = Config::default();
+        cfg.capture.clip_duration_secs = u64::MAX;
+        cfg.capture.hang_margin_secs = 1;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "capture.clip_duration_secs", .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_huge_wallclock_hours() {
+        let mut cfg = Config::default();
+        cfg.retry.per_clip_max_wallclock_hours = u64::MAX;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "retry.per_clip_max_wallclock_hours", .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_huge_max_attempt_delay_secs() {
+        let mut cfg = Config::default();
+        cfg.retry.max_attempt_delay_secs = u64::MAX;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "retry.max_attempt_delay_secs", .. })
+        ));
+    }
+
+    #[test]
+    fn ensure_runtime_ready_rejects_zero_max_clips() {
+        let mut cfg =
+            Config::from_toml_str("perchpub_url = \"https://p.example\"\n").expect("parses");
+        cfg.queue.max_clips = 0;
+        // perchpub_url is valid; the offending numeric bound must still fail.
+        assert!(cfg.ensure_runtime_ready().is_err());
+    }
+
+    #[test]
+    fn ensure_runtime_ready_rejects_zero_max_bytes() {
+        let mut cfg =
+            Config::from_toml_str("perchpub_url = \"https://p.example\"\n").expect("parses");
+        cfg.queue.max_bytes = 0;
+        assert!(cfg.ensure_runtime_ready().is_err());
     }
 }

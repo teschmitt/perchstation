@@ -33,6 +33,13 @@ pub const DEFAULT_MULTIPLIER: f64 = 2.0;
 /// not operator-configurable).
 pub const DEFAULT_JITTER_FRACTION: f64 = 0.2;
 
+/// Absolute ceiling (seconds) applied to a single computed backoff delay
+/// before [`Duration::from_secs_f64`]. Guards against a pathological
+/// (unvalidated) `max_attempt_delay` whose `as_secs_f64` approaches `2^64`
+/// and would otherwise panic the conversion. Far above any sane operator
+/// backoff — `Config::validate` caps the configured ceiling at 7 days.
+const MAX_BACKOFF_SECS: f64 = 1e15;
+
 /// Concrete schedule used by the delivery runner. Build with
 /// [`BackoffSchedule::from_config`] and reuse across attempts; the
 /// scheduler is stateless past construction.
@@ -57,7 +64,12 @@ impl BackoffSchedule {
             multiplier: DEFAULT_MULTIPLIER,
             jitter_fraction: DEFAULT_JITTER_FRACTION,
             per_clip_max_attempts: cfg.per_clip_max_attempts,
-            per_clip_max_wallclock: Duration::from_secs(cfg.per_clip_max_wallclock_hours * 3600),
+            // Saturate rather than panic if an unvalidated config slips a
+            // huge value through (defence in depth; `Config::validate`
+            // caps the configured value at 1 year of hours).
+            per_clip_max_wallclock: Duration::from_secs(
+                cfg.per_clip_max_wallclock_hours.saturating_mul(3600),
+            ),
         }
     }
 }
@@ -181,7 +193,12 @@ impl BackoffSchedule {
         let exp = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
         let base_secs = self.initial_delay.as_secs_f64() * self.multiplier.powi(exp);
         let capped = base_secs.min(self.max_attempt_delay.as_secs_f64());
-        Duration::from_secs_f64(capped.max(0.0))
+        // Clamp to a finite, non-negative, representable value so a
+        // pathological `max_attempt_delay` (near `u64::MAX` seconds) can
+        // never push `from_secs_f64` past its panic threshold.
+        let bounded =
+            if capped.is_finite() { capped.clamp(0.0, MAX_BACKOFF_SECS) } else { MAX_BACKOFF_SECS };
+        Duration::from_secs_f64(bounded)
     }
 }
 
@@ -350,6 +367,30 @@ mod tests {
             }
             NextAction::Exhausted => panic!("attempt 1 inside budget should retry"),
         }
+    }
+
+    #[test]
+    fn from_config_saturates_huge_wallclock() {
+        let cfg = RetryConfig {
+            initial_delay_secs: 10,
+            max_attempt_delay_secs: 3600,
+            per_clip_max_attempts: 12,
+            per_clip_max_wallclock_hours: u64::MAX,
+        };
+        // `hours * 3600` must saturate rather than panic on overflow.
+        let sched = BackoffSchedule::from_config(&cfg);
+        assert_eq!(sched.per_clip_max_wallclock, Duration::from_secs(u64::MAX));
+    }
+
+    #[test]
+    fn base_delay_clamps_huge_max_attempt_delay() {
+        let mut sched = no_jitter_schedule();
+        sched.max_attempt_delay = Duration::from_secs(u64::MAX);
+        // With a near-`u64::MAX` ceiling a large attempt drives the capped
+        // delay toward `2^64` seconds, which would panic `from_secs_f64`.
+        // The clamp must keep it representable.
+        let delay = sched.base_delay(100);
+        assert!(delay > Duration::ZERO);
     }
 
     #[test]

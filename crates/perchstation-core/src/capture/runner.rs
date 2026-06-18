@@ -318,7 +318,25 @@ impl Capture {
             Err(CaptureRecordError::Timeout) => {
                 self.handle_recording_hung(&recording_id, max_duration);
             }
+            Err(CaptureRecordError::DurationOverflow) => {
+                self.handle_recording_overflow(&recording_id);
+            }
         }
+    }
+
+    fn handle_recording_overflow(&mut self, recording_id: &str) {
+        tracing::error!(
+            event = obs_tracing::events::CAPTURE_RECORDING_FAILED,
+            recording_id,
+            kind = "config_overflow",
+            "clip_duration_secs + hang_margin_secs overflows the maximum representable duration",
+        );
+        self.state.record_failure(
+            self.clock.now(),
+            "config_overflow",
+            "clip_duration + hang_margin overflow".to_string(),
+        );
+        self.start_cooldown(CooldownOutcome::Failed);
     }
 
     fn handle_recording_failed(&mut self, recording_id: &str, err: &CameraError) {
