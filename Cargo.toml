@@ -66,6 +66,12 @@ thiserror = "2"
 # dyn-compatible without hand-rolled Box<dyn Future> plumbing.
 async-trait = "0.1"
 
+# Future combinators — `FutureExt::catch_unwind` lets `spawn_supervised`
+# catch a worker panic in-place (single task) instead of nesting a second
+# `tokio::spawn`, so the returned handle's `abort()` actually stops the
+# worker (PS-09).
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
 # Misc.
 uuid          = { version = "1", features = ["v4", "serde"] }
 chrono        = { version = "0.4", default-features = false, features = ["serde", "clock"] }

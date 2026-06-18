@@ -64,6 +64,11 @@ pub struct QueueConfig {
     pub max_bytes: u64,
     #[serde(default)]
     pub eviction: EvictionPolicy,
+    /// Retention (hours) before a finished `delivered/` sidecar (upload
+    /// succeeded, classify task terminal or lost) is pruned, bounding
+    /// `delivered/` growth and the classify poller's per-tick scan (PS-25).
+    #[serde(default = "default_delivered_retention_hours")]
+    pub delivered_retention_hours: u64,
 }
 
 impl Default for QueueConfig {
@@ -72,6 +77,7 @@ impl Default for QueueConfig {
             max_clips: default_max_clips(),
             max_bytes: default_max_bytes(),
             eviction: EvictionPolicy::default(),
+            delivered_retention_hours: default_delivered_retention_hours(),
         }
     }
 }
@@ -243,6 +249,11 @@ impl Config {
         if self.queue.max_bytes == 0 {
             return Err(oor("queue.max_bytes", "must be >= 1"));
         }
+        // Capped like the wallclock budget so the `* 3600` retention-seconds
+        // conversion in the classify poller cannot overflow (PS-25).
+        if !(1..=MAX_WALLCLOCK_HOURS).contains(&self.queue.delivered_retention_hours) {
+            return Err(oor("queue.delivered_retention_hours", "must be in 1..=8760"));
+        }
 
         // Capture timing. Bounding `clip_duration_secs` to `[1, 3600]` and
         // `hang_margin_secs` to `<= 600` guarantees their sum (the outer
@@ -309,6 +320,10 @@ const fn default_max_clips() -> u32 {
 
 const fn default_max_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
+}
+
+const fn default_delivered_retention_hours() -> u64 {
+    24 * 7
 }
 
 const fn default_initial_delay_secs() -> u64 {
@@ -553,6 +568,31 @@ mod tests {
         .expect("parses");
         assert_eq!(cfg.capture.camera_command, PathBuf::from("libcamera-vid"));
         assert_eq!(cfg.capture.camera_still_command, PathBuf::from("libcamera-still"));
+    }
+
+    #[test]
+    fn default_delivered_retention_is_one_week() {
+        assert_eq!(Config::default().queue.delivered_retention_hours, 24 * 7);
+    }
+
+    #[test]
+    fn validate_rejects_zero_delivered_retention_hours() {
+        let mut cfg = Config::default();
+        cfg.queue.delivered_retention_hours = 0;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "queue.delivered_retention_hours", .. })
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_huge_delivered_retention_hours() {
+        let mut cfg = Config::default();
+        cfg.queue.delivered_retention_hours = u64::MAX;
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "queue.delivered_retention_hours", .. })
+        ));
     }
 
     #[test]

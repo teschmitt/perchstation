@@ -1431,6 +1431,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "image",
  "qrcode",
  "rcgen",

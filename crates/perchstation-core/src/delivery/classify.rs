@@ -14,10 +14,11 @@
 //!   entry, but leave `outcome: Delivered` intact (the upload itself
 //!   succeeded).
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +27,7 @@ use crate::hw_traits::Clock;
 use crate::observability::tracing as obs_tracing;
 use crate::perchpub::client::{ClientError, PerchpubClient};
 use crate::perchpub::types::{ClassifyTaskStatus, ObservationPublic};
+use crate::queue::policy::prune_delivered;
 use crate::queue::store::QueueStore;
 use crate::queue::{ClipQueueEntry, QueueError};
 
@@ -34,6 +36,14 @@ use super::retry::{FailureKind, classify_poll_error, error_kind};
 
 const IDLE_SCAN_TICK: Duration = Duration::from_millis(50);
 const ACTIVE_SCAN_TICK: Duration = Duration::from_millis(5);
+
+/// Default retention (hours) before a finished `delivered/` sidecar is
+/// pruned — one week (PS-25). Overridable via `[queue] delivered_retention_hours`.
+const DEFAULT_DELIVERED_RETENTION_HOURS: i64 = 24 * 7;
+
+/// How often the loop runs a `delivered/` prune sweep. Coarse so the sweep
+/// cost is negligible against the millisecond poll tick.
+const PRUNE_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Error)]
 enum PollerError {
@@ -53,23 +63,53 @@ pub struct ClassifyPoller {
     store: QueueStore,
     client: PerchpubClient,
     clock: Arc<dyn Clock>,
+    /// clip-ids known to have reached a terminal/lost classify state this
+    /// process. Such entries can never become pollable again, so later
+    /// scans skip them without re-reading + re-parsing the sidecar (PS-25).
+    seen_terminal: HashSet<String>,
+    /// Retention (hours) before a finished `delivered/` sidecar is pruned.
+    delivered_retention_hours: i64,
 }
 
 impl ClassifyPoller {
     #[must_use]
     pub fn new(store: QueueStore, client: PerchpubClient, clock: Arc<dyn Clock>) -> Self {
-        Self { store, client, clock }
+        Self {
+            store,
+            client,
+            clock,
+            seen_terminal: HashSet::new(),
+            delivered_retention_hours: DEFAULT_DELIVERED_RETENTION_HOURS,
+        }
+    }
+
+    /// Override the retention window (hours) before a finished `delivered/`
+    /// sidecar is pruned. Wired from `[queue] delivered_retention_hours`.
+    #[must_use]
+    pub fn with_delivered_retention_hours(mut self, hours: u64) -> Self {
+        self.delivered_retention_hours = i64::try_from(hours).unwrap_or(i64::MAX);
+        self
     }
 
     /// Run until the `shutdown` token fires. Alternates a fast tick while
     /// non-terminal entries are pending and a slower tick when the queue is
     /// idle. Every `.await` cooperates with cancellation so a SIGTERM-driven
     /// shutdown stops the loop promptly (PS-04 / PS-09).
-    pub async fn run(self, shutdown: CancellationToken) {
+    pub async fn run(mut self, shutdown: CancellationToken) {
+        // Prune `delivered/` on entry and then on a coarse cadence so the
+        // per-tick scan cost stays bounded without re-scanning the whole
+        // directory every few milliseconds (PS-25).
+        let mut next_prune = Instant::now();
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
+
+            if Instant::now() >= next_prune {
+                self.prune_round();
+                next_prune = Instant::now() + PRUNE_INTERVAL;
+            }
+
             let processed = tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
@@ -91,7 +131,26 @@ impl ClassifyPoller {
         }
     }
 
-    async fn poll_round(&self) -> Result<usize, PollerError> {
+    /// Age out finished `delivered/` sidecars older than the retention
+    /// window, dropping any pruned clip-ids from the in-memory skip set so
+    /// it never outgrows the directory it shadows.
+    fn prune_round(&mut self) {
+        let retention =
+            chrono::Duration::seconds(self.delivered_retention_hours.saturating_mul(3600));
+        let cutoff = self.clock.now() - retention;
+        match prune_delivered(&self.store, cutoff) {
+            Ok(pruned) => {
+                for id in &pruned {
+                    self.seen_terminal.remove(id);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(message = %err, "classify poller delivered-prune round failed");
+            }
+        }
+    }
+
+    async fn poll_round(&mut self) -> Result<usize, PollerError> {
         let entries = self.scan_non_terminal()?;
         let mut count = 0;
         for entry in entries {
@@ -101,7 +160,7 @@ impl ClassifyPoller {
         Ok(count)
     }
 
-    fn scan_non_terminal(&self) -> Result<Vec<ClipQueueEntry>, PollerError> {
+    fn scan_non_terminal(&mut self) -> Result<Vec<ClipQueueEntry>, PollerError> {
         let delivered = self.store.delivered_dir();
         let read_dir = fs::read_dir(&delivered)
             .map_err(|source| PollerError::DeliveredIo { path: delivered.clone(), source })?;
@@ -111,6 +170,16 @@ impl ClassifyPoller {
                 .map_err(|source| PollerError::DeliveredIo { path: delivered.clone(), source })?;
             let path = dir_entry.path();
             if path.extension().is_none_or(|e| e != "json") {
+                continue;
+            }
+            // PS-25: a sidecar already known terminal/lost this process can
+            // never become pollable again — skip it without re-reading and
+            // re-parsing. The skip set is keyed by clip-id (the file stem).
+            if path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| self.seen_terminal.contains(stem))
+            {
                 continue;
             }
             let bytes = match fs::read(&path) {
@@ -148,13 +217,11 @@ impl ClassifyPoller {
                     continue;
                 }
             };
-            if entry.classify_task_id.is_none() {
-                continue;
-            }
-            if entry.classify_lost_at.is_some() {
-                continue;
-            }
-            if entry.last_classify_status.is_some_and(ClassifyTaskStatus::is_terminal) {
+            // Not pollable (no classify task / lost / terminal status) →
+            // remember it so later scans skip it without re-reading, and do
+            // not poll it now (PS-25).
+            if !is_pollable(&entry) {
+                self.seen_terminal.insert(entry.clip_id.clone());
                 continue;
             }
             entries.push(entry);
@@ -162,7 +229,7 @@ impl ClassifyPoller {
         Ok(entries)
     }
 
-    async fn poll_one(&self, mut entry: ClipQueueEntry) -> Result<(), PollerError> {
+    async fn poll_one(&mut self, mut entry: ClipQueueEntry) -> Result<(), PollerError> {
         let task_id = entry
             .classify_task_id
             .expect("scan_non_terminal filters out entries without classify_task_id");
@@ -172,6 +239,8 @@ impl ClassifyPoller {
                 self.store.update_delivered_sidecar(&entry)?;
 
                 if task.status.is_terminal() {
+                    // No further transitions possible — never re-read it (PS-25).
+                    self.seen_terminal.insert(entry.clip_id.clone());
                     let observation_id =
                         task.observation.as_ref().map(|o: &ObservationPublic| o.id);
                     tracing::info!(
@@ -214,6 +283,8 @@ impl ClassifyPoller {
                     FailureKind::Terminal => {
                         entry.classify_lost_at = Some(self.clock.now());
                         self.store.update_delivered_sidecar(&entry)?;
+                        // Polling stops here — never re-read it (PS-25).
+                        self.seen_terminal.insert(entry.clip_id.clone());
                         emit_classify_lost(&entry.clip_id, task_id, kind, status);
                         Ok(())
                     }
@@ -221,6 +292,15 @@ impl ClassifyPoller {
             }
         }
     }
+}
+
+/// `true` while a `delivered/` entry still needs polling: it has a classify
+/// task, has not been marked lost, and its last observed status is
+/// non-terminal.
+fn is_pollable(entry: &ClipQueueEntry) -> bool {
+    entry.classify_task_id.is_some()
+        && entry.classify_lost_at.is_none()
+        && !entry.last_classify_status.is_some_and(ClassifyTaskStatus::is_terminal)
 }
 
 fn emit_poll_transient(
@@ -311,7 +391,7 @@ mod tests {
         e.last_classify_status = Some(ClassifyTaskStatus::Processing);
         write_delivered(&store, &e);
 
-        let poller = poller(dir.path(), store.clone());
+        let mut poller = poller(dir.path(), store.clone());
         let entries = poller.scan_non_terminal().expect("scan must not error on corrupt sidecar");
 
         assert_eq!(entries.len(), 1);
@@ -323,6 +403,40 @@ mod tests {
         assert!(!store.delivered_dir().join(format!("{bad}.json")).exists());
     }
 
+    #[test]
+    fn scan_skips_already_terminal_without_rereading() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // A terminal (Success) delivered entry — never pollable again.
+        let id = "20260527T120000Z-001";
+        let mut e = ClipQueueEntry::new(id, instant("2026-05-27T12:00:00Z"), Utc::now(), 1);
+        e.outcome = Some(Outcome::Delivered);
+        e.classify_task_id = Some(Uuid::new_v4());
+        e.last_classify_status = Some(ClassifyTaskStatus::Success);
+        write_delivered(&store, &e);
+
+        let mut poller = poller(dir.path(), store.clone());
+
+        // First scan reads it, sees it is terminal, and remembers it.
+        assert!(poller.scan_non_terminal().expect("scan 1").is_empty());
+
+        // Corrupt the sidecar on disk. If the next scan RE-READ it, the
+        // corrupt JSON would trip the quarantine path and move it to
+        // corrupt/. A skip-without-reading leaves it untouched (PS-25).
+        std::fs::write(store.delivered_dir().join(format!("{id}.json")), b"{ now corrupt").unwrap();
+
+        assert!(poller.scan_non_terminal().expect("scan 2").is_empty());
+        assert!(
+            store.delivered_dir().join(format!("{id}.json")).is_file(),
+            "a known-terminal sidecar must not be re-read on later ticks",
+        );
+        assert!(
+            !store.corrupt_dir().join(format!("{id}.json")).exists(),
+            "skipped terminal sidecar must not be quarantined",
+        );
+    }
+
     #[tokio::test]
     async fn poll_round_advances_despite_corrupt() {
         let dir = TempDir::new().unwrap();
@@ -332,7 +446,7 @@ mod tests {
         // every tick.
         std::fs::write(store.delivered_dir().join("20260527T120000Z-001.json"), b"{ bad").unwrap();
 
-        let poller = poller(dir.path(), store.clone());
+        let mut poller = poller(dir.path(), store.clone());
         let n = poller.poll_round().await.expect("poll_round must advance past corrupt sidecar");
         assert_eq!(n, 0);
         assert!(store.corrupt_dir().join("20260527T120000Z-001.json").is_file());

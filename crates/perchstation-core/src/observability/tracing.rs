@@ -134,6 +134,11 @@ pub mod events {
     /// A `pending/` sidecar referenced media that no longer exists; the
     /// orphan sidecar was quarantined so the delivery head advances (PS-04).
     pub const QUEUE_MISSING_MEDIA: &str = "queue.missing_media";
+    /// A `delivered/` sidecar whose classify task is finished (terminal or
+    /// lost) and which has sat past the retention window was pruned, so
+    /// `delivered/` does not grow without bound and the classify poller's
+    /// per-tick scan stays cheap (PS-25).
+    pub const QUEUE_PRUNED_DELIVERED: &str = "queue.pruned_delivered";
 
     // Delivery
     pub const DELIVERY_ATTEMPT_STARTED: &str = "delivery.attempt_started";

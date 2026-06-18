@@ -115,7 +115,8 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
         schedule,
         identity.clone(),
     );
-    let poller = ClassifyPoller::new(store.clone(), client, clock.clone());
+    let poller = ClassifyPoller::new(store.clone(), client, clock.clone())
+        .with_delivered_retention_hours(config.queue.delivered_retention_hours);
 
     // Wrap each long-lived worker in `spawn_supervised` so a panic in
     // one task is logged and isolated rather than aborting the others

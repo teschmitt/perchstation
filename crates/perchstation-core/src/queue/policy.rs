@@ -25,6 +25,7 @@ use chrono::Utc;
 
 use crate::config::{EvictionPolicy, QueueConfig};
 use crate::observability::tracing as obs_tracing;
+use crate::perchpub::types::ClassifyTaskStatus;
 
 use super::inbox::Inbox;
 use super::store::{ClipMeta, QueueStore};
@@ -283,4 +284,152 @@ fn evict(store: &QueueStore, candidate: &EvictableEntry) -> Result<(), QueueErro
         Err(source) => return Err(QueueError::Io { path: sidecar, source }),
     }
     Ok(())
+}
+
+/// Age out `delivered/` sidecars that are fully done with — `outcome ==
+/// Delivered` and the classify task has reached a terminal status (or was
+/// lost) — and whose `delivered_at` predates `before`. Returns the pruned
+/// clip-ids.
+///
+/// Bounds `delivered/` growth so the classify poller's per-tick scan stays
+/// cheap on a long-running station (PS-25). Still-pollable entries
+/// (non-terminal classify) are never touched, `Undeliverable` entries are
+/// left to the pressure-driven eviction policy (so `status` can still
+/// surface the last failure), and a sidecar that fails to read/parse is left
+/// in place for the poller's corrupt-quarantine path (PS-02). Only a
+/// `read_dir` failure aborts; per-entry removal failures are logged and the
+/// entry is retried on the next round.
+pub fn prune_delivered(
+    store: &QueueStore,
+    before: DateTime<Utc>,
+) -> Result<Vec<String>, QueueError> {
+    let delivered = store.delivered_dir();
+    let read_dir = fs::read_dir(&delivered)
+        .map_err(|source| QueueError::Io { path: delivered.clone(), source })?;
+    let mut pruned = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(|source| QueueError::Io { path: delivered.clone(), source })?;
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(sidecar) = serde_json::from_slice::<ClipQueueEntry>(&bytes) else {
+            continue;
+        };
+        if !is_prunable(&sidecar, before) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to prune delivered sidecar; will retry next round",
+                );
+                continue;
+            }
+        }
+        // `delivered/` sidecars have no mp4 by invariant; sweep any stray
+        // sibling defensively (best-effort).
+        let _ = fs::remove_file(path.with_extension("mp4"));
+        tracing::debug!(
+            event = obs_tracing::events::QUEUE_PRUNED_DELIVERED,
+            clip_id = %sidecar.clip_id,
+            "pruned terminal delivered sidecar past retention",
+        );
+        pruned.push(sidecar.clip_id);
+    }
+    Ok(pruned)
+}
+
+/// `true` when a `delivered/` entry is safe to age out: a successful upload
+/// whose classify task is finished (terminal status or lost) and which has
+/// sat in `delivered/` since before `before`.
+fn is_prunable(entry: &ClipQueueEntry, before: DateTime<Utc>) -> bool {
+    if entry.outcome != Some(Outcome::Delivered) {
+        return false;
+    }
+    let classify_done = entry.classify_lost_at.is_some()
+        || entry.last_classify_status.is_some_and(ClassifyTaskStatus::is_terminal);
+    classify_done && entry.delivered_at.is_some_and(|t| t < before)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::perchpub::types::ClassifyTaskStatus;
+    use crate::queue::store::QueueStore;
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn write_delivered(store: &QueueStore, entry: &ClipQueueEntry) {
+        let path = store.delivered_dir().join(format!("{}.json", entry.clip_id));
+        std::fs::write(path, serde_json::to_vec_pretty(entry).unwrap()).unwrap();
+    }
+
+    fn delivered_success(id: &str, delivered_at: &str) -> ClipQueueEntry {
+        let mut e =
+            ClipQueueEntry::new(id, instant("2026-01-01T00:00:00Z"), instant(delivered_at), 100);
+        e.outcome = Some(Outcome::Delivered);
+        e.classify_task_id = Some(Uuid::new_v4());
+        e.last_classify_status = Some(ClassifyTaskStatus::Success);
+        e.delivered_at = Some(instant(delivered_at));
+        e
+    }
+
+    #[test]
+    fn delivered_terminal_entries_are_aged_out() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // (1) Old + terminal-classify Delivered → prunable.
+        let old = "20260101T000000Z-001";
+        write_delivered(&store, &delivered_success(old, "2026-01-01T00:00:01Z"));
+
+        // (2) Fresh terminal Delivered → retained (inside the window).
+        let fresh = "20260601T000000Z-001";
+        write_delivered(&store, &delivered_success(fresh, "2026-06-01T00:00:01Z"));
+
+        // (3) Old but still-pollable (non-terminal classify) → retained.
+        let pollable = "20260101T000000Z-002";
+        let mut p = delivered_success(pollable, "2026-01-01T00:00:01Z");
+        p.last_classify_status = Some(ClassifyTaskStatus::Processing);
+        write_delivered(&store, &p);
+
+        // Cutoff: anything delivered before 2026-03-01 ages out.
+        let pruned = prune_delivered(&store, instant("2026-03-01T00:00:00Z")).expect("prune");
+
+        assert_eq!(pruned, vec![old.to_string()], "only the old terminal entry is pruned");
+        assert!(!store.delivered_dir().join(format!("{old}.json")).exists());
+        assert!(
+            store.delivered_dir().join(format!("{fresh}.json")).exists(),
+            "fresh terminal entry retained",
+        );
+        assert!(
+            store.delivered_dir().join(format!("{pollable}.json")).exists(),
+            "still-pollable entry retained",
+        );
+    }
+
+    #[test]
+    fn prune_skips_corrupt_sidecar_without_erroring() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        std::fs::write(store.delivered_dir().join("20260101T000000Z-001.json"), b"{ not json")
+            .unwrap();
+
+        // A corrupt sidecar is left in place for the poller's quarantine path.
+        let pruned = prune_delivered(&store, instant("2099-01-01T00:00:00Z")).expect("prune");
+        assert!(pruned.is_empty());
+        assert!(store.delivered_dir().join("20260101T000000Z-001.json").is_file());
+    }
 }

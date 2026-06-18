@@ -29,6 +29,11 @@ max_bytes = 2_147_483_648  # 2 GiB
 #                               full (Inbox::submit returns QueueFull).
 eviction = "drop_oldest_undelivered"
 
+# Retention (hours) before a finished delivered/ sidecar — upload succeeded
+# and its classify task reached a terminal status (or was lost) — is pruned.
+# Bounds delivered/ growth so the classify poller's per-tick scan stays cheap.
+delivered_retention_hours = 168  # 1 week
+
 [retry]
 # Delay before the first retry of a transient upload failure.
 initial_delay_secs = 10

@@ -63,6 +63,20 @@ const IDLE_TICK: Duration = Duration::from_millis(50);
 /// trying to upload, so this tick is comfortably long.
 const CERT_EXPIRED_TICK: Duration = Duration::from_mins(1);
 
+/// Short floor on the back-off applied when a queue write hits `ENOSPC`
+/// (PS-12). The previous code reused `max_attempt_delay` — the upload-retry
+/// ceiling, an hour by default — which stalled *all* delivery for up to an
+/// hour even though eviction or the operator typically frees space within
+/// seconds. A few-second floor keeps the loop responsive without hot-looping.
+const DISK_FULL_RETRY: Duration = Duration::from_secs(5);
+
+/// The back-off to sleep after a `DiskFull` write. The short [`DISK_FULL_RETRY`]
+/// floor, clamped down to `max_attempt_delay` so a deliberately tiny configured
+/// ceiling is never overridden *upward*.
+fn disk_full_backoff(max_attempt_delay: Duration) -> Duration {
+    DISK_FULL_RETRY.min(max_attempt_delay)
+}
+
 #[derive(Debug, Error)]
 enum RunnerError {
     #[error(transparent)]
@@ -108,10 +122,11 @@ impl DeliveryRunner {
     /// shutdown stops the loop promptly (PS-04 / PS-09) — the worker no
     /// longer relies on a detaching `abort()`.
     pub async fn run(self, shutdown: CancellationToken) {
-        // Backoff used when the filesystem reports ENOSPC. Capped at
-        // `max_attempt_delay` so we wake periodically and retry once
-        // space frees up (T049a).
-        let disk_full_backoff = self.schedule.max_attempt_delay;
+        // Backoff used when the filesystem reports ENOSPC. A short floor so
+        // we wake within seconds and retry once eviction/the operator frees
+        // space, rather than stalling all delivery for the hour-long
+        // upload-retry ceiling (T049a / PS-12).
+        let disk_full_backoff = disk_full_backoff(self.schedule.max_attempt_delay);
         loop {
             if shutdown.is_cancelled() {
                 break;
@@ -499,6 +514,25 @@ mod tests {
         // The head advanced: the next pick finds nothing.
         let again = runner.try_once().await.expect("try_once 2");
         assert!(!again, "delivery head must have advanced past the orphan");
+    }
+
+    #[test]
+    fn disk_full_backs_off_for_short_floor_not_max_delay() {
+        // The upload-retry ceiling defaults to an hour; a transient ENOSPC
+        // must NOT stall the whole delivery loop for that long (PS-12).
+        assert_eq!(
+            disk_full_backoff(StdDuration::from_hours(1)),
+            DISK_FULL_RETRY,
+            "a long retry ceiling must not couple ENOSPC recovery to it",
+        );
+        // ...but never wait longer than a deliberately tiny ceiling.
+        assert_eq!(
+            disk_full_backoff(StdDuration::from_millis(2)),
+            StdDuration::from_millis(2),
+            "the floor is clamped down to a tiny configured ceiling",
+        );
+        // Must be strictly positive so the loop cannot hot-spin on ENOSPC.
+        assert!(disk_full_backoff(StdDuration::from_hours(1)) > StdDuration::ZERO);
     }
 
     #[tokio::test]

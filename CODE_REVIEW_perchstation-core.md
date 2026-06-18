@@ -27,12 +27,12 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 - [ ] PS-06 — a 200 with undecodable body / unknown status → re-upload / infinite poll *(High)*
 - [x] PS-08 — no numeric config validation → downstream overflow panics *(Medium)*
 - [ ] PS-11 — jitter bypasses the injected `Clock` → retry storms + untestable *(Medium)*
-- [ ] PS-12 — disk-full backoff defaults to 1 hour *(Medium)*
-- [ ] PS-25 — `delivered/` never pruned → unbounded re-scan every tick *(Medium)*
+- [x] PS-12 — disk-full backoff defaults to 1 hour *(Medium)*
+- [x] PS-25 — `delivered/` never pruned → unbounded re-scan every tick *(Medium)*
 - [ ] PS-27 — `apply_policy` runs synchronous all-sidecar reads on the reactor *(Medium)*
 
 **Concurrency & task lifecycle**
-- [ ] PS-09 — `spawn_supervised` nests `tokio::spawn`; abort detaches the worker *(Medium)*
+- [x] PS-09 — `spawn_supervised` nests `tokio::spawn`; abort detaches the worker *(Medium)*
 - [ ] PS-10 — eviction races `transition_inflight` on `pending/` with no lock *(Medium)*
 
 **Perchpub wire client**
@@ -332,7 +332,7 @@ fn apply_jitter(base: Duration, jitter_fraction: f64) -> Duration {
 **Tests:** retry.rs: `jitter_is_deterministic_under_fake_clock`; rewrite `jitter_stays_inside_pm_20_percent` to drop `std::thread::sleep`; `jitter_differs_across_entries_same_tick` once a per-entry seed is threaded.
 
 ## PS-12 — disk-full backoff defaults to 1 hour, stalling all delivery on transient ENOSPC
-**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/delivery/runner.rs:92-96,116-123`
 
 ```rust
@@ -347,7 +347,7 @@ Err(RunnerError::Queue(QueueError::DiskFull { path })) => { ... sleep(disk_full_
 **Tests:** runner.rs: `disk_full_backs_off_for_short_floor_not_max_delay` — `max_attempt_delay=3600s`, force `DiskFull`, assert the chosen backoff is the short floor. Factor the duration into a const/helper if timing assertions are awkward.
 
 ## PS-25 — `delivered/` Delivered entries never pruned → unbounded growth re-scanned every tick
-**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/delivery/classify.rs:101-129`; `crates/perchstation-core/src/queue/policy.rs:209-220`
 
 **Problem:** The eviction policy (policy.rs:209-220) only treats `delivered/Undeliverable` as evictable; `Delivered` entries are never pruned. `delivered/` grows without bound, and `scan_non_terminal` (classify.rs:101-129) re-reads + re-parses every `delivered/*.json` every poll tick — O(n) `fs::read` + serde per tick, growing forever on a Pi.
@@ -375,7 +375,7 @@ self.inner.submit(clip_path, meta).await
 # Concurrency & task lifecycle
 
 ## PS-09 — `spawn_supervised` nests `tokio::spawn`; aborting the handle detaches the worker
-**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/supervision.rs:39-60`
 **Depends on:** PS-12 (soft — shared cancellable-loop refactor)
 
