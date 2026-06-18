@@ -1,49 +1,38 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: (template, unfilled placeholders) → 1.0.0
-Bump rationale: Initial ratification — first concrete constitution replacing
-the unfilled `.specify/memory/constitution.md` template. Treated as 1.0.0
-because there is no prior published version to compare against.
+Version change: 1.0.0 → 1.1.0
+Bump rationale: MINOR — the Development Workflow section gained a
+"Subagent-driven implementation" rule (shared types in `data-model.md` and
+interfaces in `contracts/` before implementation begins; each task
+self-contained and touching 1–2 files, with cross-task dependencies stated
+explicitly). New material guidance; no principle removed or redefined.
 
 Modified principles:
-  - [PRINCIPLE_1_NAME] → I. Unattended Reliability (new)
-  - [PRINCIPLE_2_NAME] → II. Hardware at the Boundary (new)
-  - [PRINCIPLE_3_NAME] → III. Resource Discipline (new)
-  - [PRINCIPLE_4_NAME] → IV. Observable, Not Chatty (new)
-  - [PRINCIPLE_5_NAME] → V. Test-First Where It Matters (new, non-negotiable
-    for non-hardware code)
+  - None renamed or redefined since 1.0.0.
 
 Added sections:
-  - Technology & Resource Constraints
-  - Development Workflow
-  - Governance
+  - Development Workflow → "Subagent-driven implementation" bullet.
 
 Removed sections:
-  - None (template placeholders replaced in-place)
+  - None.
 
 Templates requiring updates:
   - ✅ .specify/templates/plan-template.md — "Constitution Check" section
-    already references the constitution dynamically; no edit needed for the
-    initial ratification. Future amendments should re-evaluate.
+    references the constitution dynamically; no edit needed.
   - ✅ .specify/templates/spec-template.md — no constitution-specific
     references; no edit needed.
-  - ✅ .specify/templates/tasks-template.md — task categories are generic
-    and compatible with the new principles (testing discipline, observability,
-    resource discipline all expressible as tasks); no edit needed.
-  - ✅ .specify/templates/checklist-template.md — not inspected in detail;
-    no known constitution-coupled fields. Flag for review on next amendment.
-  - ✅ CLAUDE.md — points to "the current plan" for tech context; remains
-    accurate. No edit needed.
+  - ✅ .specify/templates/tasks-template.md — the task model already
+    supports self-contained [P] tasks; no edit needed.
+  - ✅ .specify/templates/checklist-template.md — no known
+    constitution-coupled fields; no edit needed.
+  - ✅ CLAUDE.md — documents the subagent-driven flow consistently with
+    this section; no edit needed.
 
 Follow-up TODOs:
-  - Confirm the intended wording for the truncated fragment in the
-    Technology & Resource Constraints section ("Cross-compilation is the
-    expected build workflow; on-device builds are not required."). The
-    original input read "...workflow; on-device builds are not required."
-    — the leading clause was reconstructed from context.
-  - Confirm `RATIFICATION_DATE` (2026-05-26) reflects the actual adoption
-    date; adjust if the project decides to backdate to an earlier moment.
+  - None. The 1.0.0 open items are resolved: the Technology & Resource
+    Constraints cross-compilation clause now reads in full, and the
+    ratification date (2026-05-26) is confirmed in the footer.
 -->
 
 # Perchstation Constitution

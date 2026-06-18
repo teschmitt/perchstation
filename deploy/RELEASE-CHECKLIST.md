@@ -1,6 +1,6 @@
 # On-device release smoke test
 
-`quickstart.md` proves the delivery subsystem on a developer's laptop
+`specs/001-clip-delivery/quickstart.md` proves the delivery subsystem on a developer's laptop
 against a fake perchpub and a PNG-fed QR source. Four classes of
 behaviour are out of reach for that quickstart and MUST be exercised on
 real hardware against a real perchpub deployment before tagging a
@@ -21,7 +21,8 @@ This document is the operator checklist for those steps.
 - A perchpub enrollment session in hand: session ID, auth token, CA chain
   PEM, rendered as a QR PNG on a phone/tablet screen.
 - The release candidate `perchstation` binary cross-built per
-  `quickstart.md` §6 and copied to `/usr/local/bin/perchstation`.
+  `specs/001-clip-delivery/quickstart.md` §6 and copied to
+  `/usr/local/bin/perchstation`.
 - `deploy/config.example.toml` adapted for the staging perchpub URL and
   installed at `/etc/perchstation/config.toml`.
 - `deploy/systemd/perchstation.service` installed at
@@ -75,7 +76,7 @@ This document is the operator checklist for those steps.
    via `systemctl status perchstation` reaching `active (running)` rather
    than `activating`).
 3. Drop a known-good `sample.mp4` into `/var/lib/perchstation/queue/pending/`
-   with a matching sidecar (mirror `quickstart.md` §3).
+   with a matching sidecar (mirror `specs/001-clip-delivery/quickstart.md` §3).
 4. Expect the sequence:
    - `delivery.attempt_started attempt=1`
    - `delivery.upload_succeeded` with a real `classify_task_id`
@@ -315,7 +316,8 @@ regressed and needs to be patched before shipping.
    - `du -sh /var/lib/perchstation/queue` reports a value bounded by the
      configured `queue.max_bytes`.
    - `journalctl --disk-usage` does not exceed the configured
-     `SystemMaxUse` (default 200 MB for a Pi, see quickstart §7).
+     `SystemMaxUse` (default 200 MB for a Pi, see
+     `specs/001-clip-delivery/quickstart.md` §7).
 3. **Reject** the build if any of the above fails.
 
 ## Step 8 — Tear-down
