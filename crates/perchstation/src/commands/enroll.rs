@@ -67,7 +67,7 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
     let previous_station_id = identity::peek_existing_station_id(&config.data_dir).ok().flatten();
 
     // --- 1. Acquire a QR frame ---
-    let mut source = build_qr_source(&args)?;
+    let mut source = build_qr_source(&args, config)?;
     let frame = source.next_frame().await.map_err(|err| classify_qr_error(&err))?;
 
     // --- 2. Decode the QR payload ---
@@ -152,7 +152,10 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
     Ok(())
 }
 
-fn build_qr_source(args: &EnrollArgs) -> Result<Box<dyn QrFrameSource>, CommandError> {
+fn build_qr_source(
+    args: &EnrollArgs,
+    config: &Config,
+) -> Result<Box<dyn QrFrameSource>, CommandError> {
     match args.qr_source {
         QrSourceArg::File => {
             let path = args.qr_file.clone().ok_or_else(|| {
@@ -160,7 +163,7 @@ fn build_qr_source(args: &EnrollArgs) -> Result<Box<dyn QrFrameSource>, CommandE
             })?;
             Ok(Box::new(FileQrSource::new(path)))
         }
-        QrSourceArg::Camera => build_camera_source(),
+        QrSourceArg::Camera => build_camera_source(config),
     }
 }
 
@@ -169,12 +172,15 @@ fn build_qr_source(args: &EnrollArgs) -> Result<Box<dyn QrFrameSource>, CommandE
     clippy::unnecessary_wraps,
     reason = "non-linux variant returns an error; signature must match across cfgs"
 )]
-fn build_camera_source() -> Result<Box<dyn QrFrameSource>, CommandError> {
-    Ok(Box::new(perchstation_hw::camera_qr::CameraQrSource::new()))
+fn build_camera_source(config: &Config) -> Result<Box<dyn QrFrameSource>, CommandError> {
+    Ok(Box::new(
+        perchstation_hw::camera_qr::CameraQrSource::new()
+            .with_binary(config.capture.camera_still_command.clone()),
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn build_camera_source() -> Result<Box<dyn QrFrameSource>, CommandError> {
+fn build_camera_source(_config: &Config) -> Result<Box<dyn QrFrameSource>, CommandError> {
     Err(CommandError::Config(anyhow!(
         "--qr-source=camera is only supported on Linux (Pi). Use --qr-source=file on dev hosts.",
     )))

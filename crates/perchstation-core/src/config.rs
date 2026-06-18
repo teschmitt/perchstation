@@ -144,6 +144,16 @@ pub struct CaptureConfig {
     pub camera_framerate: u32,
     #[serde(default = "default_camera_bitrate_bps")]
     pub camera_bitrate_bps: u64,
+    /// External binary the recorder shells out to for motion clips
+    /// (`perchstation serve`). Defaults to the current Pi OS name
+    /// `rpicam-vid`; set to `libcamera-vid` on older images.
+    #[serde(default = "default_camera_command")]
+    pub camera_command: PathBuf,
+    /// External binary the enrollment QR still-capture shells out to
+    /// (`enroll --qr-source camera`). Defaults to `rpicam-still`; set to
+    /// `libcamera-still` on older images.
+    #[serde(default = "default_camera_still_command")]
+    pub camera_still_command: PathBuf,
 }
 
 impl Default for CaptureConfig {
@@ -162,6 +172,8 @@ impl Default for CaptureConfig {
             camera_height: default_camera_height(),
             camera_framerate: default_camera_framerate(),
             camera_bitrate_bps: default_camera_bitrate_bps(),
+            camera_command: default_camera_command(),
+            camera_still_command: default_camera_still_command(),
         }
     }
 }
@@ -249,6 +261,15 @@ impl Config {
         }
         if self.capture.liveness_poll_secs == 0 {
             return Err(oor("capture.liveness_poll_secs", "must be >= 1"));
+        }
+
+        // Camera binaries must be nameable — an empty command can only ever
+        // fail at spawn time, so reject it up front like the other knobs.
+        if self.capture.camera_command.as_os_str().is_empty() {
+            return Err(oor("capture.camera_command", "must not be empty"));
+        }
+        if self.capture.camera_still_command.as_os_str().is_empty() {
+            return Err(oor("capture.camera_still_command", "must not be empty"));
         }
 
         // Retry / backoff. `per_clip_max_wallclock_hours` is capped so the
@@ -360,6 +381,14 @@ const fn default_camera_framerate() -> u32 {
 
 const fn default_camera_bitrate_bps() -> u64 {
     4_000_000
+}
+
+fn default_camera_command() -> PathBuf {
+    PathBuf::from("rpicam-vid")
+}
+
+fn default_camera_still_command() -> PathBuf {
+    PathBuf::from("rpicam-still")
 }
 
 #[cfg(test)]
@@ -507,5 +536,32 @@ mod tests {
             Config::from_toml_str("perchpub_url = \"https://p.example\"\n").expect("parses");
         cfg.queue.max_bytes = 0;
         assert!(cfg.ensure_runtime_ready().is_err());
+    }
+
+    #[test]
+    fn capture_camera_commands_default_to_rpicam() {
+        let cfg = Config::default();
+        assert_eq!(cfg.capture.camera_command, PathBuf::from("rpicam-vid"));
+        assert_eq!(cfg.capture.camera_still_command, PathBuf::from("rpicam-still"));
+    }
+
+    #[test]
+    fn capture_camera_commands_are_overridable() {
+        let cfg = Config::from_toml_str(
+            "[capture]\ncamera_command = \"libcamera-vid\"\ncamera_still_command = \"libcamera-still\"\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.capture.camera_command, PathBuf::from("libcamera-vid"));
+        assert_eq!(cfg.capture.camera_still_command, PathBuf::from("libcamera-still"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_camera_command() {
+        let mut cfg = Config::default();
+        cfg.capture.camera_command = PathBuf::new();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::OutOfRange { field: "capture.camera_command", .. })
+        ));
     }
 }

@@ -3,6 +3,10 @@ Description=perchstation clip delivery subsystem
 Documentation=https://github.com/teschmitt/perchstation
 After=network-online.target time-sync.target
 Wants=network-online.target time-sync.target
+# Restart rate limiting — these keys belong in [Unit], not [Service]
+# (systemd ignores them in [Service] and warns).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=notify
@@ -17,13 +21,24 @@ StateDirectoryMode=0750
 # Restart policy: panic recovers automatically (constitution Principle I).
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 # Process hardening — no privileges, no surprise filesystem writes.
 NoNewPrivileges=true
 PrivateTmp=true
-PrivateDevices=true
+# Capture needs the GPIO char device (motion sensor) and, on a working
+# camera, the V4L2/libcamera device nodes. PrivateDevices=true would hide
+# all of them, so instead grant exactly what is needed via DeviceAllow
+# (which implies DevicePolicy=closed — every other device stays denied)
+# plus the owning groups.
+DeviceAllow=/dev/gpiochip0 rw
+SupplementaryGroups=gpio video
+# Camera device access — UNVERIFIED: the reference Pi's camera is faulty,
+# so this could not be smoke-tested. Verify on a Pi with a working camera
+# before relying on it, and note MemoryDenyWriteExecute below likely needs
+# relaxing for the GPU/codec stack:
+#DeviceAllow=char-video4linux rw
+#DeviceAllow=char-media rw
+#DeviceAllow=/dev/dma_heap/ rw
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true

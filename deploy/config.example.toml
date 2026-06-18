@@ -80,11 +80,16 @@ sensor_line = 17
 # Whether the sensor's asserted state is electrical HIGH (`true`) or
 # LOW (`false`). Most PIR breakouts are active-high.
 sensor_active_high = true
-# Camera frame width in pixels passed to libcamera-vid.
+# Camera frame width in pixels passed to the camera command.
 camera_width = 1280
-# Camera frame height in pixels passed to libcamera-vid.
+# Camera frame height in pixels passed to the camera command.
 camera_height = 720
-# Camera frame rate (frames per second) passed to libcamera-vid.
+# Camera frame rate (frames per second) passed to the camera command.
 camera_framerate = 30
-# Camera target bitrate in bits per second passed to libcamera-vid.
+# Camera target bitrate in bits per second passed to the camera command.
 camera_bitrate_bps = 4_000_000  # 4 Mbit/s
+# External capture binaries. Defaults target the current Raspberry Pi OS
+# camera stack (rpicam-*). On older images that still ship the deprecated
+# libcamera-* names, set these to "libcamera-vid" / "libcamera-still".
+camera_command = "rpicam-vid"            # records motion clips (perchstation serve)
+camera_still_command = "rpicam-still"    # still capture for `enroll --qr-source camera`

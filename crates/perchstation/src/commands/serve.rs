@@ -218,7 +218,8 @@ fn spawn_capture_task(
         config.capture.camera_height,
         config.capture.camera_framerate,
         config.capture.camera_bitrate_bps,
-    );
+    )
+    .with_binary(config.capture.camera_command.clone());
 
     let state = Arc::new(CaptureState::new());
     let capture = Capture::new(

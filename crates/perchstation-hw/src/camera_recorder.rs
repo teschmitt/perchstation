@@ -1,4 +1,5 @@
-//! Production [`Camera`] backed by `libcamera-vid`.
+//! Production [`Camera`] backed by the Pi camera CLI — `rpicam-vid` by
+//! default, configurable via `[capture].camera_command`.
 //!
 //! The adapter spawns `libcamera-vid` for each call, writes the encoded
 //! H.264-in-MP4 output to `<staging>/<recording-id>.mp4`, and awaits the
@@ -22,7 +23,7 @@ use perchstation_core::hw_traits::{Camera, CameraError, RecordedClip};
 use tokio::process::{Child, Command};
 
 const TERMINATE_GRACE: Duration = Duration::from_millis(500);
-const DEFAULT_BINARY: &str = "libcamera-vid";
+const DEFAULT_BINARY: &str = "rpicam-vid";
 
 pub struct LibcameraVidCamera {
     binary: PathBuf,
@@ -52,8 +53,8 @@ impl LibcameraVidCamera {
         }
     }
 
-    /// Override the binary path (used in dev hosts where `libcamera-vid`
-    /// lives under a non-standard prefix).
+    /// Override the binary path (wired from `[capture].camera_command`;
+    /// also used in tests and on hosts with a non-standard prefix).
     #[must_use]
     pub fn with_binary(mut self, binary: impl Into<PathBuf>) -> Self {
         self.binary = binary.into();
@@ -174,7 +175,8 @@ impl Camera for LibcameraVidCamera {
             // Guard's Drop will remove the partial file.
             let code = status.code().unwrap_or(-1);
             return Err(CameraError::Aborted(format!(
-                "{DEFAULT_BINARY} exited with status {code}"
+                "{} exited with status {code}",
+                self.binary.display()
             )));
         }
 

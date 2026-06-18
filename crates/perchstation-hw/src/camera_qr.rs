@@ -1,4 +1,5 @@
-//! Production [`QrFrameSource`] backed by `libcamera-still`.
+//! Production [`QrFrameSource`] backed by the Pi camera still CLI —
+//! `rpicam-still` by default, configurable via `[capture].camera_still_command`.
 //!
 //! The Raspberry Pi camera stack does not expose a stable in-process Rust
 //! binding, so we shell out to the stock `libcamera-still` CLI for the
@@ -31,7 +32,7 @@ pub struct CameraQrSource {
 impl Default for CameraQrSource {
     fn default() -> Self {
         Self {
-            binary: PathBuf::from("libcamera-still"),
+            binary: PathBuf::from("rpicam-still"),
             width: 800,
             height: 600,
             // `--immediate` exits as soon as the sensor produces a frame.
@@ -47,8 +48,8 @@ impl CameraQrSource {
         Self::default()
     }
 
-    /// Override the binary path (used in tests / dev hosts where
-    /// `libcamera-still` lives under a non-standard prefix).
+    /// Override the binary path (wired from `[capture].camera_still_command`;
+    /// also used in tests and on hosts with a non-standard prefix).
     #[must_use]
     pub fn with_binary(mut self, binary: impl Into<PathBuf>) -> Self {
         self.binary = binary.into();
