@@ -21,13 +21,27 @@
 //!
 //! Pre-flight readability check (T049) runs before the upload attempt;
 //! disk-full handling (T049a) is layered on the queue writes.
+//!
+//! **At-least-once delivery (PS-01).** There is an irreducible window
+//! between perchpub *accepting* the bytes (`upload_clip` returns `Ok`) and
+//! the station *recording* that success (`transition_delivered`). If the
+//! process dies — or `transition_delivered` itself fails (e.g. ENOSPC
+//! writing the sidecar) — in that window, the entry stays non-terminal in
+//! `inflight/` and boot reconciliation re-queues it, so the clip is
+//! re-uploaded. This is by design: the window cannot be closed locally, so
+//! perchpub MUST treat `POST /api/v1/upload/` as **idempotent keyed on
+//! `clip_id`** (passed as the multipart filename) and de-duplicate
+//! re-sends rather than spawn a second classify task. Crashes *after* the
+//! terminal sidecar is written but *before* the `delivered/` rename are
+//! handled separately — `reconcile_inflight` finishes that interrupted
+//! transition instead of re-queueing it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::hw_traits::Clock;
 use crate::identity::StationIdentity;
@@ -36,6 +50,7 @@ use crate::perchpub::client::{ClientError, PerchpubClient};
 use crate::queue::store::QueueStore;
 use crate::queue::{ClipQueueEntry, LastError, Outcome, QueueError};
 
+use super::cancellable_sleep;
 use super::retry::{BackoffSchedule, FailureKind, NextAction, classify_upload_error, error_kind};
 
 /// Idle tick: how long the loop sleeps when there's nothing eligible to
@@ -87,14 +102,21 @@ impl DeliveryRunner {
         }
     }
 
-    /// Run until cancelled. Each iteration either makes progress on one
-    /// clip or sleeps for [`IDLE_TICK`] and tries again.
-    pub async fn run(self) {
+    /// Run until the `shutdown` token fires. Each iteration either makes
+    /// progress on one clip or sleeps for [`IDLE_TICK`] and tries again.
+    /// Every `.await` point cooperates with cancellation so a SIGTERM-driven
+    /// shutdown stops the loop promptly (PS-04 / PS-09) — the worker no
+    /// longer relies on a detaching `abort()`.
+    pub async fn run(self, shutdown: CancellationToken) {
         // Backoff used when the filesystem reports ENOSPC. Capped at
         // `max_attempt_delay` so we wake periodically and retry once
         // space frees up (T049a).
         let disk_full_backoff = self.schedule.max_attempt_delay;
         loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
             // Pre-flight cert expiry check (T058 / FR-014). Halts the
             // loop's productive work without exiting the process so
             // `status` continues to surface the expired state.
@@ -106,27 +128,42 @@ impl DeliveryRunner {
                         "station cert has expired; halting delivery loop until re-enrollment",
                     );
                 }
-                sleep(CERT_EXPIRED_TICK).await;
+                if cancellable_sleep(&shutdown, CERT_EXPIRED_TICK).await {
+                    break;
+                }
                 continue;
             }
 
-            match self.try_once().await {
+            let outcome = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                outcome = self.try_once() => outcome,
+            };
+            match outcome {
                 Ok(true) => {}
-                Ok(false) => sleep(IDLE_TICK).await,
+                Ok(false) => {
+                    if cancellable_sleep(&shutdown, IDLE_TICK).await {
+                        break;
+                    }
+                }
                 Err(RunnerError::Queue(QueueError::DiskFull { path })) => {
                     tracing::error!(
                         event = obs_tracing::events::QUEUE_DISK_FULL,
                         path = %path.display(),
                         "queue write failed with ENOSPC; backing off",
                     );
-                    sleep(disk_full_backoff).await;
+                    if cancellable_sleep(&shutdown, disk_full_backoff).await {
+                        break;
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
                         message = %err,
                         "delivery iteration aborted on internal queue error",
                     );
-                    sleep(IDLE_TICK).await;
+                    if cancellable_sleep(&shutdown, IDLE_TICK).await {
+                        break;
+                    }
                 }
             }
         }
@@ -138,7 +175,23 @@ impl DeliveryRunner {
             return Ok(false);
         };
 
-        let entry = self.store.transition_inflight(entry, now)?;
+        let entry = match self.store.transition_inflight(entry, now) {
+            Ok(entry) => entry,
+            Err(QueueError::MissingMedia { clip_id }) => {
+                // PS-04: the sidecar references media that no longer exists
+                // (a residual orphan). Quarantine it so the delivery head
+                // advances instead of re-picking the same entry — and
+                // wedging the loop — every tick. Counts as progress.
+                tracing::warn!(
+                    event = obs_tracing::events::QUEUE_MISSING_MEDIA,
+                    clip_id = %clip_id,
+                    "quarantining orphan sidecar with missing media",
+                );
+                self.store.quarantine_orphan(&clip_id)?;
+                return Ok(true);
+            }
+            Err(err) => return Err(err.into()),
+        };
         let clip_id = entry.clip_id.clone();
         let attempt = entry.attempts;
 
@@ -182,6 +235,11 @@ impl DeliveryRunner {
                 delivered.delivered_at = Some(self.clock.now());
                 delivered.last_classify_status = Some(task.status);
                 delivered.last_error = None;
+                // PS-01: the bytes are already accepted by perchpub. If this
+                // record fails (or we crash before it), the entry stays in
+                // `inflight/` and reconcile re-queues it → an at-least-once
+                // re-upload, NOT a lost clip. perchpub de-duplicates on
+                // `clip_id` (see the module header).
                 self.store.transition_delivered(&delivered)?;
                 tracing::info!(
                     event = obs_tracing::events::DELIVERY_UPLOAD_SUCCEEDED,
@@ -386,5 +444,78 @@ fn preflight_check(clip_path: &std::path::Path) -> Option<&'static str> {
         Ok(meta) if meta.len() == 0 => Some("zero_length"),
         Ok(_) => None,
         Err(_) => Some("unreadable"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delivery::test_support::{
+        arc_clock, fake_client, far_future_identity, fast_schedule,
+    };
+    use crate::queue::ClipQueueEntry;
+    use crate::queue::store::QueueStore;
+    use chrono::{DateTime, Utc};
+    use std::time::Duration as StdDuration;
+    use tempfile::TempDir;
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn runner(dir: &std::path::Path, store: QueueStore) -> DeliveryRunner {
+        DeliveryRunner::new(
+            store,
+            fake_client(dir),
+            arc_clock(),
+            fast_schedule(),
+            far_future_identity(),
+        )
+    }
+
+    #[tokio::test]
+    async fn try_once_quarantines_missing_media_and_advances() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // An orphan: a pending sidecar whose `.mp4` media is absent.
+        let id = "20260527T120000Z-001";
+        let entry = ClipQueueEntry::new(id, instant("2026-05-27T12:00:00Z"), Utc::now(), 9);
+        std::fs::write(
+            store.pending_dir().join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let runner = runner(dir.path(), store.clone());
+
+        let progressed = runner.try_once().await.expect("try_once must not error on MissingMedia");
+        assert!(progressed, "quarantining a MissingMedia orphan counts as progress");
+        assert!(
+            !store.pending_dir().join(format!("{id}.json")).exists(),
+            "orphan sidecar must be quarantined",
+        );
+
+        // The head advanced: the next pick finds nothing.
+        let again = runner.try_once().await.expect("try_once 2");
+        assert!(!again, "delivery head must have advanced past the orphan");
+    }
+
+    #[tokio::test]
+    async fn run_exits_on_cancellation() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap(); // empty queue → idle loop
+        let runner = runner(dir.path(), store);
+
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(runner.run(shutdown.clone()));
+
+        // Let it spin a couple of idle ticks, then cancel.
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        shutdown.cancel();
+
+        let joined = tokio::time::timeout(StdDuration::from_secs(2), handle).await;
+        assert!(joined.is_ok(), "run() must exit promptly after cancellation");
+        joined.unwrap().expect("run task join");
     }
 }

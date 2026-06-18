@@ -14,3 +14,23 @@
 pub mod classify;
 pub mod retry;
 pub mod runner;
+
+#[cfg(test)]
+pub(crate) mod test_support;
+
+use std::time::Duration;
+
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+
+/// Sleep for `dur` unless `shutdown` fires first. Returns `true` when
+/// cancellation was observed (the caller should break its loop). Shared by
+/// the delivery runner and the classify poller so both cooperate with a
+/// SIGTERM-driven shutdown at every `.await` rather than relying on a
+/// detaching `abort()` (PS-04 / PS-09).
+pub(crate) async fn cancellable_sleep(shutdown: &CancellationToken, dur: Duration) -> bool {
+    tokio::select! {
+        () = shutdown.cancelled() => true,
+        () = sleep(dur) => false,
+    }
+}

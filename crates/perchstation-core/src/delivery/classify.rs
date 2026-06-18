@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::hw_traits::Clock;
 use crate::observability::tracing as obs_tracing;
@@ -29,6 +29,7 @@ use crate::perchpub::types::{ClassifyTaskStatus, ObservationPublic};
 use crate::queue::store::QueueStore;
 use crate::queue::{ClipQueueEntry, QueueError};
 
+use super::cancellable_sleep;
 use super::retry::{FailureKind, classify_poll_error, error_kind};
 
 const IDLE_SCAN_TICK: Duration = Duration::from_millis(50);
@@ -43,12 +44,6 @@ enum PollerError {
         path: PathBuf,
         #[source]
         source: std::io::Error,
-    },
-    #[error("could not parse delivered/ entry `{path}`: {source}")]
-    DeliveredParse {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
     },
 }
 
@@ -66,24 +61,32 @@ impl ClassifyPoller {
         Self { store, client, clock }
     }
 
-    /// Run until cancelled. Alternates a fast tick while non-terminal
-    /// entries are pending and a slower tick when the queue is idle.
-    pub async fn run(self) {
+    /// Run until the `shutdown` token fires. Alternates a fast tick while
+    /// non-terminal entries are pending and a slower tick when the queue is
+    /// idle. Every `.await` cooperates with cancellation so a SIGTERM-driven
+    /// shutdown stops the loop promptly (PS-04 / PS-09).
+    pub async fn run(self, shutdown: CancellationToken) {
         loop {
-            let processed = match self.poll_round().await {
-                Ok(n) => n,
-                Err(err) => {
-                    tracing::warn!(
-                        message = %err,
-                        "classify poller iteration failed",
-                    );
-                    0
-                }
+            if shutdown.is_cancelled() {
+                break;
+            }
+            let processed = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                result = self.poll_round() => match result {
+                    Ok(n) => n,
+                    Err(err) => {
+                        tracing::warn!(
+                            message = %err,
+                            "classify poller iteration failed",
+                        );
+                        0
+                    }
+                },
             };
-            if processed > 0 {
-                sleep(ACTIVE_SCAN_TICK).await;
-            } else {
-                sleep(IDLE_SCAN_TICK).await;
+            let tick = if processed > 0 { ACTIVE_SCAN_TICK } else { IDLE_SCAN_TICK };
+            if cancellable_sleep(&shutdown, tick).await {
+                break;
             }
         }
     }
@@ -110,10 +113,41 @@ impl ClassifyPoller {
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            let bytes = fs::read(&path)
-                .map_err(|source| PollerError::DeliveredIo { path: path.clone(), source })?;
-            let entry: ClipQueueEntry = serde_json::from_slice(&bytes)
-                .map_err(|source| PollerError::DeliveredParse { path: path.clone(), source })?;
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    // Per-file I/O error (e.g. a concurrent prune removed it).
+                    // Skip; do not abort the whole scan.
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "skipping unreadable delivered sidecar",
+                    );
+                    continue;
+                }
+            };
+            let entry: ClipQueueEntry = match serde_json::from_slice(&bytes) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    // PS-02: a single corrupt sidecar must not wedge the
+                    // classify poller forever. Quarantine it so the scan
+                    // head advances permanently.
+                    tracing::warn!(
+                        event = obs_tracing::events::QUEUE_CORRUPT_SIDECAR,
+                        path = %path.display(),
+                        error = %err,
+                        "quarantining corrupt delivered sidecar",
+                    );
+                    if let Err(qerr) = self.store.quarantine_corrupt(&path) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %qerr,
+                            "failed to quarantine corrupt delivered sidecar",
+                        );
+                    }
+                    continue;
+                }
+            };
             if entry.classify_task_id.is_none() {
                 continue;
             }
@@ -234,5 +268,73 @@ fn emit_classify_lost(clip_id: &str, task_id: uuid::Uuid, kind: &str, status: Op
             kind = kind,
             "classify task lost; stopped polling",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::delivery::test_support::{arc_clock, fake_client};
+    use crate::queue::store::QueueStore;
+    use crate::queue::{ClipQueueEntry, Outcome};
+    use chrono::{DateTime, Utc};
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    fn instant(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn write_delivered(store: &QueueStore, entry: &ClipQueueEntry) {
+        let path = store.delivered_dir().join(format!("{}.json", entry.clip_id));
+        std::fs::write(path, serde_json::to_vec_pretty(entry).unwrap()).unwrap();
+    }
+
+    fn poller(dir: &std::path::Path, store: QueueStore) -> ClassifyPoller {
+        ClassifyPoller::new(store, fake_client(dir), arc_clock())
+    }
+
+    #[test]
+    fn scan_skips_corrupt_sidecar_and_continues() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // A corrupt delivered sidecar ...
+        let bad = "20260527T120000Z-001";
+        std::fs::write(store.delivered_dir().join(format!("{bad}.json")), b"{ not json").unwrap();
+
+        // ... and a still-pollable (non-terminal) one.
+        let good = "20260527T120100Z-001";
+        let mut e = ClipQueueEntry::new(good, instant("2026-05-27T12:01:00Z"), Utc::now(), 1);
+        e.outcome = Some(Outcome::Delivered);
+        e.classify_task_id = Some(Uuid::new_v4());
+        e.last_classify_status = Some(ClassifyTaskStatus::Processing);
+        write_delivered(&store, &e);
+
+        let poller = poller(dir.path(), store.clone());
+        let entries = poller.scan_non_terminal().expect("scan must not error on corrupt sidecar");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].clip_id, good);
+        assert!(
+            store.corrupt_dir().join(format!("{bad}.json")).is_file(),
+            "corrupt sidecar quarantined to corrupt/",
+        );
+        assert!(!store.delivered_dir().join(format!("{bad}.json")).exists());
+    }
+
+    #[tokio::test]
+    async fn poll_round_advances_despite_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        // Only a corrupt sidecar — no pollable entry, so poll_round makes no
+        // network call but must still complete (Ok) rather than erroring
+        // every tick.
+        std::fs::write(store.delivered_dir().join("20260527T120000Z-001.json"), b"{ bad").unwrap();
+
+        let poller = poller(dir.path(), store.clone());
+        let n = poller.poll_round().await.expect("poll_round must advance past corrupt sidecar");
+        assert_eq!(n, 0);
+        assert!(store.corrupt_dir().join("20260527T120000Z-001.json").is_file());
     }
 }

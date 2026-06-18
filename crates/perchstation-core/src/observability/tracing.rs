@@ -123,6 +123,17 @@ pub mod events {
     pub const QUEUE_EVICTED: &str = "queue.evicted";
     pub const QUEUE_ZERO_LENGTH_SKIPPED: &str = "queue.zero_length_skipped";
     pub const QUEUE_DISK_FULL: &str = "queue.disk_full";
+    /// A `pending/`/`delivered/` sidecar failed to deserialise and was
+    /// moved to `corrupt/` so the scan head advances instead of failing on
+    /// the same file every tick (PS-02).
+    pub const QUEUE_CORRUPT_SIDECAR: &str = "queue.corrupt_sidecar";
+    /// Boot sweep reclaimed an `*.mp4` with no matching sidecar — media
+    /// stranded by a crash between the media rename and the sidecar write
+    /// (PS-07).
+    pub const QUEUE_ORPHAN_MEDIA: &str = "queue.orphan_media";
+    /// A `pending/` sidecar referenced media that no longer exists; the
+    /// orphan sidecar was quarantined so the delivery head advances (PS-04).
+    pub const QUEUE_MISSING_MEDIA: &str = "queue.missing_media";
 
     // Delivery
     pub const DELIVERY_ATTEMPT_STARTED: &str = "delivery.attempt_started";

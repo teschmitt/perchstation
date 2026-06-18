@@ -119,9 +119,12 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
 
     // Wrap each long-lived worker in `spawn_supervised` so a panic in
     // one task is logged and isolated rather than aborting the others
-    // (FR-012, SC-009).
-    let delivery_handle = spawn_supervised("delivery", runner.run());
-    let classify_handle = spawn_supervised("classify", poller.run());
+    // (FR-012, SC-009). Each worker gets a `CancellationToken` so SIGTERM
+    // shutdown stops it cleanly at the next `.await` (PS-04 / PS-09) rather
+    // than relying on a detaching `abort()`.
+    let worker_shutdown = CancellationToken::new();
+    let delivery_handle = spawn_supervised("delivery", runner.run(worker_shutdown.clone()));
+    let classify_handle = spawn_supervised("classify", poller.run(worker_shutdown.clone()));
 
     // Build the capture loop's inbox + adapters and spawn its supervised
     // task alongside delivery / classify. Linux-only: on dev hosts that
@@ -155,13 +158,15 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     );
 
     capture_shutdown.cancel();
-    delivery_handle.abort();
-    classify_handle.abort();
+    worker_shutdown.cancel();
+
+    // Give each worker a brief chance to observe cancellation and drain.
+    // The supervised tasks resolve cleanly once their loops break; the
+    // timeout bounds shutdown if a loop is mid-upload.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), delivery_handle).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), classify_handle).await;
 
     if let Some(handle) = capture_handle {
-        // Give the capture loop a brief chance to drain before falling
-        // back to abort. The supervisor exits cleanly when the
-        // CancellationToken fires; abort is the belt-and-braces path.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 

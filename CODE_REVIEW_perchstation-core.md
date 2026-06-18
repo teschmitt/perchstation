@@ -12,10 +12,10 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 ### Progress checklist
 
 **Queue crash-safety & integrity**
-- [ ] PS-01 — reconcile re-queues terminal entries → duplicate delivery *(Critical)*
-- [ ] PS-02 — one corrupt sidecar wedges the delivery & classify loops forever *(Critical)*
-- [ ] PS-04 — orphan-media entries permanently wedge the delivery loop *(High)*
-- [ ] PS-07 — `enqueue` orphans the mp4 if the sidecar write fails *(High)*
+- [x] PS-01 — reconcile re-queues terminal entries → duplicate delivery *(Critical)*
+- [x] PS-02 — one corrupt sidecar wedges the delivery & classify loops forever *(Critical)*
+- [x] PS-04 — orphan-media entries permanently wedge the delivery loop *(High)*
+- [x] PS-07 — `enqueue` orphans the mp4 if the sidecar write fails *(High)*
 
 **Queue policy & eviction**
 - [x] PS-03 — `max_clips = 0` (unvalidated) silently bricks the queue *(High)*
@@ -115,7 +115,7 @@ The four queue-store crash-safety findings (PS-01, PS-02, PS-04, PS-07) share on
 # Queue crash-safety & integrity
 
 ## PS-01 — reconcile_inflight re-queues terminal entries → duplicate delivery
-**Severity:** Critical · **Effort:** L · **Confidence:** confirmed · **Status:** todo
+**Severity:** Critical · **Effort:** L · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/store.rs:228-252,265-283`; `crates/perchstation-core/src/delivery/runner.rs:176-200`
 **Depends on:** PS-04
 
@@ -141,7 +141,7 @@ Preserve the data-model invariant that the mp4 is unlinked before the `delivered
 **Notes:** `reconcile_inflight` is called once at boot from `crates/perchstation/src/commands/serve.rs:82-84`. `is_terminal()` = `outcome.is_some()` at `queue/mod.rs:127`.
 
 ## PS-02 — a single corrupt sidecar wedges the delivery & classify loops forever
-**Severity:** Critical · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Critical · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/store.rs:113-140` (delivery loop); `crates/perchstation-core/src/delivery/classify.rs:101-129` (classify poller)
 **Depends on:** PS-25 (soft — shared warn-dedup / in-memory set)
 
@@ -162,7 +162,7 @@ let entry: ClipQueueEntry = serde_json::from_slice(&bytes)
 **Tests:** store.rs: `pick_oldest_pending_skips_corrupt_sidecar` — a valid newer entry + an invalid older `pending/<id>.json` (`b"{ not json"`); assert `Ok(Some(valid))`, and (if quarantined) the bad file moved out. classify.rs (add a `#[cfg(test)]` module — none today): `scan_skips_corrupt_sidecar_and_continues` and `poll_round_advances_despite_corrupt` returning `Ok(1)`.
 
 ## PS-04 — orphan-media entries permanently wedge the delivery loop; no `MissingMedia` arm, no cancellation
-**Severity:** High · **Effort:** L · **Confidence:** confirmed · **Status:** todo
+**Severity:** High · **Effort:** L · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/store.rs:151-187,203-221`; `crates/perchstation-core/src/delivery/runner.rs:113-141`
 **Depends on:** PS-01, PS-07
 
@@ -183,7 +183,7 @@ Err(err) => { tracing::warn!(message=%err, "delivery iteration aborted on intern
 **Tests:** store.rs: `transition_inflight_rolls_back_mp4_on_sidecar_write_failure`. runner: `try_once_quarantines_missing_media_and_advances` — stage a `pending/` sidecar with no mp4, run `try_once`, assert `Ok(true)` and the orphan is removed/quarantined (a second `try_once` returns `Ok(false)`); `quarantine_orphan_removes_sidecar_idempotently`; `run_exits_on_cancellation` once the token is threaded.
 
 ## PS-07 — `enqueue` orphans the mp4 if the sidecar write fails
-**Severity:** High · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** High · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/store.rs:88-107`
 
 ```rust

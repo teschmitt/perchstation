@@ -20,12 +20,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use chrono::{DateTime, Utc};
 
+use crate::observability::tracing::events;
+
 use super::{ClipQueueEntry, QueueError};
 
 const QUEUE_DIR: &str = "queue";
 const PENDING: &str = "pending";
 const INFLIGHT: &str = "inflight";
 const DELIVERED: &str = "delivered";
+/// Graveyard for sidecars that fail to deserialise (PS-02) — moving them
+/// here lets a scan head advance permanently instead of choking on the
+/// same corrupt file every tick.
+const CORRUPT: &str = "corrupt";
 
 /// Metadata the capture subsystem hands the queue alongside the clip media.
 #[derive(Debug, Clone, Copy)]
@@ -48,7 +54,7 @@ impl QueueStore {
     /// three state subdirectories are created on first use.
     pub fn open(data_dir: &Path) -> Result<Self, QueueError> {
         let root = data_dir.join(QUEUE_DIR);
-        for sub in [PENDING, INFLIGHT, DELIVERED] {
+        for sub in [PENDING, INFLIGHT, DELIVERED, CORRUPT] {
             let path = root.join(sub);
             fs::create_dir_all(&path)
                 .map_err(|source| QueueError::Io { path: path.clone(), source })?;
@@ -71,6 +77,11 @@ impl QueueStore {
         self.root.join(DELIVERED)
     }
 
+    #[must_use]
+    pub fn corrupt_dir(&self) -> PathBuf {
+        self.root.join(CORRUPT)
+    }
+
     /// Move a freshly-captured clip into `pending/`. Stages the mp4 via a
     /// `.tmp` suffix then renames; writes the sidecar via tmp + rename.
     pub fn enqueue(
@@ -79,6 +90,18 @@ impl QueueStore {
         meta: ClipMeta,
     ) -> Result<ClipQueueEntry, QueueError> {
         let clip_id = next_clip_id(meta.captured_at);
+        self.enqueue_with_id(&clip_id, clip_source, meta)
+    }
+
+    /// Core of [`enqueue`] with the clip-id supplied by the caller. Split
+    /// out so tests can drive a deterministic id (the production id is a
+    /// process-local atomic that parallel tests cannot predict).
+    fn enqueue_with_id(
+        &self,
+        clip_id: &str,
+        clip_source: &Path,
+        meta: ClipMeta,
+    ) -> Result<ClipQueueEntry, QueueError> {
         let pending = self.pending_dir();
 
         let metadata = fs::metadata(clip_source)
@@ -100,9 +123,16 @@ impl QueueStore {
             let _ = fs::remove_file(clip_source);
         }
 
-        let entry = ClipQueueEntry::new(clip_id.clone(), meta.captured_at, Utc::now(), byte_size);
+        let entry = ClipQueueEntry::new(clip_id, meta.captured_at, Utc::now(), byte_size);
         let sidecar_target = pending.join(format!("{clip_id}.json"));
-        write_sidecar_atomic(&sidecar_target, &entry)?;
+        if let Err(err) = write_sidecar_atomic(&sidecar_target, &entry) {
+            // PS-07: the mp4 is already staged in pending/; a failed sidecar
+            // write would leave it orphaned (invisible to every json-keyed
+            // scan → a silent disk leak that eats the eviction budget).
+            // Best-effort remove the media before surfacing the error.
+            let _ = fs::remove_file(&mp4_target);
+            return Err(err);
+        }
 
         Ok(entry)
     }
@@ -128,7 +158,37 @@ impl QueueStore {
         sidecars.sort();
 
         for path in sidecars {
-            let entry = read_sidecar(&path)?;
+            let entry = match read_sidecar(&path) {
+                Ok(entry) => entry,
+                Err(QueueError::Deserialise { .. }) => {
+                    // PS-02: a single corrupt sidecar must not wedge the
+                    // whole scan (and with it the delivery loop). Quarantine
+                    // it so the head advances permanently.
+                    tracing::warn!(
+                        event = events::QUEUE_CORRUPT_SIDECAR,
+                        path = %path.display(),
+                        "quarantining corrupt pending sidecar",
+                    );
+                    if let Err(err) = self.quarantine_corrupt(&path) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %err,
+                            "failed to quarantine corrupt pending sidecar",
+                        );
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    // Per-file I/O error (e.g. a concurrent eviction removed
+                    // the file mid-scan). Skip it; do not abort the scan.
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "skipping unreadable pending sidecar",
+                    );
+                    continue;
+                }
+            };
             if let Some(next) = entry.next_attempt_after
                 && next > now
             {
@@ -175,7 +235,13 @@ impl QueueStore {
         fs::rename(&pending_mp4, &inflight_mp4)
             .map_err(|source| QueueError::Io { path: inflight_mp4.clone(), source })?;
 
-        write_sidecar_atomic(&inflight_sidecar, &updated)?;
+        if let Err(err) = write_sidecar_atomic(&inflight_sidecar, &updated) {
+            // PS-04: roll the mp4 back to pending/ so it isn't stranded in
+            // inflight/ with no sidecar (where reconcile_inflight, which
+            // enumerates only inflight/*.json, could never recover it).
+            let _ = fs::rename(&inflight_mp4, &pending_mp4);
+            return Err(err);
+        }
 
         match fs::remove_file(&pending_sidecar) {
             Ok(()) => {}
@@ -226,6 +292,13 @@ impl QueueStore {
     /// by `commands::serve` before `service.ready`. Idempotent against
     /// a clean `inflight/`.
     pub fn reconcile_inflight(&self) -> Result<Vec<ClipQueueEntry>, QueueError> {
+        // PS-07: reclaim orphan media (an `*.mp4` with no matching `*.json`)
+        // from pending/ and inflight/ before reconciling — a crash between
+        // the media rename and the sidecar write strands media invisible to
+        // every json-keyed scan.
+        sweep_orphan_media(&self.pending_dir())?;
+        sweep_orphan_media(&self.inflight_dir())?;
+
         let inflight = self.inflight_dir();
         let mut sidecars: Vec<PathBuf> = Vec::new();
         let read_dir = fs::read_dir(&inflight)
@@ -243,6 +316,16 @@ impl QueueStore {
         let mut recovered = Vec::with_capacity(sidecars.len());
         for sidecar in sidecars {
             let mut entry = read_sidecar(&sidecar)?;
+            if entry.is_terminal() {
+                // PS-01: a crash inside transition_delivered can leave a
+                // terminal sidecar in inflight/. Finish the interrupted
+                // transition (idempotent — the unlink/rename tolerate
+                // NotFound) rather than re-queueing it, which would
+                // re-upload an already-delivered clip and spawn a duplicate
+                // classify task on perchpub.
+                self.transition_delivered(&entry)?;
+                continue;
+            }
             entry.next_attempt_after = None;
             entry.last_error = None;
             self.transition_back_to_pending(&entry)?;
@@ -281,6 +364,63 @@ impl QueueStore {
 
         Ok(())
     }
+
+    /// Resolve a `pending/` entry whose `.mp4` media is missing — a
+    /// residual orphan (sidecar with no media) that `transition_inflight`
+    /// would reject with [`QueueError::MissingMedia`] on every tick,
+    /// wedging the delivery head (PS-04). Removes the orphan sidecar (and
+    /// any stray media) idempotently so the head advances.
+    pub fn quarantine_orphan(&self, clip_id: &str) -> Result<(), QueueError> {
+        let sidecar = self.pending_dir().join(format!("{clip_id}.json"));
+        let mp4 = self.pending_dir().join(format!("{clip_id}.mp4"));
+        remove_if_exists(&sidecar)?;
+        remove_if_exists(&mp4)?;
+        Ok(())
+    }
+
+    /// Move a sidecar that failed to deserialise (and any same-stem `.mp4`)
+    /// into `corrupt/` so the enclosing scan advances permanently instead
+    /// of re-failing on the same file every tick (PS-02).
+    pub fn quarantine_corrupt(&self, sidecar: &Path) -> Result<(), QueueError> {
+        let corrupt = self.corrupt_dir();
+        fs::create_dir_all(&corrupt)
+            .map_err(|source| QueueError::Io { path: corrupt.clone(), source })?;
+        if let Some(name) = sidecar.file_name() {
+            let dest = corrupt.join(name);
+            fs::rename(sidecar, &dest).map_err(|source| QueueError::Io { path: dest, source })?;
+        }
+        // Move any same-stem media alongside the bad sidecar (pending/
+        // entries carry an `.mp4`; delivered/ ones do not).
+        let mp4 = sidecar.with_extension("mp4");
+        if mp4.exists()
+            && let Some(name) = mp4.file_name()
+        {
+            let _ = fs::rename(&mp4, corrupt.join(name));
+        }
+        Ok(())
+    }
+}
+
+/// Remove every `*.mp4` in `dir` whose matching `*.json` sidecar is
+/// absent — media stranded by a crash between the media rename and the
+/// sidecar write (PS-07). Best-effort per file; only a `read_dir` failure
+/// aborts.
+fn sweep_orphan_media(dir: &Path) -> Result<(), QueueError> {
+    let read_dir =
+        fs::read_dir(dir).map_err(|source| QueueError::Io { path: dir.to_path_buf(), source })?;
+    for entry in read_dir {
+        let entry = entry.map_err(|source| QueueError::Io { path: dir.to_path_buf(), source })?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "mp4") && !path.with_extension("json").exists() {
+            tracing::warn!(
+                event = events::QUEUE_ORPHAN_MEDIA,
+                path = %path.display(),
+                "sweeping sidecarless media at boot",
+            );
+            remove_if_exists(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Generate the next `<capture_utc_basic>-<seq>` clip-id. The basic ISO-8601
@@ -313,6 +453,16 @@ fn io_to_queue_err(err: io::Error, path: &Path) -> QueueError {
         QueueError::DiskFull { path: path.to_path_buf() }
     } else {
         QueueError::Io { path: path.to_path_buf(), source: err }
+    }
+}
+
+/// Remove `path`, tolerating an already-absent file so callers can be
+/// idempotent against partial/repeated cleanup.
+fn remove_if_exists(path: &Path) -> Result<(), QueueError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(QueueError::Io { path: path.to_path_buf(), source }),
     }
 }
 
@@ -473,5 +623,188 @@ mod tests {
             QueueError::MissingMedia { clip_id } => assert_eq!(clip_id, id),
             other => panic!("expected MissingMedia, got {other:?}"),
         }
+    }
+
+    // ---- PS-07: enqueue / boot orphan-media safety ----
+
+    #[test]
+    fn enqueue_removes_mp4_when_sidecar_write_fails() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"bytes").unwrap();
+
+        // Force the sidecar write to fail *after* the mp4 has been staged:
+        // occupy the sidecar's tmp path with a directory so `fs::write` errors.
+        let id = "20260527T120000Z-700";
+        fs::create_dir(store.pending_dir().join(format!("{id}.json.tmp"))).unwrap();
+
+        let err = store
+            .enqueue_with_id(id, &src, ClipMeta { captured_at: instant("2026-05-27T12:00:00Z") })
+            .expect_err("sidecar write must fail");
+        assert!(matches!(err, QueueError::Io { .. }), "got {err:?}");
+
+        // The staged mp4 must not be left orphaned in pending/.
+        assert!(
+            !store.pending_dir().join(format!("{id}.mp4")).exists(),
+            "orphan mp4 must be removed when the sidecar write fails",
+        );
+    }
+
+    #[test]
+    fn reconcile_sweeps_sidecarless_mp4() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        // An orphan mp4 in pending/ with no sidecar (crash between renames).
+        let orphan = "20260527T120000Z-009";
+        fs::write(store.pending_dir().join(format!("{orphan}.mp4")), b"orphan").unwrap();
+        // A complete pending pair that must survive the sweep.
+        let good = "20260527T120100Z-001";
+        fs::write(store.pending_dir().join(format!("{good}.mp4")), b"x").unwrap();
+        let entry = ClipQueueEntry::new(good, instant("2026-05-27T12:01:00Z"), Utc::now(), 1);
+        write_sidecar_atomic(&store.pending_dir().join(format!("{good}.json")), &entry).unwrap();
+
+        store.reconcile_inflight().expect("reconcile");
+
+        assert!(
+            !store.pending_dir().join(format!("{orphan}.mp4")).exists(),
+            "sidecarless mp4 must be swept at boot",
+        );
+        assert!(store.pending_dir().join(format!("{good}.mp4")).exists(), "valid pair survives");
+        assert!(store.pending_dir().join(format!("{good}.json")).exists(), "valid pair survives");
+    }
+
+    // ---- PS-04: transition rollback + orphan quarantine ----
+
+    #[test]
+    fn transition_inflight_rolls_back_mp4_on_sidecar_write_failure() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        let id = "20260527T120000Z-001";
+        fs::write(store.pending_dir().join(format!("{id}.mp4")), b"the bytes").unwrap();
+        let entry = ClipQueueEntry::new(id, instant("2026-05-27T12:00:00Z"), Utc::now(), 9);
+        write_sidecar_atomic(&store.pending_dir().join(format!("{id}.json")), &entry).unwrap();
+
+        // Block the inflight sidecar's tmp path so write_sidecar_atomic fails
+        // *after* the mp4 has been renamed into inflight/.
+        fs::create_dir(store.inflight_dir().join(format!("{id}.json.tmp"))).unwrap();
+
+        let err = store
+            .transition_inflight(entry, instant("2026-05-27T12:00:30Z"))
+            .expect_err("sidecar write must fail");
+        assert!(matches!(err, QueueError::Io { .. }), "got {err:?}");
+
+        // The mp4 must be rolled back to pending/, not stranded in inflight/.
+        assert!(
+            store.pending_dir().join(format!("{id}.mp4")).exists(),
+            "mp4 must be rolled back to pending/",
+        );
+        assert!(
+            !store.inflight_dir().join(format!("{id}.mp4")).exists(),
+            "mp4 must not be stranded in inflight/",
+        );
+    }
+
+    #[test]
+    fn quarantine_orphan_removes_sidecar_idempotently() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        let id = "20260527T120000Z-001";
+        let entry = ClipQueueEntry::new(id, instant("2026-05-27T12:00:00Z"), Utc::now(), 9);
+        write_sidecar_atomic(&store.pending_dir().join(format!("{id}.json")), &entry).unwrap();
+
+        store.quarantine_orphan(id).expect("quarantine");
+        assert!(!store.pending_dir().join(format!("{id}.json")).exists(), "orphan sidecar removed");
+
+        // Idempotent: a second call against the now-absent sidecar is fine.
+        store.quarantine_orphan(id).expect("quarantine is idempotent");
+    }
+
+    // ---- PS-01: reconcile must finish terminal entries, not re-queue ----
+
+    #[test]
+    fn reconcile_inflight_finishes_terminal_entry_left_in_inflight() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        let id = "20260527T120000Z-001";
+        // Simulate a crash inside transition_delivered: terminal sidecar still
+        // in inflight/, mp4 not yet unlinked.
+        fs::write(store.inflight_dir().join(format!("{id}.mp4")), b"the bytes").unwrap();
+        let mut entry = ClipQueueEntry::new(id, instant("2026-05-27T12:00:00Z"), Utc::now(), 9);
+        entry.outcome = Some(Outcome::Delivered);
+        entry.classify_task_id = Some(Uuid::new_v4());
+        entry.delivered_at = Some(instant("2026-05-27T12:00:30Z"));
+        write_sidecar_atomic(&store.inflight_dir().join(format!("{id}.json")), &entry).unwrap();
+
+        let recovered = store.reconcile_inflight().expect("reconcile");
+
+        assert!(recovered.is_empty(), "terminal entry must not be re-queued");
+        assert!(
+            store.delivered_dir().join(format!("{id}.json")).is_file(),
+            "interrupted transition must be finished to delivered/",
+        );
+        assert!(
+            !store.pending_dir().join(format!("{id}.json")).exists(),
+            "terminal entry must not land in pending/",
+        );
+        assert!(
+            !store.inflight_dir().join(format!("{id}.mp4")).exists(),
+            "mp4 must be unlinked while finishing the transition",
+        );
+        assert!(!store.inflight_dir().join(format!("{id}.json")).exists());
+    }
+
+    #[test]
+    fn reconcile_inflight_skips_terminal_does_not_requeue() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // A terminal entry (crashed mid-delivery) ...
+        let terminal = "20260527T120000Z-001";
+        fs::write(store.inflight_dir().join(format!("{terminal}.mp4")), b"a").unwrap();
+        let mut t = ClipQueueEntry::new(terminal, instant("2026-05-27T12:00:00Z"), Utc::now(), 1);
+        t.outcome = Some(Outcome::Delivered);
+        write_sidecar_atomic(&store.inflight_dir().join(format!("{terminal}.json")), &t).unwrap();
+
+        // ... alongside a genuinely-interrupted (non-terminal) entry.
+        let pending = "20260527T120100Z-001";
+        fs::write(store.inflight_dir().join(format!("{pending}.mp4")), b"b").unwrap();
+        let p = ClipQueueEntry::new(pending, instant("2026-05-27T12:01:00Z"), Utc::now(), 1);
+        write_sidecar_atomic(&store.inflight_dir().join(format!("{pending}.json")), &p).unwrap();
+
+        let recovered = store.reconcile_inflight().expect("reconcile");
+
+        let recovered_ids: Vec<&str> = recovered.iter().map(|e| e.clip_id.as_str()).collect();
+        assert_eq!(recovered_ids, vec![pending], "only the non-terminal entry is re-queued");
+        assert!(store.pending_dir().join(format!("{pending}.json")).is_file());
+        assert!(!store.pending_dir().join(format!("{terminal}.json")).exists());
+        assert!(store.delivered_dir().join(format!("{terminal}.json")).is_file());
+    }
+
+    // ---- PS-02: a corrupt sidecar must not wedge the pick loop ----
+
+    #[test]
+    fn pick_oldest_pending_skips_corrupt_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // Older, corrupt sidecar (sorts first) ...
+        let bad = "20260527T120000Z-001";
+        fs::write(store.pending_dir().join(format!("{bad}.json")), b"{ not json").unwrap();
+        // ... and a newer, valid one.
+        let good = "20260527T120100Z-001";
+        fs::write(store.pending_dir().join(format!("{good}.mp4")), b"x").unwrap();
+        let entry = ClipQueueEntry::new(good, instant("2026-05-27T12:01:00Z"), Utc::now(), 1);
+        write_sidecar_atomic(&store.pending_dir().join(format!("{good}.json")), &entry).unwrap();
+
+        let picked = store.pick_oldest_pending(Utc::now()).expect("pick").expect("some");
+        assert_eq!(picked.clip_id, good, "corrupt head must be skipped, not wedge the scan");
+
+        // The corrupt sidecar is quarantined out of pending/.
+        assert!(
+            store.corrupt_dir().join(format!("{bad}.json")).is_file(),
+            "corrupt sidecar moved to corrupt/",
+        );
+        assert!(!store.pending_dir().join(format!("{bad}.json")).exists());
     }
 }
