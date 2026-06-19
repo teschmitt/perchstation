@@ -58,6 +58,11 @@ path    = "../../tests/integration/queue_eviction.rs"
 harness = true
 
 [[test]]
+name    = "queue_eviction_race"
+path    = "../../tests/integration/queue_eviction_race.rs"
+harness = true
+
+[[test]]
 name    = "permanent_failure"
 path    = "../../tests/integration/permanent_failure.rs"
 harness = true

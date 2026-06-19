@@ -19,9 +19,9 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 
 **Queue policy & eviction**
 - [x] PS-03 — `max_clips = 0` (unvalidated) silently bricks the queue *(High)*
-- [ ] PS-05 — eviction counts un-evictable entries → drops fresh clips yet still `QueueFull` *(High)*
-- [ ] PS-20 — phantom byte accounting for delivered entries *(Low)*
-- [ ] PS-21 — eviction-reason mislabel when both ceilings breach *(Low)*
+- [x] PS-05 — eviction counts un-evictable entries → drops fresh clips yet still `QueueFull` *(High)*
+- [x] PS-20 — phantom byte accounting for delivered entries *(Low)*
+- [x] PS-21 — eviction-reason mislabel when both ceilings breach *(Low)*
 
 **Delivery, retry & backoff**
 - [ ] PS-06 — a 200 with undecodable body / unknown status → re-upload / infinite poll *(High)*
@@ -29,11 +29,11 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 - [ ] PS-11 — jitter bypasses the injected `Clock` → retry storms + untestable *(Medium)*
 - [x] PS-12 — disk-full backoff defaults to 1 hour *(Medium)*
 - [x] PS-25 — `delivered/` never pruned → unbounded re-scan every tick *(Medium)*
-- [ ] PS-27 — `apply_policy` runs synchronous all-sidecar reads on the reactor *(Medium)*
+- [x] PS-27 — `apply_policy` runs synchronous all-sidecar reads on the reactor *(Medium)*
 
 **Concurrency & task lifecycle**
 - [x] PS-09 — `spawn_supervised` nests `tokio::spawn`; abort detaches the worker *(Medium)*
-- [ ] PS-10 — eviction races `transition_inflight` on `pending/` with no lock *(Medium)*
+- [x] PS-10 — eviction races `transition_inflight` on `pending/` with no lock *(Medium)*
 
 **Perchpub wire client**
 - [ ] PS-16 — response body read with no size cap → OOM *(Medium)*
@@ -220,7 +220,7 @@ if !needs_eviction { return Ok(()); }
 **Tests:** config.rs: `ensure_runtime_ready_rejects_zero_max_clips`, `..._zero_max_bytes` (valid `perchpub_url` + offending bound → new error variant).
 
 ## PS-05 — eviction counts un-evictable inflight/delivered → drops fresh clips yet still returns `QueueFull`
-**Severity:** High · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** High · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/policy.rs:107-128` (count), `:154-193` (loop), `:211-239` (candidates)
 **Depends on:** PS-20, PS-21 (same `count_queue`/loop)
 
@@ -238,7 +238,7 @@ for dir in [store.pending_dir(), store.inflight_dir(), store.delivered_dir()] {
 **Tests:** `tests/integration/queue_eviction.rs`: `delivered_backlog_does_not_destroy_fresh_pending_then_queuefull` — pre-populate `delivered/` with N `Delivered` (mp4-unlinked) sidecars near `max_clips` + one pending clip; submit a fresh clip; assert the existing pending clip is NOT deleted and submission succeeds or returns `QueueFull` without evicting un-freeable pending entries.
 
 ## PS-20 — phantom byte accounting: counts `byte_size` of delivered entries whose mp4 was unlinked
-**Severity:** Low · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Low · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/policy.rs:110-125`; `crates/perchstation-core/src/queue/store.rs:265-283`
 **Depends on:** PS-05
 
@@ -248,7 +248,7 @@ for dir in [store.pending_dir(), store.inflight_dir(), store.delivered_dir()] {
 **Tests:** `tests/integration/queue_eviction.rs`: `delivered_bytes_not_counted_against_max_bytes` — `delivered/` Delivered sidecars (large `byte_size`, no mp4) totalling > `max_bytes`; submit a small pending clip; assert accepted.
 
 ## PS-21 — eviction-reason mislabel when both ceilings breach
-**Severity:** Low · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Low · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/policy.rs:170-188`
 
 ```rust
@@ -356,7 +356,7 @@ Err(RunnerError::Queue(QueueError::DiskFull { path })) => { ... sleep(disk_full_
 **Tests:** policy.rs: `delivered_terminal_entries_are_aged_out` (old `delivered_at` + terminal status → prune target after the window; a fresh terminal entry is NOT pruned). classify.rs: `scan_skips_already_terminal_without_rereading` (or, after the in-memory-set refactor, a terminal sidecar isn't re-read on later ticks). Check pruning doesn't race the poller mid-poll.
 
 ## PS-27 — `apply_policy` runs synchronous all-sidecar reads inline on the reactor
-**Severity:** Medium · **Effort:** M · **Confidence:** plausible · **Status:** todo
+**Severity:** Medium · **Effort:** M · **Confidence:** plausible · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/policy.rs:93-103,107-128`
 **Depends on:** PS-05, PS-20 (they reshape `count_queue`)
 
@@ -393,7 +393,7 @@ tokio::spawn(async move {
 **Tests:** supervision.rs: `abort_actually_stops_inner_worker` — supervise a future that increments an `Arc<AtomicUsize>` in a loop; abort + await the handle; assert the counter stopped advancing (current code fails). Keep the existing panic-isolation / clean-exit tests passing. If the token route is chosen, add cancellation-arm tests to the runner/poller loops.
 
 ## PS-10 — eviction races `transition_inflight` on `pending/` with no lock
-**Severity:** Medium · **Effort:** L · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** L · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/queue/policy.rs:266-286`; `crates/perchstation-core/src/queue/store.rs:151-187`
 
 **Problem:** `evict()` (policy.rs:266-286) runs `fs::remove_file` on `pending/<id>.{mp4,json}` inline on the **capture** task, while the **delivery** task concurrently calls `transition_inflight` (store.rs:151-187) doing `fs::rename` on the same `pending/<id>.mp4`. Neither `PolicyInbox` nor `QueueStore` holds a lock.

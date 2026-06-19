@@ -12,10 +12,19 @@
 //!    `captured_at` (FR-006 ordering is preserved by the basic-ISO
 //!    clip-id prefix; sorting filenames is equivalent to sorting by
 //!    `captured_at`).
-//! 3. `inflight/` is never touched — the runner moves entries out of
-//!    `inflight/` quickly enough that a momentary breach is preferable
-//!    to disturbing an in-flight upload.
+//! 3. `inflight/` and `delivered/` `Delivered` entries are never touched —
+//!    they form an **un-evictable floor**. The census counts them toward the
+//!    ceilings (they occupy slots) but the eviction loop can never free them,
+//!    so if the floor alone already breaches a ceiling the submission is
+//!    refused *before* deleting any evictable clip (PS-05) — never destroy
+//!    fresh `pending/` data that eviction cannot make room for.
+//!
+//! Byte accounting only ever counts media that is actually on disk:
+//! `pending/` and `inflight/` carry their `.mp4`, but `delivered/` entries had
+//! it unlinked on success, so their `byte_size` is phantom and excluded
+//! (PS-20).
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 
@@ -51,6 +60,10 @@ impl From<&QueueConfig> for QueuePolicy {
 pub enum EvictionReason {
     MaxClipsExceeded,
     MaxBytesExceeded,
+    /// Both ceilings are breached at this eviction (PS-21). Reported instead of
+    /// silently attributing the pressure to clip count alone, which hid byte
+    /// pressure from the `queue.evicted` telemetry.
+    BothExceeded,
 }
 
 impl EvictionReason {
@@ -59,6 +72,7 @@ impl EvictionReason {
         match self {
             Self::MaxClipsExceeded => "max_clips_exceeded",
             Self::MaxBytesExceeded => "max_bytes_exceeded",
+            Self::BothExceeded => "both_exceeded",
         }
     }
 }
@@ -93,102 +107,178 @@ impl<I: Inbox> PolicyInbox<I> {
 impl<I: Inbox> Inbox for PolicyInbox<I> {
     async fn submit(&self, clip_path: &Path, meta: ClipMeta) -> Result<ClipQueueEntry, InboxError> {
         let incoming_bytes = fs::metadata(clip_path).map_or(0, |m| m.len());
-        // Policy preflight runs inline (not on `spawn_blocking`) so the
-        // `queue.evicted` events fire in the caller's tracing scope —
-        // useful for tests that install a scoped subscriber, and harmless
-        // in production (sidecar reads + a few unlink calls are fast even
-        // at the configured 500-entry / 2 GiB ceiling).
-        apply_policy(&self.store, self.policy, incoming_bytes)?;
+        // PS-27: the preflight does a synchronous `read_dir` + per-sidecar
+        // `fs::read` + parse across all three queue dirs (and re-reads on
+        // eviction). At the configured 500-entry ceiling on a slow SD card
+        // that is enough blocking I/O to stall the async reactor on every
+        // capture, delaying delivery/classify polling. Run it on a blocking
+        // thread instead.
+        let store = self.store.clone();
+        let policy = self.policy;
+        let outcome =
+            tokio::task::spawn_blocking(move || apply_policy(&store, policy, incoming_bytes))
+                .await
+                .expect("queue policy preflight task panicked");
+        // Emit the `queue.evicted` events HERE, after the blocking call
+        // returns, so they land in the caller's tracing scope. `spawn_blocking`
+        // does not inherit the caller's `DefaultGuard` subscriber, so emitting
+        // them from inside `apply_policy` would lose them in scoped-subscriber
+        // tests and pin the per-callsite interest cache to `Never`.
+        //
+        // Emit for EVERY clip that was actually removed from disk *before*
+        // propagating `outcome.result` — a later eviction may have failed after
+        // earlier ones succeeded, and a deleted clip must never be dropped from
+        // the telemetry.
+        for eviction in &outcome.evictions {
+            tracing::warn!(
+                event = obs_tracing::events::QUEUE_EVICTED,
+                clip_id = %eviction.clip_id,
+                reason = eviction.reason.as_str(),
+                policy = policy_as_str(policy.eviction),
+                remaining_clips = eviction.remaining_clips,
+                remaining_bytes = eviction.remaining_bytes,
+                "queue eviction issued",
+            );
+        }
+        outcome.result?;
         self.inner.submit(clip_path, meta).await
     }
 }
 
-/// Walk every sidecar in `pending/`, `inflight/`, `delivered/` and sum
-/// `byte_size`. Returns `(clip_count, byte_total)`.
-pub fn count_queue(store: &QueueStore) -> Result<(u32, u64), QueueError> {
-    let mut clips = 0_u32;
-    let mut bytes = 0_u64;
-    for dir in [store.pending_dir(), store.inflight_dir(), store.delivered_dir()] {
-        for entry in
-            fs::read_dir(&dir).map_err(|source| QueueError::Io { path: dir.clone(), source })?
-        {
-            let entry = entry.map_err(|source| QueueError::Io { path: dir.clone(), source })?;
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            let bytes_read =
-                fs::read(&path).map_err(|source| QueueError::Io { path: path.clone(), source })?;
-            let sidecar: ClipQueueEntry = serde_json::from_slice(&bytes_read)
-                .map_err(|source| QueueError::Deserialise { path: path.clone(), source })?;
-            clips = clips.saturating_add(1);
-            bytes = bytes.saturating_add(sidecar.byte_size);
-        }
-    }
-    Ok((clips, bytes))
+/// One eviction performed by [`apply_policy`]. Returned (rather than logged
+/// in-place) so the caller can emit the `queue.evicted` event from its own
+/// tracing scope — the preflight runs on a `spawn_blocking` thread that does
+/// not inherit the caller's subscriber (PS-27).
+#[derive(Debug, Clone)]
+pub struct EvictionRecord {
+    pub clip_id: String,
+    pub reason: EvictionReason,
+    pub remaining_clips: u32,
+    pub remaining_bytes: u64,
+}
+
+/// Outcome of a policy preflight ([`apply_policy`]).
+///
+/// `evictions` lists the clips that were actually removed from disk, in order.
+/// The caller must emit `queue.evicted` for all of them **regardless of
+/// `result`** — a later eviction can fail after earlier ones succeeded, and a
+/// deleted clip must not vanish from the telemetry. `result` is `Ok` once the
+/// queue has room for the incoming clip, or `Err` if the submission must be
+/// refused (`QueueFull`) or a store error aborted the sweep.
+pub struct PolicyOutcome {
+    pub evictions: Vec<EvictionRecord>,
+    pub result: Result<(), InboxError>,
+}
+
+/// A snapshot of the queue split into the part eviction can free and the part
+/// it cannot, with byte totals counting only media that is actually on disk.
+struct Census {
+    /// Clips eviction can never free: `inflight/` (mid-upload) and
+    /// `delivered/` `Delivered`. They occupy slots but stay put.
+    floor_clips: u32,
+    /// Bytes held by the un-evictable floor. Only `inflight/` carries media;
+    /// `delivered/` had its mp4 unlinked on success (PS-20).
+    floor_bytes: u64,
+    /// Evictable entries oldest-first: `delivered/` Undeliverable, then
+    /// `pending/`. `pop_front` walks oldest-first.
+    candidates: VecDeque<EvictableEntry>,
+}
+
+/// Bytes the whole queue currently occupies on disk, and the clip slots it
+/// fills, as the ceilings see them.
+fn census_totals(census: &Census) -> (u32, u64) {
+    let candidate_clips = u32::try_from(census.candidates.len()).unwrap_or(u32::MAX);
+    let candidate_bytes: u64 = census.candidates.iter().map(EvictableEntry::on_disk_bytes).sum();
+    (
+        census.floor_clips.saturating_add(candidate_clips),
+        census.floor_bytes.saturating_add(candidate_bytes),
+    )
 }
 
 /// Enforce `policy` against the current queue state. On
-/// `DropOldestUndelivered`, evict until both bounds would be satisfied
-/// once `incoming_bytes` lands in the queue. On `RefuseNew`, return
-/// `InboxError::QueueFull` when either ceiling would be breached by the
-/// incoming clip.
-pub fn apply_policy(
-    store: &QueueStore,
-    policy: QueuePolicy,
-    incoming_bytes: u64,
-) -> Result<(), InboxError> {
-    let (mut clips, mut bytes) = count_queue(store)?;
-    let needs_eviction =
-        clips + 1 > policy.max_clips || bytes.saturating_add(incoming_bytes) > policy.max_bytes;
-    if !needs_eviction {
-        return Ok(());
+/// `DropOldestUndelivered`, evict oldest-first until both bounds would be
+/// satisfied once `incoming_bytes` lands in the queue — but refuse *without*
+/// evicting anything if the un-evictable floor alone already breaches a
+/// ceiling (PS-05). On `RefuseNew`, refuse with `InboxError::QueueFull` when
+/// either ceiling would be breached by the incoming clip.
+///
+/// Returns a [`PolicyOutcome`]: the evictions actually performed (so the caller
+/// can emit `queue.evicted` from its own tracing scope — PS-27) plus the
+/// `Ok`/`Err` verdict. Evictions are reported even when the verdict is `Err`,
+/// since a store error can abort the sweep after earlier clips were removed.
+#[must_use]
+pub fn apply_policy(store: &QueueStore, policy: QueuePolicy, incoming_bytes: u64) -> PolicyOutcome {
+    let census = match take_census(store) {
+        Ok(census) => census,
+        Err(err) => return PolicyOutcome { evictions: Vec::new(), result: Err(err.into()) },
+    };
+    let (total_clips, total_bytes) = census_totals(&census);
+
+    let breaches = |clips: u32, bytes: u64| {
+        clips.saturating_add(1) > policy.max_clips
+            || bytes.saturating_add(incoming_bytes) > policy.max_bytes
+    };
+    if !breaches(total_clips, total_bytes) {
+        return PolicyOutcome { evictions: Vec::new(), result: Ok(()) };
     }
 
+    let queue_full = || InboxError::QueueFull {
+        current_clips: total_clips,
+        max_clips: policy.max_clips,
+        current_bytes: total_bytes,
+        max_bytes: policy.max_bytes,
+    };
+
     match policy.eviction {
-        EvictionPolicy::RefuseNew => Err(InboxError::QueueFull {
-            current_clips: clips,
-            max_clips: policy.max_clips,
-            current_bytes: bytes,
-            max_bytes: policy.max_bytes,
-        }),
+        EvictionPolicy::RefuseNew => {
+            PolicyOutcome { evictions: Vec::new(), result: Err(queue_full()) }
+        }
         EvictionPolicy::DropOldestUndelivered => {
-            let mut candidates = enumerate_evictable(store)?;
-            while clips + 1 > policy.max_clips
-                || bytes.saturating_add(incoming_bytes) > policy.max_bytes
-            {
-                let Some(candidate) = candidates.pop_front() else {
-                    // Ran out of evictable entries. Surface as QueueFull
-                    // so the capture side gets a structured refusal.
-                    return Err(InboxError::QueueFull {
-                        current_clips: clips,
-                        max_clips: policy.max_clips,
-                        current_bytes: bytes,
-                        max_bytes: policy.max_bytes,
-                    });
-                };
-
-                let reason = if clips + 1 > policy.max_clips {
-                    EvictionReason::MaxClipsExceeded
-                } else {
-                    EvictionReason::MaxBytesExceeded
-                };
-
-                evict(store, &candidate)?;
-                clips = clips.saturating_sub(1);
-                bytes = bytes.saturating_sub(candidate.entry.byte_size);
-
-                tracing::warn!(
-                    event = obs_tracing::events::QUEUE_EVICTED,
-                    clip_id = %candidate.entry.clip_id,
-                    reason = reason.as_str(),
-                    policy = policy_as_str(policy.eviction),
-                    remaining_clips = clips,
-                    remaining_bytes = bytes,
-                    "queue eviction issued",
-                );
+            // PS-05: if the floor that eviction CANNOT free already breaches a
+            // ceiling, evicting every candidate still won't make room — refuse
+            // up front rather than destroying fresh pending clips for nothing.
+            if breaches(census.floor_clips, census.floor_bytes) {
+                return PolicyOutcome { evictions: Vec::new(), result: Err(queue_full()) };
             }
-            Ok(())
+
+            let mut clips = total_clips;
+            let mut bytes = total_bytes;
+            let mut candidates = census.candidates;
+            let mut evictions = Vec::new();
+            while breaches(clips, bytes) {
+                let Some(candidate) = candidates.pop_front() else {
+                    // Unreachable given the floor check above (evicting all
+                    // candidates lands us at the floor, which is under bounds),
+                    // but keep a structured refusal as a defensive backstop.
+                    return PolicyOutcome { evictions, result: Err(queue_full()) };
+                };
+
+                // PS-21: attribute the eviction to the ceiling(s) actually
+                // breached so byte pressure isn't hidden behind clip count.
+                let over_clips = clips.saturating_add(1) > policy.max_clips;
+                let over_bytes = bytes.saturating_add(incoming_bytes) > policy.max_bytes;
+                let reason = match (over_clips, over_bytes) {
+                    (true, true) => EvictionReason::BothExceeded,
+                    (false, true) => EvictionReason::MaxBytesExceeded,
+                    _ => EvictionReason::MaxClipsExceeded,
+                };
+
+                // A store error here aborts the sweep, but the clips already
+                // removed are returned so the caller still logs them.
+                if let Err(err) = evict(store, &candidate) {
+                    return PolicyOutcome { evictions, result: Err(err.into()) };
+                }
+                clips = clips.saturating_sub(1);
+                bytes = bytes.saturating_sub(candidate.on_disk_bytes());
+
+                evictions.push(EvictionRecord {
+                    clip_id: candidate.entry.clip_id,
+                    reason,
+                    remaining_clips: clips,
+                    remaining_bytes: bytes,
+                });
+            }
+            PolicyOutcome { evictions, result: Ok(()) }
         }
     }
 }
@@ -200,43 +290,65 @@ struct EvictableEntry {
     entry: ClipQueueEntry,
 }
 
+impl EvictableEntry {
+    /// Bytes this entry's media occupies on disk. `pending/` entries carry
+    /// their `.mp4`; `delivered/` Undeliverable entries had it unlinked, so
+    /// they free no bytes when evicted (PS-20).
+    fn on_disk_bytes(&self) -> u64 {
+        match self.location {
+            EvictableLocation::Pending => self.entry.byte_size,
+            EvictableLocation::DeliveredUndeliverable => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvictableLocation {
     DeliveredUndeliverable,
     Pending,
 }
 
-/// Enumerate evictable entries in the preferred order: oldest
-/// `delivered/` Undeliverable first, then oldest `pending/`. Returns a
-/// `VecDeque` so `pop_front` walks oldest-first.
-fn enumerate_evictable(
-    store: &QueueStore,
-) -> Result<std::collections::VecDeque<EvictableEntry>, QueueError> {
+/// Snapshot the queue: tally the un-evictable floor (`inflight/` +
+/// `delivered/` `Delivered`) and collect the evictable candidates
+/// (`delivered/` Undeliverable, then `pending/`) oldest-first.
+fn take_census(store: &QueueStore) -> Result<Census, QueueError> {
+    let mut floor_clips = 0_u32;
+    let mut floor_bytes = 0_u64;
+
+    // `inflight/`: un-evictable, media on disk.
+    for entry in read_sidecars(&store.inflight_dir())? {
+        floor_clips = floor_clips.saturating_add(1);
+        floor_bytes = floor_bytes.saturating_add(entry.byte_size);
+    }
+
+    // `delivered/`: Undeliverable is evictable (no media); everything else
+    // (Delivered, or a defensive outcome-less sidecar) is un-evictable floor
+    // and holds no media bytes (PS-20).
     let mut undeliverable: Vec<EvictableEntry> = Vec::new();
-    for sidecar in read_sidecars(&store.delivered_dir())? {
-        if sidecar.outcome == Some(Outcome::Undeliverable) {
+    for entry in read_sidecars(&store.delivered_dir())? {
+        if entry.outcome == Some(Outcome::Undeliverable) {
             undeliverable.push(EvictableEntry {
                 location: EvictableLocation::DeliveredUndeliverable,
-                entry: sidecar,
+                entry,
             });
+        } else {
+            floor_clips = floor_clips.saturating_add(1);
         }
     }
     undeliverable.sort_by_key(|e| sort_key(&e.entry));
 
+    // `pending/`: evictable, media on disk.
     let mut pending: Vec<EvictableEntry> = read_sidecars(&store.pending_dir())?
         .into_iter()
         .map(|entry| EvictableEntry { location: EvictableLocation::Pending, entry })
         .collect();
     pending.sort_by_key(|e| sort_key(&e.entry));
 
-    let mut out = std::collections::VecDeque::with_capacity(undeliverable.len() + pending.len());
-    for item in undeliverable {
-        out.push_back(item);
-    }
-    for item in pending {
-        out.push_back(item);
-    }
-    Ok(out)
+    let mut candidates = VecDeque::with_capacity(undeliverable.len() + pending.len());
+    candidates.extend(undeliverable);
+    candidates.extend(pending);
+
+    Ok(Census { floor_clips, floor_bytes, candidates })
 }
 
 fn sort_key(entry: &ClipQueueEntry) -> (DateTime<Utc>, String) {
@@ -253,8 +365,17 @@ fn read_sidecars(dir: &Path) -> Result<Vec<ClipQueueEntry>, QueueError> {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let bytes =
-            fs::read(&path).map_err(|source| QueueError::Io { path: path.clone(), source })?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            // PS-10: a concurrent eviction or `transition_inflight` may unlink
+            // this sidecar between `read_dir` listing it and this read. Treat a
+            // vanished file as absent rather than failing the whole census.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::trace!(path = %path.display(), "sidecar vanished mid-census; skipping");
+                continue;
+            }
+            Err(source) => return Err(QueueError::Io { path, source }),
+        };
         let sidecar: ClipQueueEntry = serde_json::from_slice(&bytes)
             .map_err(|source| QueueError::Deserialise { path: path.clone(), source })?;
         out.push(sidecar);
@@ -417,6 +538,33 @@ mod tests {
         assert!(
             store.delivered_dir().join(format!("{pollable}.json")).exists(),
             "still-pollable entry retained",
+        );
+    }
+
+    // PS-10: the eviction census must not hard-error when a sidecar it
+    // enumerated vanishes before it can be read (a concurrent transition /
+    // eviction unlinked it). A dangling symlink is a deterministic stand-in:
+    // `read_dir` lists it, but `fs::read` follows it and returns `NotFound`.
+    #[cfg(unix)]
+    #[test]
+    fn apply_policy_tolerates_sidecar_that_vanishes_mid_census() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        // A `pending/<id>.json` symlink pointing at a non-existent target.
+        let dangling = store.pending_dir().join("20260101T000000Z-001.json");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist.json"), &dangling).unwrap();
+
+        // Huge bounds → no eviction is needed, but the census still reads every
+        // pending sidecar. It must skip the vanished one rather than failing.
+        let policy = QueuePolicy {
+            max_clips: u32::MAX,
+            max_bytes: u64::MAX,
+            eviction: EvictionPolicy::DropOldestUndelivered,
+        };
+        assert!(
+            apply_policy(&store, policy, 0).result.is_ok(),
+            "a sidecar that vanished mid-census must be skipped, not fail the whole preflight",
         );
     }
 

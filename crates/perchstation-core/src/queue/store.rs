@@ -205,7 +205,13 @@ impl QueueStore {
     /// fresh-attempt sidecar.
     ///
     /// Steps (each is `rename`-atomic w.r.t. readers):
-    /// 1. Rename `pending/<id>.mp4` → `inflight/<id>.mp4`.
+    /// 1. Rename `pending/<id>.mp4` → `inflight/<id>.mp4`. A `NotFound` here
+    ///    means the media is gone — a residual orphan (PS-04) or a concurrent
+    ///    eviction that won the race for this clip (PS-10) — so it is surfaced
+    ///    as [`QueueError::MissingMedia`] (which the runner quarantines past),
+    ///    never a raw `Io` that would merely wedge the loop a tick. The rename
+    ///    is the sole media gate; there is no separate `exists()` pre-check to
+    ///    race against.
     /// 2. Write the updated sidecar to `inflight/<id>.json` via tmp + rename.
     /// 3. Remove `pending/<id>.json`.
     pub fn transition_inflight(
@@ -219,10 +225,6 @@ impl QueueStore {
         let inflight_mp4 = self.inflight_dir().join(format!("{clip_id}.mp4"));
         let inflight_sidecar = self.inflight_dir().join(format!("{clip_id}.json"));
 
-        if !pending_mp4.exists() {
-            return Err(QueueError::MissingMedia { clip_id });
-        }
-
         let mut updated = entry;
         updated.attempts = updated.attempts.saturating_add(1);
         if updated.first_attempt_at.is_none() {
@@ -232,8 +234,13 @@ impl QueueStore {
         updated.next_attempt_after = None;
         updated.last_error = None;
 
-        fs::rename(&pending_mp4, &inflight_mp4)
-            .map_err(|source| QueueError::Io { path: inflight_mp4.clone(), source })?;
+        match fs::rename(&pending_mp4, &inflight_mp4) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(QueueError::MissingMedia { clip_id });
+            }
+            Err(source) => return Err(QueueError::Io { path: inflight_mp4, source }),
+        }
 
         if let Err(err) = write_sidecar_atomic(&inflight_sidecar, &updated) {
             // PS-04: roll the mp4 back to pending/ so it isn't stranded in
