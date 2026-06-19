@@ -18,6 +18,7 @@
 use std::io::BufReader;
 use std::time::Duration;
 
+use chrono::{DateTime, TimeZone, Utc};
 use rcgen::KeyPair;
 use reqwest::{Certificate, StatusCode};
 use thiserror::Error;
@@ -59,6 +60,12 @@ pub enum ConfirmError {
     KeyMismatch,
     #[error("perchpub returned a certificate that does not chain to the pinned CA: {0}")]
     ChainMismatch(String),
+    #[error("perchpub attempted an unsupported redirect (HTTP {status}, location: {location:?})")]
+    UnexpectedRedirect { status: u16, location: Option<String> },
+    #[error("perchpub returned a certificate that is not yet valid (not_before {not_before})")]
+    CertNotYetValid { not_before: DateTime<Utc> },
+    #[error("perchpub returned a certificate that has expired (not_after {not_after})")]
+    CertExpired { not_after: DateTime<Utc> },
 }
 
 /// Retry schedule for transient 5xx / network errors. Each entry is the
@@ -73,7 +80,10 @@ pub const TRANSIENT_BACKOFF: &[Duration] =
 ///
 /// `perchpub_base_url` is the value from `config.toml::perchpub_url`.
 /// `ca_chain_pem` is the CA pin from the QR payload (must contain at least
-/// one PEM cert; multiple are tolerated).
+/// one PEM cert; multiple are tolerated). `now` is the wall-clock instant
+/// the returned leaf's validity window is checked against — the caller
+/// supplies it (rather than this module calling `Utc::now`) so validation
+/// stays a pure function of time.
 pub async fn send(
     perchpub_base_url: &str,
     ca_chain_pem: &str,
@@ -81,6 +91,7 @@ pub async fn send(
     auth_token: &str,
     csr_pem: &str,
     keypair: &KeyPair,
+    now: DateTime<Utc>,
 ) -> Result<ConfirmedEnrollment, ConfirmError> {
     send_with_backoff(
         perchpub_base_url,
@@ -89,6 +100,7 @@ pub async fn send(
         auth_token,
         csr_pem,
         keypair,
+        now,
         TRANSIENT_BACKOFF,
     )
     .await
@@ -97,6 +109,10 @@ pub async fn send(
 /// Variant of [`send`] with an injectable backoff schedule. The production
 /// call site uses [`TRANSIENT_BACKOFF`]; tests substitute a `&[]` (no
 /// retries) or a shortened schedule to keep wall-clock under control.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one-shot enrollment exchange; each parameter is a distinct wire input and bundling them would only obscure the call"
+)]
 pub async fn send_with_backoff(
     perchpub_base_url: &str,
     ca_chain_pem: &str,
@@ -104,6 +120,7 @@ pub async fn send_with_backoff(
     auth_token: &str,
     csr_pem: &str,
     keypair: &KeyPair,
+    now: DateTime<Utc>,
     backoff: &[Duration],
 ) -> Result<ConfirmedEnrollment, ConfirmError> {
     let client = build_client(ca_chain_pem)?;
@@ -121,7 +138,7 @@ pub async fn send_with_backoff(
     for attempt in 1..=max_attempts {
         match attempt_once(&client, &url, &body).await {
             Ok(response) => {
-                return validate_response(response, ca_chain_pem, keypair);
+                return validate_response(response, ca_chain_pem, keypair, now);
             }
             Err(AttemptError::Transient(msg)) => {
                 last_transient = Some(msg);
@@ -141,9 +158,28 @@ pub async fn send_with_backoff(
     })
 }
 
+#[derive(Debug)]
 enum AttemptError {
     Transient(String),
     Terminal(ConfirmError),
+}
+
+/// Classify a response status that fell through the 200 / 422 / 4xx / 5xx
+/// arms of [`attempt_once`]. The client disables redirect-following
+/// ([`build_client`] sets [`reqwest::redirect::Policy::none`]), so a 3xx
+/// reaching here is the server trying to bounce our `auth_token` + CSR to
+/// another host — terminal, and never retried (re-issuing the POST to the
+/// `Location` would leak the one-time enrollment token). A stray 1xx is
+/// genuinely unexpected and kept transient.
+fn classify_non_terminal_status(status: StatusCode, location: Option<String>) -> AttemptError {
+    if status.is_redirection() {
+        AttemptError::Terminal(ConfirmError::UnexpectedRedirect {
+            status: status.as_u16(),
+            location,
+        })
+    } else {
+        AttemptError::Transient(format!("unexpected HTTP {status}"))
+    }
 }
 
 async fn attempt_once(
@@ -187,9 +223,16 @@ async fn attempt_once(
         return Err(AttemptError::Transient(format!("HTTP {status}: {message}")));
     }
 
-    // 1xx / 3xx — treat as transient. reqwest follows redirects by
-    // default, so a 3xx here is unusual and worth retrying.
-    Err(AttemptError::Transient(format!("unexpected HTTP {status}")))
+    // 1xx / 3xx. Redirect-following is disabled at the client
+    // (build_client), so a 3xx here means the server tried to bounce us to
+    // another host — terminal, never retried. Capture Location for the
+    // error before dropping the response body.
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    Err(classify_non_terminal_status(status, location))
 }
 
 fn build_client(ca_chain_pem: &str) -> Result<reqwest::Client, ConfirmError> {
@@ -209,6 +252,11 @@ fn build_client(ca_chain_pem: &str) -> Result<reqwest::Client, ConfirmError> {
         .tls_built_in_root_certs(false)
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
         .https_only(true)
+        // Never follow redirects: a 307/308 preserves method + body, which
+        // would re-POST the bearer auth_token + CSR to whatever host the
+        // server names in Location. https_only constrains the scheme, not
+        // the host. Mirrors the mTLS client in perchpub::client.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30));
     for cert in roots {
         builder = builder.add_root_certificate(cert);
@@ -220,6 +268,7 @@ fn validate_response(
     response: EnrollmentResponse,
     ca_chain_pem: &str,
     keypair: &KeyPair,
+    now: DateTime<Utc>,
 ) -> Result<ConfirmedEnrollment, ConfirmError> {
     if !response.success {
         return Err(ConfirmError::Refused { reason: response.reason });
@@ -232,7 +281,7 @@ fn validate_response(
         response.station_id.ok_or(ConfirmError::MissingField { field: "station_id" })?;
 
     validate_cert_against_key(&certificate_pem, keypair)?;
-    validate_chain(&certificate_pem, ca_chain_pem, &ca_chain_response)?;
+    validate_chain(&certificate_pem, ca_chain_pem, &ca_chain_response, now)?;
 
     Ok(ConfirmedEnrollment { station_id, certificate_pem, ca_chain_pem: ca_chain_response })
 }
@@ -256,6 +305,7 @@ fn validate_chain(
     cert_pem: &str,
     pinned_ca_pem: &str,
     response_ca_pem: &str,
+    now: DateTime<Utc>,
 ) -> Result<(), ConfirmError> {
     // Refuse if the server tried to pivot us to a different CA than the
     // one we pinned from the QR. Comparing the parsed cert sets is robust
@@ -283,6 +333,24 @@ fn validate_chain(
         .parse_x509()
         .map_err(|err| ConfirmError::ChainMismatch(format!("parse leaf x509: {err}")))?;
 
+    // Reject a leaf whose validity window does not contain `now`. A
+    // correctly-signed but expired / not-yet-valid leaf would otherwise be
+    // persisted by identity::save and then brick every upload preflight
+    // (cert_is_expired) — enrollment would "succeed" with a dead station.
+    let validity = &leaf.tbs_certificate.validity;
+    let not_before = asn1_to_utc(validity.not_before.timestamp()).ok_or_else(|| {
+        ConfirmError::ChainMismatch("leaf not_before is not a representable UTC time".into())
+    })?;
+    let not_after = asn1_to_utc(validity.not_after.timestamp()).ok_or_else(|| {
+        ConfirmError::ChainMismatch("leaf not_after is not a representable UTC time".into())
+    })?;
+    if now < not_before {
+        return Err(ConfirmError::CertNotYetValid { not_before });
+    }
+    if now > not_after {
+        return Err(ConfirmError::CertExpired { not_after });
+    }
+
     let mut last_err: Option<String> = None;
     for ca_der in &pinned_ders {
         let ca = match x509_parser::parse_x509_certificate(ca_der) {
@@ -292,6 +360,15 @@ fn validate_chain(
                 continue;
             }
         };
+        // Only a real CA may vouch for the leaf: require BasicConstraints
+        // cA=TRUE plus a keyUsage permitting certificate signing. A pinned
+        // leaf / non-CA cert must be skipped, not allowed to verify a cert.
+        let usable_ca = ca.is_ca()
+            && ca.key_usage().ok().flatten().is_some_and(|usage| usage.value.key_cert_sign());
+        if !usable_ca {
+            last_err = Some("pinned cert is not a usable CA (needs cA=TRUE + keyCertSign)".into());
+            continue;
+        }
         match leaf.verify_signature(Some(ca.public_key())) {
             Ok(()) => return Ok(()),
             Err(err) => last_err = Some(format!("verify against pinned CA: {err}")),
@@ -300,6 +377,13 @@ fn validate_chain(
     Err(ConfirmError::ChainMismatch(
         last_err.unwrap_or_else(|| "no pinned CA verified the leaf signature".into()),
     ))
+}
+
+/// Convert an X.509 validity timestamp (whole seconds since the Unix
+/// epoch) into a UTC instant, returning `None` if it is not representable
+/// (handled by the caller as a rejection, never a panic).
+fn asn1_to_utc(timestamp: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_opt(timestamp, 0).single()
 }
 
 fn parse_cert_ders(pem: &str) -> Result<Vec<Vec<u8>>, String> {
@@ -335,6 +419,41 @@ mod tests {
         cert.pem()
     }
 
+    /// Sign a CSR with an explicit validity window (year, month, day) so a
+    /// test can mint expired / not-yet-valid leaves deterministically.
+    fn sign_csr_with_validity(
+        csr_pem: &str,
+        ca: &rcgen::Certificate,
+        ca_key: &KeyPair,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
+    ) -> String {
+        let mut params = CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+        params.params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+        let cert = params.signed_by(ca, ca_key).unwrap();
+        cert.pem()
+    }
+
+    /// A self-signed cert that is NOT a CA (`cA=FALSE`) even though it
+    /// claims `keyCertSign`. Used as a bogus issuer the gate must reject.
+    fn build_non_ca_issuer() -> (String, rcgen::Certificate, KeyPair) {
+        let key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut params = CertificateParams::new(vec!["not-a-ca".into()]).unwrap();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), cert, key)
+    }
+
+    /// A fixed `now` inside the test CAs' validity window (`2026..2099`)
+    /// and the rcgen default leaf window (`1975..4096`).
+    fn fixed_now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).single().unwrap()
+    }
+
     #[test]
     fn validate_response_accepts_well_formed_chain() {
         let (ca_pem, ca_cert, ca_key) = build_ca();
@@ -348,7 +467,7 @@ mod tests {
             ca_chain_pem: Some(ca_pem.clone()),
             station_id: Some(station_id),
         };
-        let result = validate_response(response, &ca_pem, &csr.keypair).expect("ok");
+        let result = validate_response(response, &ca_pem, &csr.keypair, fixed_now()).expect("ok");
         assert_eq!(result.station_id, station_id);
         assert!(result.certificate_pem.contains("BEGIN CERTIFICATE"));
     }
@@ -367,7 +486,8 @@ mod tests {
             ca_chain_pem: Some(ca_pem.clone()),
             station_id: Some(Uuid::new_v4()),
         };
-        let err = validate_response(response, &ca_pem, &csr_a.keypair).expect_err("mismatch");
+        let err = validate_response(response, &ca_pem, &csr_a.keypair, fixed_now())
+            .expect_err("mismatch");
         assert!(matches!(err, ConfirmError::KeyMismatch));
     }
 
@@ -384,8 +504,8 @@ mod tests {
             ca_chain_pem: Some(other_pem),
             station_id: Some(Uuid::new_v4()),
         };
-        let err =
-            validate_response(response, &pinned_pem, &csr.keypair).expect_err("chain mismatch");
+        let err = validate_response(response, &pinned_pem, &csr.keypair, fixed_now())
+            .expect_err("chain mismatch");
         assert!(matches!(err, ConfirmError::ChainMismatch(_)));
     }
 
@@ -400,7 +520,8 @@ mod tests {
             ca_chain_pem: None,
             station_id: None,
         };
-        let err = validate_response(response, &ca_pem, &csr.keypair).expect_err("refused");
+        let err =
+            validate_response(response, &ca_pem, &csr.keypair, fixed_now()).expect_err("refused");
         match err {
             ConfirmError::Refused { reason } => assert_eq!(reason, "session-replayed"),
             other => panic!("expected Refused, got {other:?}"),
@@ -418,13 +539,108 @@ mod tests {
             ca_chain_pem: Some(ca_pem.clone()),
             station_id: Some(Uuid::new_v4()),
         };
-        let err = validate_response(response, &ca_pem, &csr.keypair).expect_err("missing cert");
+        let err = validate_response(response, &ca_pem, &csr.keypair, fixed_now())
+            .expect_err("missing cert");
         assert!(matches!(err, ConfirmError::MissingField { field: "certificate_pem" }));
+    }
+
+    #[test]
+    fn validate_response_rejects_expired_leaf() {
+        let (ca_pem, ca_cert, ca_key) = build_ca();
+        let csr = super::super::csr::generate().expect("csr");
+        let leaf_pem =
+            sign_csr_with_validity(&csr.csr_pem, &ca_cert, &ca_key, (2020, 1, 1), (2021, 1, 1));
+        let response = EnrollmentResponse {
+            success: true,
+            reason: String::new(),
+            certificate_pem: Some(leaf_pem),
+            ca_chain_pem: Some(ca_pem.clone()),
+            station_id: Some(Uuid::new_v4()),
+        };
+        let err = validate_response(response, &ca_pem, &csr.keypair, fixed_now())
+            .expect_err("expired leaf");
+        assert!(matches!(err, ConfirmError::CertExpired { .. }));
+    }
+
+    #[test]
+    fn validate_response_rejects_not_yet_valid_leaf() {
+        let (ca_pem, ca_cert, ca_key) = build_ca();
+        let csr = super::super::csr::generate().expect("csr");
+        let leaf_pem =
+            sign_csr_with_validity(&csr.csr_pem, &ca_cert, &ca_key, (2090, 1, 1), (2099, 1, 1));
+        let response = EnrollmentResponse {
+            success: true,
+            reason: String::new(),
+            certificate_pem: Some(leaf_pem),
+            ca_chain_pem: Some(ca_pem.clone()),
+            station_id: Some(Uuid::new_v4()),
+        };
+        let err = validate_response(response, &ca_pem, &csr.keypair, fixed_now())
+            .expect_err("not yet valid leaf");
+        assert!(matches!(err, ConfirmError::CertNotYetValid { .. }));
+    }
+
+    #[test]
+    fn validate_response_rejects_leaf_signed_by_non_ca() {
+        // Pin a non-CA cert and have it sign the leaf. The signature is
+        // cryptographically valid, but the issuer is not a CA, so the chain
+        // must be refused rather than trusting an end-entity to vouch for
+        // another cert.
+        let (issuer_pem, issuer_cert, issuer_key) = build_non_ca_issuer();
+        let csr = super::super::csr::generate().expect("csr");
+        let leaf_pem = sign_csr(&csr.csr_pem, &issuer_cert, &issuer_key);
+        let response = EnrollmentResponse {
+            success: true,
+            reason: String::new(),
+            certificate_pem: Some(leaf_pem),
+            ca_chain_pem: Some(issuer_pem.clone()),
+            station_id: Some(Uuid::new_v4()),
+        };
+        let err = validate_response(response, &issuer_pem, &csr.keypair, fixed_now())
+            .expect_err("non-CA issuer");
+        assert!(matches!(err, ConfirmError::ChainMismatch(_)));
     }
 
     #[test]
     fn build_client_rejects_empty_ca_chain() {
         let err = build_client("").expect_err("empty CA chain");
         assert!(matches!(err, ConfirmError::CaChainEmpty));
+    }
+
+    #[test]
+    fn build_client_accepts_valid_ca() {
+        let (ca_pem, _, _) = build_ca();
+        build_client(&ca_pem).expect("a valid CA chain builds a client");
+    }
+
+    #[test]
+    fn redirect_status_is_terminal_with_location() {
+        let err = classify_non_terminal_status(
+            StatusCode::TEMPORARY_REDIRECT,
+            Some("https://attacker.example.org/".into()),
+        );
+        match err {
+            AttemptError::Terminal(ConfirmError::UnexpectedRedirect { status, location }) => {
+                assert_eq!(status, 307);
+                assert_eq!(location.as_deref(), Some("https://attacker.example.org/"));
+            }
+            other => panic!("expected Terminal UnexpectedRedirect, got a different arm: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permanent_redirect_is_terminal() {
+        assert!(matches!(
+            classify_non_terminal_status(StatusCode::PERMANENT_REDIRECT, None),
+            AttemptError::Terminal(ConfirmError::UnexpectedRedirect { .. })
+        ));
+    }
+
+    #[test]
+    fn informational_status_stays_transient() {
+        assert!(matches!(
+            classify_non_terminal_status(StatusCode::CONTINUE, None),
+            AttemptError::Transient(_)
+        ));
     }
 }

@@ -20,6 +20,14 @@ use uuid::Uuid;
 
 use crate::observability::tracing as obs_tracing;
 
+/// Hard cap on either dimension of a decoded QR frame, shared by the
+/// file-backed reader ([`file_source`], which sets it as an
+/// `image::Limits`) and the in-memory decode guard below. QR enrollment
+/// frames are tiny (the test fixtures are 200×200 / 300×300); the cap only
+/// exists to refuse a decompression-bomb image before it can drive a
+/// multi-gigabyte allocation on a memory-constrained Pi.
+pub(crate) const MAX_QR_IMAGE_DIM: u32 = 8192;
+
 /// In-memory material decoded from a single enrollment QR frame.
 ///
 /// `data_model.md` §`EnrollmentSessionMaterial` documents the canonical
@@ -49,6 +57,8 @@ pub enum QrDecodeError {
     MissingField { field: &'static str },
     #[error("QR payload field `{field}` is malformed: {message}")]
     BadField { field: &'static str, message: String },
+    #[error("QR frame is too large ({width}x{height}); max {max} per dimension")]
+    FrameTooLarge { width: u32, height: u32, max: u32 },
 }
 
 /// Wire shape of the QR JSON payload. `expires_at` is accepted-and-ignored
@@ -73,6 +83,12 @@ pub fn decode_enrollment_session(
     image: &GrayImage,
 ) -> Result<EnrollmentSessionMaterial, QrDecodeError> {
     let (width, height) = image.dimensions();
+    // Defence-in-depth: even though the file reader caps dimensions, the
+    // grayscale frame can also arrive from the camera adapter, so refuse an
+    // oversized frame before `prepare_from_greyscale` allocates width*height.
+    if width > MAX_QR_IMAGE_DIM || height > MAX_QR_IMAGE_DIM {
+        return Err(QrDecodeError::FrameTooLarge { width, height, max: MAX_QR_IMAGE_DIM });
+    }
     let mut img =
         rqrr::PreparedImage::prepare_from_greyscale(width as usize, height as usize, |x, y| {
             // rqrr's closure indices are bounded by the (width, height) passed
@@ -191,5 +207,16 @@ mod tests {
         let err = decode_enrollment_session(&img).expect_err("missing ca_chain should fail");
         // serde itself rejects the missing required field before our check fires.
         assert!(matches!(err, QrDecodeError::NotJson(_) | QrDecodeError::MissingField { .. }));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_frame() {
+        // One dimension just over the cap, the other tiny: the buffer is
+        // trivial to allocate, but the frame must be rejected up front
+        // (before QR detection) so an attacker-sized image can't drive a
+        // second huge allocation in `prepare_from_greyscale`.
+        let oversized = GrayImage::from_pixel(MAX_QR_IMAGE_DIM + 1, 1, Luma([255u8]));
+        let err = decode_enrollment_session(&oversized).expect_err("oversized frame rejected");
+        assert!(matches!(err, QrDecodeError::FrameTooLarge { .. }));
     }
 }

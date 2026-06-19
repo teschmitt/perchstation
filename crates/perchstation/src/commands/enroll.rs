@@ -109,6 +109,7 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
         &material.auth_token,
         &csr.csr_pem,
         &csr.keypair,
+        Utc::now(),
     )
     .await
     {
@@ -239,6 +240,9 @@ fn map_confirm_error(err: &ConfirmError) -> CommandError {
         ConfirmError::KeyMismatch
         | ConfirmError::ChainMismatch(_)
         | ConfirmError::CertPem(_)
+        | ConfirmError::CertExpired { .. }
+        | ConfirmError::CertNotYetValid { .. }
+        | ConfirmError::UnexpectedRedirect { .. }
         | ConfirmError::MissingField { .. }
         | ConfirmError::CaChainEmpty
         | ConfirmError::TlsConfig(_) => {

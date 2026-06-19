@@ -12,6 +12,7 @@
 //! Production camera capture lives in
 //! `crates/perchstation-hw/src/camera_qr.rs` (T029).
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -54,7 +55,24 @@ impl FileQrSource {
     fn load(&self) -> Result<GrayImage, FileQrError> {
         let bytes = std::fs::read(&self.path)
             .map_err(|source| FileQrError::Io { path: self.path.clone(), source })?;
-        let img = image::load_from_memory(&bytes)
+        // The QR file is operator-supplied (a recovery PNG or a phone photo)
+        // and only semi-trusted. Decode through a size-limited reader so a
+        // small file declaring enormous dimensions is rejected before it can
+        // allocate gigabytes and OOM-kill the station (a decompression bomb).
+        // `image::Limits` leaves both dimension caps unset by default, so
+        // they must be set explicitly; `load_from_memory` installs none.
+        let mut reader = image::ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|source| FileQrError::Image {
+                path: self.path.clone(),
+                source: image::ImageError::IoError(source),
+            })?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(crate::enrollment::MAX_QR_IMAGE_DIM);
+        limits.max_image_height = Some(crate::enrollment::MAX_QR_IMAGE_DIM);
+        reader.limits(limits);
+        let img = reader
+            .decode()
             .map_err(|source| FileQrError::Image { path: self.path.clone(), source })?;
         Ok(img.into_luma8())
     }
@@ -124,6 +142,25 @@ mod tests {
         std::fs::write(&bogus, b"this is not an image").unwrap();
         let mut src = FileQrSource::new(&bogus);
         let err = src.next_frame().await.expect_err("non-image");
+        assert!(matches!(err, QrFrameError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_image_as_decode_error() {
+        let dir = TempDir::new().unwrap();
+        // A valid grayscale PNG whose declared width exceeds the decode
+        // cap but whose payload is tiny. The size-limited reader must
+        // reject it (Decode) rather than allocating, so a few-KB file
+        // declaring enormous dimensions can't OOM-kill the station.
+        let img: GrayImage =
+            ImageBuffer::from_pixel(crate::enrollment::MAX_QR_IMAGE_DIM + 1, 1, Luma([0u8]));
+        let mut bytes = Vec::new();
+        img.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png).expect("encode oversized png");
+        let path = dir.path().join("oversized.png");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut src = FileQrSource::new(&path);
+        let err = src.next_frame().await.expect_err("oversized image");
         assert!(matches!(err, QrFrameError::Decode(_)));
     }
 }

@@ -14,7 +14,7 @@
 //! stored in `identity.json`; the JSON sidecar carries `station_id`,
 //! `enrolled_at`, and `perchpub_url` only.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -104,11 +104,15 @@ impl StationIdentity {
         })
     }
 
-    /// `true` if the cert's `not_after` is strictly in the past relative to
-    /// `now`. Used by `status` and by the per-upload pre-flight check.
+    /// `true` once the cert's `not_after` has been reached relative to
+    /// `now`. Used by `status` and by the per-upload pre-flight check. The
+    /// comparison is inclusive (`<=`): `not_after` is parsed truncated to a
+    /// whole second, so the boundary second is a real, reachable instant at
+    /// which the cert must be treated as already expired (halt before
+    /// perchpub rejects the upload as expired).
     #[must_use]
     pub fn cert_is_expired(&self, now: DateTime<Utc>) -> bool {
-        self.cert_not_after < now
+        self.cert_not_after <= now
     }
 }
 
@@ -159,7 +163,8 @@ pub fn peek_existing_station_id(data_dir: &Path) -> Result<Option<Uuid>, Identit
 ///    (refused if `overwrite` is false; FR-003).
 /// 3. Rename `credentials.tmp/` → `credentials/` (a same-filesystem
 ///    directory rename — atomic with respect to readers that see the
-///    final pathname).
+///    final pathname), then `fsync` the parent `data_dir` so the rename
+///    itself is durable, not just the file contents.
 /// 4. Best-effort delete `credentials.old/` (a crash before this step
 ///    leaves the old directory behind; a subsequent invocation will
 ///    sweep it on its own staging pass).
@@ -210,6 +215,11 @@ pub fn save(data_dir: &Path, opts: &SaveOptions<'_>) -> Result<StationIdentity, 
         serde_json::to_vec_pretty(&identity_file).map_err(IdentityError::Serialise)?;
     write_mode(&staging_path.join(IDENTITY_FILE), &identity_json, 0o644)?;
 
+    // Make the staged directory entries durable before we publish them via
+    // rename — the file contents were sync'd by write_mode, but the dir
+    // entries linking them may still be in the page cache.
+    fsync_dir(&staging_path)?;
+
     // Rotate any existing credentials/ out of the way.
     let creds_existed = creds_path.exists();
     if creds_existed {
@@ -228,6 +238,12 @@ pub fn save(data_dir: &Path, opts: &SaveOptions<'_>) -> Result<StationIdentity, 
         return Err(IdentityError::Io { path: creds_path, source });
     }
 
+    // Persist the rename(s) into data_dir itself. Both the rotation rename
+    // and the staging→credentials promote modify entries in data_dir; one
+    // fsync of the parent makes them durable so a power cut can't lose the
+    // just-enrolled identity after save() reported success.
+    fsync_dir(data_dir)?;
+
     if creds_existed {
         // Best-effort cleanup; a leftover credentials.old/ is harmless
         // because the next save() invocation sweeps it.
@@ -237,6 +253,17 @@ pub fn save(data_dir: &Path, opts: &SaveOptions<'_>) -> Result<StationIdentity, 
     // Re-load so the caller gets the same cert_not_after the rest of the
     // process will see (parsed from the freshly-written station.crt).
     StationIdentity::load(data_dir)
+}
+
+/// Flush a directory's own entries to stable storage by `fsync`-ing the
+/// directory. [`write_mode`] makes file *contents* durable, but a `rename`
+/// that publishes those files only updates the parent directory, whose
+/// entry change can linger in the page cache until the directory itself is
+/// sync'd.
+fn fsync_dir(path: &Path) -> Result<(), IdentityError> {
+    File::open(path)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|source| IdentityError::Io { path: path.to_path_buf(), source })
 }
 
 fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), IdentityError> {
@@ -521,5 +548,77 @@ mod tests {
         assert!(!dir.path().join("credentials.tmp").exists());
         // And the leftover file did not bleed into the final credentials/.
         assert!(!dir.path().join("credentials/leftover").exists());
+    }
+
+    #[test]
+    fn fsync_dir_succeeds_on_existing_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        fsync_dir(dir.path()).expect("fsync an existing directory");
+    }
+
+    #[test]
+    fn fsync_dir_errors_on_missing_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let missing = dir.path().join("does-not-exist");
+        let err = fsync_dir(&missing).expect_err("fsync of a missing path must error");
+        assert!(matches!(err, IdentityError::Io { .. }));
+    }
+
+    #[test]
+    fn save_fsyncs_parent_dir_after_rename() {
+        let dir = TempDir::new().expect("tempdir");
+        let (cert_pem, key_pem) = build_signing_material();
+        let station_id = Uuid::new_v4();
+
+        let identity = save(
+            dir.path(),
+            &SaveOptions {
+                station_id,
+                enrolled_at: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+                perchpub_url: "https://perchpub.example.org",
+                station_key_pem: &key_pem,
+                station_cert_pem: &cert_pem,
+                ca_chain_pem: &cert_pem,
+                overwrite: false,
+            },
+        )
+        .expect("save with parent-dir fsync");
+        assert_eq!(identity.station_id, station_id);
+
+        // The rename was made durable and the credentials round-trip back.
+        let reloaded = StationIdentity::load(dir.path()).expect("reload after fsync");
+        assert_eq!(reloaded.station_id, station_id);
+    }
+
+    fn identity_with_not_after(not_after: DateTime<Utc>) -> StationIdentity {
+        StationIdentity {
+            station_id: Uuid::new_v4(),
+            enrolled_at: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            perchpub_url: "https://perchpub.example.org".into(),
+            cert_not_after: not_after,
+        }
+    }
+
+    #[test]
+    fn cert_is_expired_at_exact_not_after_second_is_true() {
+        let not_after = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).single().unwrap();
+        let identity = identity_with_not_after(not_after);
+        // The boundary second is a reachable instant (the cert time is
+        // truncated to whole seconds); halt conservatively *at* it.
+        assert!(identity.cert_is_expired(not_after));
+    }
+
+    #[test]
+    fn cert_is_not_expired_one_second_before_not_after() {
+        let not_after = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).single().unwrap();
+        let identity = identity_with_not_after(not_after);
+        assert!(!identity.cert_is_expired(not_after - chrono::Duration::seconds(1)));
+    }
+
+    #[test]
+    fn cert_is_expired_one_second_after_not_after() {
+        let not_after = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).single().unwrap();
+        let identity = identity_with_not_after(not_after);
+        assert!(identity.cert_is_expired(not_after + chrono::Duration::seconds(1)));
     }
 }

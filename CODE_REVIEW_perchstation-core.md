@@ -42,11 +42,11 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 - [ ] PS-23 — `Retry-After` HTTP-date form dropped *(Low)*
 
 **Enrollment & identity (security)**
-- [ ] PS-13 — `validate_chain` accepts expired / non-CA certs *(High)*
-- [ ] PS-14 — enrollment client follows redirects → re-sends `auth_token`+CSR *(Medium)*
-- [ ] PS-15 — untrusted QR images decoded with no size limits → decompression bomb *(Medium)*
-- [ ] PS-17 — no parent-dir fsync after credentials rename *(Medium)*
-- [ ] PS-19 — `cert_is_expired` strict `<` boundary *(Low)*
+- [x] PS-13 — `validate_chain` accepts expired / non-CA certs *(High)*
+- [x] PS-14 — enrollment client follows redirects → re-sends `auth_token`+CSR *(Medium)*
+- [x] PS-15 — untrusted QR images decoded with no size limits → decompression bomb *(Medium)*
+- [x] PS-17 — no parent-dir fsync after credentials rename *(Medium)*
+- [x] PS-19 — `cert_is_expired` strict `<` boundary *(Low)*
 
 **Observability**
 - [ ] PS-26 — `RedactingWriter` clones the secrets `Vec` on every log line *(Low)*
@@ -465,7 +465,7 @@ fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
 # Enrollment & identity (security)
 
 ## PS-13 — `validate_chain` accepts expired / non-CA certs
-**Severity:** High · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** High · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/enrollment/confirm.rs:255-303`
 **Depends on:** PS-11 (inject a clock, don't call `Utc::now` directly)
 
@@ -483,7 +483,7 @@ match leaf.verify_signature(Some(ca.public_key())) {
 **Notes:** `x509-parser` is 0.16; identity.rs:264-273 shows the validity-timestamp parsing pattern. `cert_is_expired` (identity.rs:110-112, see PS-19) is what bricks uploads once an expired leaf is persisted.
 
 ## PS-14 — enrollment client follows redirects → re-sends `auth_token`+CSR
-**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/enrollment/confirm.rs:195-217`
 
 ```rust
@@ -501,7 +501,7 @@ let mut builder = reqwest::Client::builder()
 **Tests:** confirm.rs `mod tests`: `build_client` succeeds; a local mock HTTPS server (pinned self-signed CA) returns 307 with `Location` to a second host — assert the second host never receives a request and `send_with_backoff` returns terminal, not a leaked POST. Minimum: assert the builder is configured with `Policy::none()` and an `attempt_once`-level test that a synthetic 3xx classifies Terminal.
 
 ## PS-15 — untrusted QR images decoded with no size/pixel limits → decompression-bomb OOM
-**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/enrollment/file_source.rs:54-60`; `crates/perchstation-core/src/enrollment/mod.rs:72-84`
 
 ```rust
@@ -519,7 +519,7 @@ rqrr::PreparedImage::prepare_from_greyscale(width as usize, height as usize, |x,
 **Notes:** image 0.25 — the type is `image::ImageReader` (the brief's `image::io::Limits`/`Reader.limits()` is the 0.24 spelling). `Limits::default()` sets `max_alloc=Some(512 MiB)` but `max_image_width/height=None`, and bare `load_from_memory` installs none.
 
 ## PS-17 — no parent-dir fsync after credentials rename
-**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/identity.rs:172-240,242-253,152-171`
 **Depends on:** PS-28 (shared unix-cfg strategy for opening a dir)
 
@@ -536,7 +536,7 @@ if let Err(source) = fs::rename(&staging_path, &creds_path) {   // dir entry nev
 **Tests:** identity.rs: `save_fsyncs_parent_dir_after_rename` (at minimum asserts save still succeeds + files round-trip). Extract the helper and add `fsync_dir_succeeds_on_existing_dir` / `fsync_dir_errors_on_missing_path`.
 
 ## PS-19 — `cert_is_expired` uses strict `<` (boundary off-by-one at `not_after` second)
-**Severity:** Low · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Low · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/identity.rs:107-113,263-274`
 
 ```rust
