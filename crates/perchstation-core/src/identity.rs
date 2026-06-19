@@ -16,7 +16,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -266,11 +265,35 @@ fn fsync_dir(path: &Path) -> Result<(), IdentityError> {
         .map_err(|source| IdentityError::Io { path: path.to_path_buf(), source })
 }
 
+/// Create `path` exclusively (`O_CREAT|O_EXCL|O_WRONLY`) with the given unix
+/// permission `mode`, write `bytes`, and `fsync` the contents. The `0o600`
+/// private-key discipline is a unix concept; the import + `.mode()` are
+/// cfg-gated so `perchstation-core` stays compilable on non-unix targets
+/// (PS-28). perchstation's only production target is Linux.
+#[cfg(unix)]
 fn write_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), IdentityError> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(mode)
+        .open(path)
+        .map_err(|source| IdentityError::Io { path: path.to_path_buf(), source })?;
+    file.write_all(bytes)
+        .map_err(|source| IdentityError::Io { path: path.to_path_buf(), source })?;
+    file.sync_all().map_err(|source| IdentityError::Io { path: path.to_path_buf(), source })?;
+    Ok(())
+}
+
+/// Non-unix fallback: still creates the file exclusively, but cannot apply
+/// the unix `mode`. Exists only so the platform-agnostic crate compiles off
+/// unix; production runs on Linux where the unix `write_mode` variant
+/// enforces `0o600` on `station.key`.
+#[cfg(not(unix))]
+fn write_mode(path: &Path, bytes: &[u8], _mode: u32) -> Result<(), IdentityError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
         .open(path)
         .map_err(|source| IdentityError::Io { path: path.to_path_buf(), source })?;
     file.write_all(bytes)
@@ -372,6 +395,7 @@ mod tests {
         assert!(matches!(err, IdentityError::CertPem { .. }));
     }
 
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     /// Build a self-signed Ed25519 cert and return `(cert_pem, key_pem)`,
@@ -403,6 +427,9 @@ mod tests {
         assert_eq!(id, station_id);
     }
 
+    // The `0o600` permission assertion is unix-only; on non-unix targets the
+    // `write_mode` fallback cannot set a mode (PS-28), so this test is gated.
+    #[cfg(unix)]
     #[test]
     fn save_writes_all_four_files_with_correct_modes() {
         let dir = TempDir::new().expect("tempdir");

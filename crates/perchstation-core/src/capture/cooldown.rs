@@ -3,27 +3,16 @@
 //! After every handled trigger — success, failure, queue-refused, degraded
 //! skip, disk-pressure skip — the supervisor starts a cooldown so a
 //! sustained-asserted sensor cannot produce back-to-back recordings (US2
-//! #2 in letter, FR-006 in spirit).
+//! #2 in letter, FR-006 in spirit). The only state the gate carries is the
+//! outstanding deadline, surfaced as `cooldown_until` on
+//! `capture.cooldown_skip`.
 
 use chrono::{DateTime, Duration, Utc};
-
-/// What ended the most recent `handle_trigger` call. Informational —
-/// surfaced on `capture.cooldown_skip` so an operator can tell why the
-/// loop is currently in cooldown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CooldownOutcome {
-    Submitted,
-    Failed,
-    QueueRefused,
-    DegradedSkip,
-    DiskPressureSkip,
-}
 
 /// Cooldown gate. Holds at most one outstanding deadline.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CooldownState {
     until: Option<DateTime<Utc>>,
-    last_outcome: Option<CooldownOutcome>,
 }
 
 impl CooldownState {
@@ -32,17 +21,10 @@ impl CooldownState {
         Self::default()
     }
 
-    /// Set `until = now + cooldown_secs` and remember the outcome that
-    /// triggered this cooldown.
-    pub fn start_after(
-        &mut self,
-        now: DateTime<Utc>,
-        cooldown_secs: u64,
-        outcome: CooldownOutcome,
-    ) {
+    /// Set `until = now + cooldown_secs`.
+    pub fn start_after(&mut self, now: DateTime<Utc>, cooldown_secs: u64) {
         let secs = i64::try_from(cooldown_secs).unwrap_or(i64::MAX);
         self.until = Some(now + Duration::seconds(secs));
-        self.last_outcome = Some(outcome);
     }
 
     /// `true` while the cooldown deadline has not yet elapsed.
@@ -57,11 +39,6 @@ impl CooldownState {
     pub fn until(&self) -> Option<DateTime<Utc>> {
         self.until
     }
-
-    #[must_use]
-    pub fn last_outcome(&self) -> Option<CooldownOutcome> {
-        self.last_outcome
-    }
 }
 
 #[cfg(test)]
@@ -74,20 +51,18 @@ mod tests {
     }
 
     #[test]
-    fn new_is_inactive_and_has_no_outcome() {
+    fn new_is_inactive() {
         let c = CooldownState::new();
         assert!(!c.is_active(Utc::now()));
-        assert!(c.last_outcome().is_none());
         assert!(c.until().is_none());
     }
 
     #[test]
-    fn start_after_sets_deadline_and_outcome() {
+    fn start_after_sets_deadline() {
         let mut c = CooldownState::new();
         let now = t("2026-05-27T12:00:00Z");
-        c.start_after(now, 30, CooldownOutcome::Submitted);
+        c.start_after(now, 30);
         assert_eq!(c.until(), Some(now + Duration::seconds(30)));
-        assert_eq!(c.last_outcome(), Some(CooldownOutcome::Submitted));
         assert!(c.is_active(now));
         assert!(c.is_active(now + Duration::seconds(29)));
         assert!(!c.is_active(now + Duration::seconds(30)));
@@ -98,9 +73,8 @@ mod tests {
     fn start_after_overrides_previous_deadline() {
         let mut c = CooldownState::new();
         let now = Utc.with_ymd_and_hms(2026, 5, 27, 12, 0, 0).unwrap();
-        c.start_after(now, 30, CooldownOutcome::Submitted);
-        c.start_after(now, 60, CooldownOutcome::Failed);
+        c.start_after(now, 30);
+        c.start_after(now, 60);
         assert_eq!(c.until(), Some(now + Duration::seconds(60)));
-        assert_eq!(c.last_outcome(), Some(CooldownOutcome::Failed));
     }
 }

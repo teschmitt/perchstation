@@ -169,14 +169,15 @@ fn build_qr_source(
 }
 
 #[cfg(target_os = "linux")]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "non-linux variant returns an error; signature must match across cfgs"
-)]
 fn build_camera_source(config: &Config) -> Result<Box<dyn QrFrameSource>, CommandError> {
+    // The camera-binary name lives in the hardware-specific `[capture]` knobs
+    // that core carries opaquely (PS-29/PS-30); decode them here at the wiring
+    // layer to find which still-capture binary to shell out to.
+    let hw = perchstation_hw::capture_config::CaptureHwConfig::from_table(&config.capture.hardware)
+        .map_err(|err| CommandError::Config(anyhow!("invalid [capture] hardware config: {err}")))?;
     Ok(Box::new(
         perchstation_hw::camera_qr::CameraQrSource::new()
-            .with_binary(config.capture.camera_still_command.clone()),
+            .with_binary(hw.camera_still_command.clone()),
     ))
 }
 

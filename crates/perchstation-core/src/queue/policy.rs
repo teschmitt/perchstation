@@ -37,7 +37,7 @@ use crate::observability::tracing as obs_tracing;
 use crate::perchpub::types::ClassifyTaskStatus;
 
 use super::inbox::Inbox;
-use super::store::{ClipMeta, QueueStore};
+use super::store::{ClipMeta, QueueStore, read_sidecar};
 use super::{ClipQueueEntry, InboxError, Outcome, QueueError};
 
 /// Bounds + eviction strategy for a configured queue.
@@ -365,20 +365,16 @@ fn read_sidecars(dir: &Path) -> Result<Vec<ClipQueueEntry>, QueueError> {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        match read_sidecar(&path) {
+            Ok(sidecar) => out.push(sidecar),
             // PS-10: a concurrent eviction or `transition_inflight` may unlink
             // this sidecar between `read_dir` listing it and this read. Treat a
             // vanished file as absent rather than failing the whole census.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(QueueError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 tracing::trace!(path = %path.display(), "sidecar vanished mid-census; skipping");
-                continue;
             }
-            Err(source) => return Err(QueueError::Io { path, source }),
-        };
-        let sidecar: ClipQueueEntry = serde_json::from_slice(&bytes)
-            .map_err(|source| QueueError::Deserialise { path: path.clone(), source })?;
-        out.push(sidecar);
+            Err(err) => return Err(err),
+        }
     }
     Ok(out)
 }
@@ -391,8 +387,8 @@ fn evict(store: &QueueStore, candidate: &EvictableEntry) -> Result<(), QueueErro
         EvictableLocation::DeliveredUndeliverable => store.delivered_dir(),
         EvictableLocation::Pending => store.pending_dir(),
     };
-    let sidecar = dir.join(format!("{clip_id}.json"));
-    let mp4 = dir.join(format!("{clip_id}.mp4"));
+    let sidecar = dir.join(QueueStore::sidecar_name(clip_id));
+    let mp4 = dir.join(QueueStore::media_name(clip_id));
 
     match fs::remove_file(&mp4) {
         Ok(()) => {}

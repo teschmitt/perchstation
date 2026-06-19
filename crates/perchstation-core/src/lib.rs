@@ -5,29 +5,11 @@ pub mod capture;
 pub mod config;
 pub mod delivery;
 pub mod enrollment;
+mod fsutil;
 pub mod hw_traits;
 pub mod identity;
 pub mod observability;
 pub mod perchpub;
 pub mod queue;
 pub mod supervision;
-
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum Error {
-    #[error("configuration error: {0}")]
-    Config(String),
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("enrollment error: {0}")]
-    Enrollment(String),
-    #[error("perchpub HTTP error: {0}")]
-    Perchpub(String),
-    #[error("queue error: {0}")]
-    Queue(String),
-    #[error("delivery error: {0}")]
-    Delivery(String),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
+mod tls;

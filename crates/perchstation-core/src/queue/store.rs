@@ -82,6 +82,30 @@ impl QueueStore {
         self.root.join(CORRUPT)
     }
 
+    /// On-disk media filename for `clip_id` (`<clip-id>.mp4`). Centralised so
+    /// a layout change (a compression suffix, a different extension) lands in
+    /// one place instead of the dozen hand-written `format!("{clip_id}.mp4")`
+    /// sites that previously drifted independently (PS-31).
+    #[must_use]
+    pub fn media_name(clip_id: &str) -> String {
+        format!("{clip_id}.mp4")
+    }
+
+    /// Staging filename used while a clip's media is being placed
+    /// (`<clip-id>.mp4.tmp`). Kept distinct from [`media_name`](Self::media_name)
+    /// so the tmp suffix is not mistaken for the final media name (PS-31).
+    #[must_use]
+    pub fn media_tmp_name(clip_id: &str) -> String {
+        format!("{clip_id}.mp4.tmp")
+    }
+
+    /// On-disk sidecar filename for `clip_id` (`<clip-id>.json`). See
+    /// [`media_name`](Self::media_name).
+    #[must_use]
+    pub fn sidecar_name(clip_id: &str) -> String {
+        format!("{clip_id}.json")
+    }
+
     /// Move a freshly-captured clip into `pending/`. Stages the mp4 via a
     /// `.tmp` suffix then renames; writes the sidecar via tmp + rename.
     pub fn enqueue(
@@ -108,8 +132,8 @@ impl QueueStore {
             .map_err(|source| QueueError::Io { path: clip_source.to_path_buf(), source })?;
         let byte_size = metadata.len();
 
-        let mp4_target = pending.join(format!("{clip_id}.mp4"));
-        let mp4_tmp = pending.join(format!("{clip_id}.mp4.tmp"));
+        let mp4_target = pending.join(Self::media_name(clip_id));
+        let mp4_tmp = pending.join(Self::media_tmp_name(clip_id));
 
         // Try rename first (same-filesystem); fall back to copy+remove for
         // cross-filesystem sources (e.g., capture stages clips under /tmp).
@@ -124,7 +148,7 @@ impl QueueStore {
         }
 
         let entry = ClipQueueEntry::new(clip_id, meta.captured_at, Utc::now(), byte_size);
-        let sidecar_target = pending.join(format!("{clip_id}.json"));
+        let sidecar_target = pending.join(Self::sidecar_name(clip_id));
         if let Err(err) = write_sidecar_atomic(&sidecar_target, &entry) {
             // PS-07: the mp4 is already staged in pending/; a failed sidecar
             // write would leave it orphaned (invisible to every json-keyed
@@ -220,10 +244,10 @@ impl QueueStore {
         now: DateTime<Utc>,
     ) -> Result<ClipQueueEntry, QueueError> {
         let clip_id = entry.clip_id.clone();
-        let pending_mp4 = self.pending_dir().join(format!("{clip_id}.mp4"));
-        let pending_sidecar = self.pending_dir().join(format!("{clip_id}.json"));
-        let inflight_mp4 = self.inflight_dir().join(format!("{clip_id}.mp4"));
-        let inflight_sidecar = self.inflight_dir().join(format!("{clip_id}.json"));
+        let pending_mp4 = self.pending_dir().join(Self::media_name(&clip_id));
+        let pending_sidecar = self.pending_dir().join(Self::sidecar_name(&clip_id));
+        let inflight_mp4 = self.inflight_dir().join(Self::media_name(&clip_id));
+        let inflight_sidecar = self.inflight_dir().join(Self::sidecar_name(&clip_id));
 
         let mut updated = entry;
         updated.attempts = updated.attempts.saturating_add(1);
@@ -264,7 +288,7 @@ impl QueueStore {
     /// latest `last_classify_status` and `observation_id` without moving
     /// the entry.
     pub fn update_delivered_sidecar(&self, entry: &ClipQueueEntry) -> Result<(), QueueError> {
-        let path = self.delivered_dir().join(format!("{}.json", entry.clip_id));
+        let path = self.delivered_dir().join(Self::sidecar_name(&entry.clip_id));
         write_sidecar_atomic(&path, entry)
     }
 
@@ -275,10 +299,10 @@ impl QueueStore {
     /// partial transition.
     pub fn transition_back_to_pending(&self, entry: &ClipQueueEntry) -> Result<(), QueueError> {
         let clip_id = &entry.clip_id;
-        let inflight_mp4 = self.inflight_dir().join(format!("{clip_id}.mp4"));
-        let inflight_sidecar = self.inflight_dir().join(format!("{clip_id}.json"));
-        let pending_mp4 = self.pending_dir().join(format!("{clip_id}.mp4"));
-        let pending_sidecar = self.pending_dir().join(format!("{clip_id}.json"));
+        let inflight_mp4 = self.inflight_dir().join(Self::media_name(clip_id));
+        let inflight_sidecar = self.inflight_dir().join(Self::sidecar_name(clip_id));
+        let pending_mp4 = self.pending_dir().join(Self::media_name(clip_id));
+        let pending_sidecar = self.pending_dir().join(Self::sidecar_name(clip_id));
 
         if inflight_mp4.exists() {
             fs::rename(&inflight_mp4, &pending_mp4)
@@ -354,9 +378,9 @@ impl QueueStore {
     /// 3. Renames `inflight/<id>.json` → `delivered/<id>.json`.
     pub fn transition_delivered(&self, entry: &ClipQueueEntry) -> Result<(), QueueError> {
         let clip_id = &entry.clip_id;
-        let inflight_mp4 = self.inflight_dir().join(format!("{clip_id}.mp4"));
-        let inflight_sidecar = self.inflight_dir().join(format!("{clip_id}.json"));
-        let delivered_sidecar = self.delivered_dir().join(format!("{clip_id}.json"));
+        let inflight_mp4 = self.inflight_dir().join(Self::media_name(clip_id));
+        let inflight_sidecar = self.inflight_dir().join(Self::sidecar_name(clip_id));
+        let delivered_sidecar = self.delivered_dir().join(Self::sidecar_name(clip_id));
 
         write_sidecar_atomic(&inflight_sidecar, entry)?;
 
@@ -378,8 +402,8 @@ impl QueueStore {
     /// wedging the delivery head (PS-04). Removes the orphan sidecar (and
     /// any stray media) idempotently so the head advances.
     pub fn quarantine_orphan(&self, clip_id: &str) -> Result<(), QueueError> {
-        let sidecar = self.pending_dir().join(format!("{clip_id}.json"));
-        let mp4 = self.pending_dir().join(format!("{clip_id}.mp4"));
+        let sidecar = self.pending_dir().join(Self::sidecar_name(clip_id));
+        let mp4 = self.pending_dir().join(Self::media_name(clip_id));
         remove_if_exists(&sidecar)?;
         remove_if_exists(&mp4)?;
         Ok(())
@@ -473,7 +497,13 @@ fn remove_if_exists(path: &Path) -> Result<(), QueueError> {
     }
 }
 
-fn read_sidecar(path: &Path) -> Result<ClipQueueEntry, QueueError> {
+/// Read and deserialise a single sidecar JSON file — the one shared reader
+/// every queue scan funnels through (PS-31). A `fs::read` failure surfaces as
+/// [`QueueError::Io`] (callers inspect `source.kind()` for `NotFound` to skip a
+/// file that vanished mid-scan) and a parse failure as
+/// [`QueueError::Deserialise`] (the signal each scan turns into its own
+/// corrupt-quarantine or warn-skip handling — PS-02).
+pub(crate) fn read_sidecar(path: &Path) -> Result<ClipQueueEntry, QueueError> {
     let bytes =
         fs::read(path).map_err(|source| QueueError::Io { path: path.to_path_buf(), source })?;
     serde_json::from_slice(&bytes)
@@ -489,6 +519,16 @@ mod tests {
 
     fn instant(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn media_and_sidecar_names_match_on_disk_convention() {
+        // PS-31: every `<clip-id>.mp4` / `.json` join routes through these
+        // helpers so a layout change lands in one place.
+        let id = "20260527T120000Z-001";
+        assert_eq!(QueueStore::media_name(id), "20260527T120000Z-001.mp4");
+        assert_eq!(QueueStore::media_tmp_name(id), "20260527T120000Z-001.mp4.tmp");
+        assert_eq!(QueueStore::sidecar_name(id), "20260527T120000Z-001.json");
     }
 
     #[test]

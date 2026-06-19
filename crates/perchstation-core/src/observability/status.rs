@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::capture::state::CaptureState;
 use crate::identity::{CREDENTIALS_DIR, IDENTITY_FILE, IdentityError, StationIdentity};
 use crate::perchpub::types::ClassifyTaskStatus;
-use crate::queue::{ClipQueueEntry, Outcome};
+use crate::queue::store::read_sidecar;
+use crate::queue::{ClipQueueEntry, Outcome, QueueError};
 
 const QUEUE_DIR: &str = "queue";
 const PENDING: &str = "pending";
@@ -228,39 +229,25 @@ fn queue_snapshot(data_dir: &Path) -> Result<QueueSnapshot, StatusError> {
 }
 
 fn count_sidecars(dir: &Path) -> Result<u32, StatusError> {
-    let read = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(source) => return Err(StatusError::Io { path: dir.to_path_buf(), source }),
-    };
-    let mut count = 0_u32;
-    for entry in read {
-        let entry = entry.map_err(|source| StatusError::Io { path: dir.to_path_buf(), source })?;
-        if entry.path().extension().is_some_and(|e| e == "json") {
-            count = count.saturating_add(1);
-        }
-    }
-    Ok(count)
+    // PS-31: share the one `read_dir` + saturating-fold scanner. Each `.json`
+    // entry contributes 1; everything else contributes 0.
+    let count = crate::fsutil::sum_dir(dir, |entry| {
+        Ok(u64::from(entry.path().extension().is_some_and(|e| e == "json")))
+    })
+    .map_err(|source| StatusError::Io { path: dir.to_path_buf(), source })?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
 fn sum_mp4_bytes(dir: &Path) -> Result<u64, StatusError> {
-    let read = match fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(source) => return Err(StatusError::Io { path: dir.to_path_buf(), source }),
-    };
-    let mut total = 0_u64;
-    for entry in read {
-        let entry = entry.map_err(|source| StatusError::Io { path: dir.to_path_buf(), source })?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "mp4") {
-            let meta = entry
-                .metadata()
-                .map_err(|source| StatusError::Io { path: path.clone(), source })?;
-            total = total.saturating_add(meta.len());
+    // PS-31: share the scanner; each `.mp4` entry contributes its byte size.
+    crate::fsutil::sum_dir(dir, |entry| {
+        if entry.path().extension().is_some_and(|e| e == "mp4") {
+            Ok(entry.metadata()?.len())
+        } else {
+            Ok(0)
         }
-    }
-    Ok(total)
+    })
+    .map_err(|source| StatusError::Io { path: dir.to_path_buf(), source })
 }
 
 fn load_delivered(data_dir: &Path) -> Result<Vec<ClipQueueEntry>, StatusError> {
@@ -278,10 +265,17 @@ fn load_delivered(data_dir: &Path) -> Result<Vec<ClipQueueEntry>, StatusError> {
         if path.extension().is_none_or(|e| e != "json") {
             continue;
         }
-        let bytes =
-            fs::read(&path).map_err(|source| StatusError::Io { path: path.clone(), source })?;
-        let parsed: ClipQueueEntry = serde_json::from_slice(&bytes)
-            .map_err(|source| StatusError::Parse { path: path.clone(), source })?;
+        // PS-31: use the single shared queue-store reader, mapping its typed
+        // error back into this module's Io / Parse split. `read_sidecar` only
+        // ever returns `Io` or `Deserialise`; the catch-all keeps the surface
+        // total without inventing a path for unreachable variants.
+        let parsed = read_sidecar(&path).map_err(|err| match err {
+            QueueError::Deserialise { path, source } => StatusError::Parse { path, source },
+            QueueError::Io { path, source } => StatusError::Io { path, source },
+            other => {
+                StatusError::Io { path: path.clone(), source: io::Error::other(other.to_string()) }
+            }
+        })?;
         entries.push(parsed);
     }
     Ok(entries)
@@ -304,7 +298,13 @@ fn pick_last_success(delivered: &[ClipQueueEntry]) -> Option<SuccessSnapshot> {
 fn pick_last_failure(delivered: &[ClipQueueEntry]) -> Option<FailureSnapshot> {
     delivered
         .iter()
-        .filter(|e| e.outcome == Some(Outcome::Undeliverable) || e.last_error.is_some())
+        // PS-24: only an `Undeliverable` outcome is a failure. The earlier
+        // `|| e.last_error.is_some()` disjunct trusted an invariant maintained
+        // elsewhere (the success path clears `last_error` before
+        // `transition_delivered`); if that ever regressed, a `Delivered` entry
+        // with a stale error would be mis-surfaced. The `map_or_else` fallback
+        // below already handles a missing error string.
+        .filter(|e| e.outcome == Some(Outcome::Undeliverable))
         .filter(|e| e.delivered_at.is_some() || e.last_attempt_at.is_some())
         .max_by_key(|e| e.delivered_at.or(e.last_attempt_at).expect("filter above"))
         .map(|e| {
@@ -575,6 +575,40 @@ mod tests {
         let picked = pick_last_success(&[a, b, c]).unwrap();
         assert_eq!(picked.clip_id, "b");
         assert_eq!(picked.classify_status, Some(ClassifyTaskStatus::Success));
+    }
+
+    #[test]
+    fn pick_last_failure_ignores_delivered_with_stale_error() {
+        // PS-24 hardening: a `Delivered` entry that somehow carries a stale
+        // `last_error` must not be surfaced as the last failure. Only an
+        // `Undeliverable` outcome counts — the success path clears
+        // `last_error`, so this state is unreachable today, but the filter
+        // must not depend on that invariant being maintained elsewhere.
+        let mut e = ClipQueueEntry::new("a", instant("2026-05-27T06:00:00Z"), Utc::now(), 1);
+        e.outcome = Some(Outcome::Delivered);
+        e.delivered_at = Some(instant("2026-05-27T06:00:00Z"));
+        e.last_error = Some(crate::queue::LastError {
+            kind: "network".into(),
+            status: None,
+            message: "stale".into(),
+        });
+        assert!(pick_last_failure(&[e]).is_none());
+    }
+
+    #[test]
+    fn pick_last_failure_picks_undeliverable() {
+        // The genuine failure path: an Undeliverable entry is still surfaced.
+        let mut e = ClipQueueEntry::new("b", instant("2026-05-27T07:00:00Z"), Utc::now(), 1);
+        e.outcome = Some(Outcome::Undeliverable);
+        e.delivered_at = Some(instant("2026-05-27T07:00:00Z"));
+        e.last_error = Some(crate::queue::LastError {
+            kind: "http_status".into(),
+            status: Some(422),
+            message: "rejected".into(),
+        });
+        let picked = pick_last_failure(&[e]).expect("undeliverable is a failure");
+        assert_eq!(picked.clip_id, "b");
+        assert_eq!(picked.status, Some(422));
     }
 
     #[test]

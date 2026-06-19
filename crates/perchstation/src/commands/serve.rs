@@ -212,45 +212,63 @@ fn spawn_capture_task(
     use perchstation_core::queue::inbox::StoreInbox;
     use perchstation_core::queue::policy::{PolicyInbox, QueuePolicy};
     use perchstation_hw::camera_recorder::LibcameraVidCamera;
+    use perchstation_hw::capture_config::CaptureHwConfig;
     use perchstation_hw::motion_sensor::GpioMotionSensor;
 
     // Purge failed earlier — `capture.init_failed` was already logged in
     // `run`. Do not spawn the supervisor; delivery continues regardless.
     let purge_report = purge_report?;
-    let policy = QueuePolicy::from(&config.queue);
-    let inbox = Arc::new(PolicyInbox::new(StoreInbox::new(store.clone()), store, policy));
 
-    let sensor = match GpioMotionSensor::new(
-        &config.capture.sensor_gpiochip,
-        config.capture.sensor_line,
-        config.capture.sensor_active_high,
-    ) {
-        Ok(s) => s,
+    // Decode the hardware-specific `[capture]` knobs that core carried
+    // opaquely (PS-29/PS-30). A malformed or mistyped hardware key disables
+    // the capture loop (delivery continues, FR-012) rather than panicking.
+    let hw = match CaptureHwConfig::from_table(&config.capture.hardware)
+        .map_err(|err| err.to_string())
+        .and_then(|hw| hw.validate().map(|()| hw))
+    {
+        Ok(hw) => hw,
         Err(err) => {
-            // Capture failure must not block delivery (FR-012). Log a
-            // warning so an operator on real hardware sees the
-            // misconfiguration; on dev hosts without /dev/gpiochip0
-            // this is the expected path.
             tracing::warn!(
                 event = obs_tracing::events::CAPTURE_INIT_FAILED,
-                reason = "sensor_open_failed",
+                reason = "hardware_config_invalid",
                 error = %err,
-                chip = %config.capture.sensor_gpiochip.display(),
-                line = config.capture.sensor_line,
-                "capture loop not started: motion sensor unavailable",
+                "capture loop not started: invalid [capture] hardware config",
             );
             return None;
         }
     };
 
+    let policy = QueuePolicy::from(&config.queue);
+    let inbox = Arc::new(PolicyInbox::new(StoreInbox::new(store.clone()), store, policy));
+
+    let sensor =
+        match GpioMotionSensor::new(&hw.sensor_gpiochip, hw.sensor_line, hw.sensor_active_high) {
+            Ok(s) => s,
+            Err(err) => {
+                // Capture failure must not block delivery (FR-012). Log a
+                // warning so an operator on real hardware sees the
+                // misconfiguration; on dev hosts without /dev/gpiochip0
+                // this is the expected path.
+                tracing::warn!(
+                    event = obs_tracing::events::CAPTURE_INIT_FAILED,
+                    reason = "sensor_open_failed",
+                    error = %err,
+                    chip = %hw.sensor_gpiochip.display(),
+                    line = hw.sensor_line,
+                    "capture loop not started: motion sensor unavailable",
+                );
+                return None;
+            }
+        };
+
     let camera = LibcameraVidCamera::new(
         staging_path,
-        config.capture.camera_width,
-        config.capture.camera_height,
-        config.capture.camera_framerate,
-        config.capture.camera_bitrate_bps,
+        hw.camera_width,
+        hw.camera_height,
+        hw.camera_framerate,
+        hw.camera_bitrate_bps,
     )
-    .with_binary(config.capture.camera_command.clone());
+    .with_binary(hw.camera_command.clone());
 
     let state = Arc::new(CaptureState::new());
     let capture = Capture::new(

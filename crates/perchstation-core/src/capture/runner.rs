@@ -13,7 +13,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
-use crate::capture::cooldown::{CooldownOutcome, CooldownState};
+use crate::capture::cooldown::CooldownState;
 use crate::capture::liveness::{
     DegradedKind, SensorLiveness, SensorLivenessTracker, SensorLivenessTransition,
 };
@@ -246,7 +246,7 @@ impl Capture {
                 sensor_liveness = snapshot,
                 "trigger arrived while sensor is degraded",
             );
-            self.start_cooldown(CooldownOutcome::DegradedSkip);
+            self.start_cooldown();
             return;
         }
 
@@ -266,7 +266,7 @@ impl Capture {
                     "disk_pressure",
                     format!("{}/{} bytes", bytes, self.config.max_staging_bytes),
                 );
-                self.start_cooldown(CooldownOutcome::DiskPressureSkip);
+                self.start_cooldown();
                 return;
             }
             Ok(_) => {}
@@ -336,7 +336,7 @@ impl Capture {
             "config_overflow",
             "clip_duration + hang_margin overflow".to_string(),
         );
-        self.start_cooldown(CooldownOutcome::Failed);
+        self.start_cooldown();
     }
 
     fn handle_recording_failed(&mut self, recording_id: &str, err: &CameraError) {
@@ -348,7 +348,7 @@ impl Capture {
             "capture recording failed",
         );
         self.state.record_failure(self.clock.now(), "recording_failed", err.to_string());
-        self.start_cooldown(CooldownOutcome::Failed);
+        self.start_cooldown();
     }
 
     fn handle_recording_empty(&mut self, recording_id: &str, path: &std::path::Path) {
@@ -360,7 +360,7 @@ impl Capture {
             "capture recording produced no bytes",
         );
         self.state.record_failure(self.clock.now(), "recording_failed", "empty clip".to_string());
-        self.start_cooldown(CooldownOutcome::Failed);
+        self.start_cooldown();
     }
 
     fn handle_recording_hung(&mut self, recording_id: &str, max_duration: Duration) {
@@ -372,7 +372,7 @@ impl Capture {
             "camera adapter hung past clip duration + hang margin",
         );
         self.state.record_failure(self.clock.now(), "camera_hang", format!("{max_duration_ms} ms"));
-        self.start_cooldown(CooldownOutcome::Failed);
+        self.start_cooldown();
     }
 
     async fn submit_clip(
@@ -397,7 +397,7 @@ impl Capture {
                     "capture recording completed",
                 );
                 self.state.record_success(entry.clip_id.clone(), triggered_at);
-                self.start_cooldown(CooldownOutcome::Submitted);
+                self.start_cooldown();
             }
             Err(InboxError::QueueFull { current_clips, max_clips, current_bytes, max_bytes }) => {
                 let _ = std::fs::remove_file(&clip_path);
@@ -416,7 +416,7 @@ impl Capture {
                     "queue_full",
                     format!("{current_clips}/{max_clips} clips, {current_bytes}/{max_bytes} bytes"),
                 );
-                self.start_cooldown(CooldownOutcome::QueueRefused);
+                self.start_cooldown();
             }
             Err(InboxError::Queue(err)) => {
                 let _ = std::fs::remove_file(&clip_path);
@@ -428,13 +428,13 @@ impl Capture {
                     "queue I/O error during submit",
                 );
                 self.state.record_failure(self.clock.now(), "queue_io", err.to_string());
-                self.start_cooldown(CooldownOutcome::QueueRefused);
+                self.start_cooldown();
             }
         }
     }
 
-    fn start_cooldown(&mut self, outcome: CooldownOutcome) {
-        self.cooldown.start_after(self.clock.now(), self.config.cooldown_secs, outcome);
+    fn start_cooldown(&mut self) {
+        self.cooldown.start_after(self.clock.now(), self.config.cooldown_secs);
     }
 }
 

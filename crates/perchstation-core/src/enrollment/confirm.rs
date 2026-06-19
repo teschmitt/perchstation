@@ -20,11 +20,12 @@ use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
 use rcgen::KeyPair;
-use reqwest::{Certificate, StatusCode};
+use reqwest::StatusCode;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::perchpub::types::{EnrollmentRequest, EnrollmentResponse, HTTPValidationError};
+use crate::tls::{TlsBuilderError, rustls_builder_with_roots};
 
 /// Successful confirm response, validated end-to-end against the station's
 /// in-memory keypair. The cert and CA chain returned here are what
@@ -236,32 +237,20 @@ async fn attempt_once(
 }
 
 fn build_client(ca_chain_pem: &str) -> Result<reqwest::Client, ConfirmError> {
-    let mut roots = Vec::new();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_chain_pem.as_bytes())) {
-        let cert = cert.map_err(|err| ConfirmError::TlsConfig(format!("parse CA cert: {err}")))?;
-        let reqwest_cert = Certificate::from_der(cert.as_ref())
-            .map_err(|err| ConfirmError::TlsConfig(format!("convert CA cert: {err}")))?;
-        roots.push(reqwest_cert);
-    }
-    if roots.is_empty() {
-        return Err(ConfirmError::CaChainEmpty);
-    }
-
-    let mut builder = reqwest::Client::builder()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
-        .https_only(true)
-        // Never follow redirects: a 307/308 preserves method + body, which
-        // would re-POST the bearer auth_token + CSR to whatever host the
-        // server names in Location. https_only constrains the scheme, not
-        // the host. Mirrors the mTLS client in perchpub::client.
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30));
-    for cert in roots {
-        builder = builder.add_root_certificate(cert);
-    }
-    builder.build().map_err(|err| ConfirmError::TlsConfig(err.to_string()))
+    // Shared hardened rustls base (PS-31): rustls backend, no platform roots,
+    // TLS >= 1.2, HTTPS-only, no redirect following, CA pinned. The confirm
+    // client presents no identity (plain TLS) and uses a 30-second timeout.
+    // The no-redirect policy is essential here: a 307/308 preserves method +
+    // body, so following it would re-POST the bearer auth_token + CSR to
+    // whatever host the server names in Location.
+    let builder = rustls_builder_with_roots(ca_chain_pem.as_bytes()).map_err(|err| match err {
+        TlsBuilderError::EmptyRoots => ConfirmError::CaChainEmpty,
+        TlsBuilderError::Parse(message) => ConfirmError::TlsConfig(message),
+    })?;
+    builder
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| ConfirmError::TlsConfig(err.to_string()))
 }
 
 fn validate_response(

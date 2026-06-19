@@ -218,7 +218,7 @@ impl DeliveryRunner {
             "delivery attempt started",
         );
 
-        let mp4_path = self.store.inflight_dir().join(format!("{clip_id}.mp4"));
+        let mp4_path = self.store.inflight_dir().join(QueueStore::media_name(&clip_id));
 
         // Pre-flight: zero-length or unreadable → emit warning and mark
         // the entry undeliverable without sending bytes (FR-013, T049).

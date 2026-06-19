@@ -114,15 +114,16 @@ impl Default for RetryConfig {
     }
 }
 
-/// `[capture]` section — knobs that tune the motion-triggered capture loop.
+/// `[capture]` section — the platform-agnostic knobs that tune the
+/// motion-triggered capture supervisor.
 ///
 /// Defaults from research.md R-4 (cooldown, clip duration), R-7
 /// (`max_staging_bytes`), and R-10 (assembled view). The hardware-specific
-/// `sensor_*` and `camera_*` fields are only consumed by the production
-/// adapters in `perchstation-hw`; the platform-agnostic capture supervisor
-/// in `perchstation-core` does not see them.
+/// `sensor_*` / `camera_*` keys are NOT modelled here — they flatten into
+/// [`CaptureConfig::hardware`] as an opaque table and are decoded by the
+/// production adapters in `perchstation-hw` (`CaptureHwConfig`), keeping
+/// hardware concerns out of the platform-agnostic core (PS-29/PS-30).
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CaptureConfig {
     #[serde(default = "default_clip_duration_secs")]
     pub clip_duration_secs: u64,
@@ -136,30 +137,13 @@ pub struct CaptureConfig {
     pub liveness_poll_secs: u64,
     #[serde(default = "default_max_staging_bytes")]
     pub max_staging_bytes: u64,
-    #[serde(default = "default_sensor_gpiochip")]
-    pub sensor_gpiochip: PathBuf,
-    #[serde(default = "default_sensor_line")]
-    pub sensor_line: u32,
-    #[serde(default = "default_sensor_active_high")]
-    pub sensor_active_high: bool,
-    #[serde(default = "default_camera_width")]
-    pub camera_width: u32,
-    #[serde(default = "default_camera_height")]
-    pub camera_height: u32,
-    #[serde(default = "default_camera_framerate")]
-    pub camera_framerate: u32,
-    #[serde(default = "default_camera_bitrate_bps")]
-    pub camera_bitrate_bps: u64,
-    /// External binary the recorder shells out to for motion clips
-    /// (`perchstation serve`). Defaults to the current Pi OS name
-    /// `rpicam-vid`; set to `libcamera-vid` on older images.
-    #[serde(default = "default_camera_command")]
-    pub camera_command: PathBuf,
-    /// External binary the enrollment QR still-capture shells out to
-    /// (`enroll --qr-source camera`). Defaults to `rpicam-still`; set to
-    /// `libcamera-still` on older images.
-    #[serde(default = "default_camera_still_command")]
-    pub camera_still_command: PathBuf,
+    /// Hardware-specific `[capture]` knobs (sensor GPIO + camera) carried
+    /// opaquely so the platform-agnostic core never interprets them. The
+    /// production `sensor_*` / `camera_*` keys flatten in here and are decoded
+    /// by `perchstation-hw`'s `CaptureHwConfig` at the wiring layer
+    /// (PS-29/PS-30). Empty for a config with no hardware overrides.
+    #[serde(flatten)]
+    pub hardware: toml::Table,
 }
 
 impl Default for CaptureConfig {
@@ -171,15 +155,7 @@ impl Default for CaptureConfig {
             liveness_stuck_secs: default_liveness_stuck_secs(),
             liveness_poll_secs: default_liveness_poll_secs(),
             max_staging_bytes: default_max_staging_bytes(),
-            sensor_gpiochip: default_sensor_gpiochip(),
-            sensor_line: default_sensor_line(),
-            sensor_active_high: default_sensor_active_high(),
-            camera_width: default_camera_width(),
-            camera_height: default_camera_height(),
-            camera_framerate: default_camera_framerate(),
-            camera_bitrate_bps: default_camera_bitrate_bps(),
-            camera_command: default_camera_command(),
-            camera_still_command: default_camera_still_command(),
+            hardware: toml::Table::new(),
         }
     }
 }
@@ -273,15 +249,10 @@ impl Config {
         if self.capture.liveness_poll_secs == 0 {
             return Err(oor("capture.liveness_poll_secs", "must be >= 1"));
         }
-
-        // Camera binaries must be nameable — an empty command can only ever
-        // fail at spawn time, so reject it up front like the other knobs.
-        if self.capture.camera_command.as_os_str().is_empty() {
-            return Err(oor("capture.camera_command", "must not be empty"));
-        }
-        if self.capture.camera_still_command.as_os_str().is_empty() {
-            return Err(oor("capture.camera_still_command", "must not be empty"));
-        }
+        // The hardware-specific `[capture]` knobs (sensor GPIO + camera) are
+        // not validated here — they live in `config.capture.hardware` as an
+        // opaque table and are decoded + validated by `perchstation-hw`'s
+        // `CaptureHwConfig` at the wiring layer (PS-29).
 
         // Retry / backoff. `per_clip_max_wallclock_hours` is capped so the
         // `* 3600` conversion cannot overflow `u64`; the delay ceiling is
@@ -368,42 +339,6 @@ const fn default_liveness_poll_secs() -> u64 {
 
 const fn default_max_staging_bytes() -> u64 {
     256 * 1024 * 1024
-}
-
-fn default_sensor_gpiochip() -> PathBuf {
-    PathBuf::from("/dev/gpiochip0")
-}
-
-const fn default_sensor_line() -> u32 {
-    17
-}
-
-const fn default_sensor_active_high() -> bool {
-    true
-}
-
-const fn default_camera_width() -> u32 {
-    1280
-}
-
-const fn default_camera_height() -> u32 {
-    720
-}
-
-const fn default_camera_framerate() -> u32 {
-    30
-}
-
-const fn default_camera_bitrate_bps() -> u64 {
-    4_000_000
-}
-
-fn default_camera_command() -> PathBuf {
-    PathBuf::from("rpicam-vid")
-}
-
-fn default_camera_still_command() -> PathBuf {
-    PathBuf::from("rpicam-still")
 }
 
 #[cfg(test)]
@@ -554,20 +489,27 @@ mod tests {
     }
 
     #[test]
-    fn capture_camera_commands_default_to_rpicam() {
-        let cfg = Config::default();
-        assert_eq!(cfg.capture.camera_command, PathBuf::from("rpicam-vid"));
-        assert_eq!(cfg.capture.camera_still_command, PathBuf::from("rpicam-still"));
+    fn capture_hardware_keys_flatten_into_opaque_table() {
+        // PS-29/PS-30: the hardware-specific `[capture]` keys are not modelled
+        // in core; they flatten into the opaque `hardware` table for the hw
+        // layer to decode, while the agnostic knobs deserialize normally.
+        let cfg = Config::from_toml_str(
+            "[capture]\nclip_duration_secs = 9\nsensor_line = 22\ncamera_command = \"libcamera-vid\"\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.capture.clip_duration_secs, 9);
+        assert_eq!(cfg.capture.hardware["sensor_line"].as_integer(), Some(22));
+        assert_eq!(cfg.capture.hardware["camera_command"].as_str(), Some("libcamera-vid"));
+        // An agnostic knob is consumed by the typed fields, not duplicated into
+        // the opaque hardware table.
+        assert!(!cfg.capture.hardware.contains_key("clip_duration_secs"));
     }
 
     #[test]
-    fn capture_camera_commands_are_overridable() {
-        let cfg = Config::from_toml_str(
-            "[capture]\ncamera_command = \"libcamera-vid\"\ncamera_still_command = \"libcamera-still\"\n",
-        )
-        .expect("parses");
-        assert_eq!(cfg.capture.camera_command, PathBuf::from("libcamera-vid"));
-        assert_eq!(cfg.capture.camera_still_command, PathBuf::from("libcamera-still"));
+    fn default_capture_carries_empty_hardware_table() {
+        // The shipped default has no hardware overrides; the hw layer supplies
+        // the `/dev/gpiochip0` + `rpicam-*` defaults from an empty table.
+        assert!(Config::default().capture.hardware.is_empty());
     }
 
     #[test]
@@ -592,16 +534,6 @@ mod tests {
         assert!(matches!(
             cfg.validate(),
             Err(ConfigError::OutOfRange { field: "queue.delivered_retention_hours", .. })
-        ));
-    }
-
-    #[test]
-    fn validate_rejects_empty_camera_command() {
-        let mut cfg = Config::default();
-        cfg.capture.camera_command = PathBuf::new();
-        assert!(matches!(
-            cfg.validate(),
-            Err(ConfigError::OutOfRange { field: "capture.camera_command", .. })
         ));
     }
 }

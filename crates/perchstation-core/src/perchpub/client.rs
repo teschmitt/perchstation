@@ -24,20 +24,22 @@
 //! Credentials can be hot-reloaded after re-enrollment via
 //! [`PerchpubClient::reload`] (PS-18) — no `serve` restart required.
 
-use std::io::{self, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::header;
-use reqwest::{Body, Certificate, Client, Identity, StatusCode, Url};
+use reqwest::{Body, Client, Identity, StatusCode, Url};
 use thiserror::Error;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::identity::{CA_CHAIN_FILE, CREDENTIALS_DIR, STATION_CERT_FILE, STATION_KEY_FILE};
 use crate::perchpub::types::ClassifyTaskPublic;
+use crate::queue::store::QueueStore;
+use crate::tls::{TlsBuilderError, rustls_builder_with_roots};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -129,39 +131,23 @@ fn build_inner(creds: &Path) -> Result<Client, ClientError> {
     let identity = Identity::from_pem(&identity_pem)
         .map_err(|err| ClientError::TlsConfig(format!("identity: {err}")))?;
 
-    let mut roots: Vec<Certificate> = Vec::new();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_slice())) {
-        let cert = cert.map_err(|err| ClientError::TlsConfig(format!("parse CA cert: {err}")))?;
-        let reqwest_cert = Certificate::from_der(cert.as_ref())
-            .map_err(|err| ClientError::TlsConfig(format!("convert CA cert: {err}")))?;
-        roots.push(reqwest_cert);
-    }
-    if roots.is_empty() {
-        return Err(ClientError::TlsConfig(format!(
-            "`{}` contained no certificates",
-            ca_path.display()
-        )));
-    }
+    // Shared hardened rustls base (PS-31): rustls backend, no platform roots,
+    // TLS >= 1.2, HTTPS-only, no redirect following, CA pinned. The mTLS
+    // client layers on its station identity and a 1-minute request timeout.
+    // The no-redirect policy (SC-007 / T060) catches server-driven URL swaps;
+    // the allowlist gate (`check_authority`) catches caller-built URLs.
+    let builder = rustls_builder_with_roots(&ca_pem).map_err(|err| match err {
+        TlsBuilderError::EmptyRoots => {
+            ClientError::TlsConfig(format!("`{}` contained no certificates", ca_path.display()))
+        }
+        TlsBuilderError::Parse(message) => ClientError::TlsConfig(message),
+    })?;
 
-    let mut builder = Client::builder()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .min_tls_version(reqwest::tls::Version::TLS_1_2)
-        .https_only(true)
+    builder
         .identity(identity)
-        // SC-007 / T060: redirects are not followed. A 3xx response
-        // from perchpub becomes a plain HTTP status the caller sees,
-        // not a transparent reconnect to a possibly-rogue Location.
-        // The allowlist gate (`check_authority`) catches caller-
-        // constructed URLs; this no-redirect policy catches
-        // server-driven URL swaps.
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_mins(1));
-    for root in roots {
-        builder = builder.add_root_certificate(root);
-    }
-
-    builder.build().map_err(|err| ClientError::TlsConfig(err.to_string()))
+        .timeout(Duration::from_mins(1))
+        .build()
+        .map_err(|err| ClientError::TlsConfig(err.to_string()))
 }
 
 impl PerchpubClient {
@@ -233,7 +219,7 @@ impl PerchpubClient {
 
         let body = Body::wrap_stream(ReaderStream::new(file));
         let part = reqwest::multipart::Part::stream_with_length(body, byte_size)
-            .file_name(format!("{clip_id}.mp4"))
+            .file_name(QueueStore::media_name(clip_id))
             .mime_str("video/mp4")
             .map_err(|err| ClientError::TlsConfig(format!("mime: {err}")))?;
         let form = reqwest::multipart::Form::new().part("file", part);

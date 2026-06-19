@@ -18,6 +18,8 @@ thiserror         = { workspace = true }
 tracing           = { workspace = true }
 async-trait       = { workspace = true }
 tempfile          = { workspace = true }
+serde             = { workspace = true }
+toml              = { workspace = true }
 
 # Linux-only GPIO character-device binding (research.md R-2). Production-only;
 # the capture-loop traits live in perchstation-core and are exercised host-side

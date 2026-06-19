@@ -28,7 +28,7 @@ use crate::observability::tracing as obs_tracing;
 use crate::perchpub::client::{ClientError, PerchpubClient};
 use crate::perchpub::types::{ClassifyTaskStatus, ObservationPublic};
 use crate::queue::policy::prune_delivered;
-use crate::queue::store::QueueStore;
+use crate::queue::store::{QueueStore, read_sidecar};
 use crate::queue::{ClipQueueEntry, QueueError};
 
 use super::cancellable_sleep;
@@ -190,29 +190,16 @@ impl ClassifyPoller {
             {
                 continue;
             }
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    // Per-file I/O error (e.g. a concurrent prune removed it).
-                    // Skip; do not abort the whole scan.
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "skipping unreadable delivered sidecar",
-                    );
-                    continue;
-                }
-            };
-            let mut entry: ClipQueueEntry = match serde_json::from_slice(&bytes) {
+            let mut entry = match read_sidecar(&path) {
                 Ok(entry) => entry,
-                Err(err) => {
+                Err(QueueError::Deserialise { source, .. }) => {
                     // PS-02: a single corrupt sidecar must not wedge the
                     // classify poller forever. Quarantine it so the scan
                     // head advances permanently.
                     tracing::warn!(
                         event = obs_tracing::events::QUEUE_CORRUPT_SIDECAR,
                         path = %path.display(),
-                        error = %err,
+                        error = %source,
                         "quarantining corrupt delivered sidecar",
                     );
                     if let Err(qerr) = self.store.quarantine_corrupt(&path) {
@@ -222,6 +209,16 @@ impl ClassifyPoller {
                             "failed to quarantine corrupt delivered sidecar",
                         );
                     }
+                    continue;
+                }
+                Err(err) => {
+                    // Per-file I/O error (e.g. a concurrent prune removed it).
+                    // Skip; do not abort the whole scan.
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "skipping unreadable delivered sidecar",
+                    );
                     continue;
                 }
             };

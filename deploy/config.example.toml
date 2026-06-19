@@ -77,6 +77,12 @@ liveness_poll_secs = 5
 # gate). Completed clips are handed straight to the delivery queue
 # and never accumulate here in steady state.
 max_staging_bytes = 268_435_456  # 256 MiB
+
+# --- Hardware-specific knobs (sensor GPIO + camera) -----------------------
+# These keys stay under [capture] but are platform-specific: the
+# platform-agnostic core carries them opaquely and only the production
+# adapters in perchstation-hw interpret them. Unknown keys here are rejected
+# when the capture loop starts.
 # Path to the Linux gpiochip character device the motion sensor is
 # wired to. Almost always `/dev/gpiochip0` on a Pi.
 sensor_gpiochip = "/dev/gpiochip0"

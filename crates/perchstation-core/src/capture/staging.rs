@@ -96,24 +96,15 @@ pub fn purge(staging_dir: &Path) -> io::Result<PurgeReport> {
 /// Returns `0` if the directory does not exist yet (the supervisor
 /// creates it during the startup purge).
 pub fn staging_bytes(staging_dir: &Path) -> io::Result<u64> {
-    let read = match fs::read_dir(staging_dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => return Err(err),
-    };
-    let mut total: u64 = 0;
-    for entry in read {
-        let entry = entry?;
-        let metadata = match entry.metadata() {
-            Ok(m) => m,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Ok(total)
+    // PS-31: share the one `read_dir` + saturating-fold scanner. Each regular
+    // file contributes its size; a file that vanished mid-scan, and any
+    // non-file entry, contributes 0.
+    crate::fsutil::sum_dir(staging_dir, |entry| match entry.metadata() {
+        Ok(m) if m.is_file() => Ok(m.len()),
+        Ok(_) => Ok(0),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err),
+    })
 }
 
 #[cfg(test)]

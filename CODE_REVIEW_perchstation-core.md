@@ -50,15 +50,15 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 
 **Observability**
 - [ ] PS-26 — `RedactingWriter` clones the secrets `Vec` on every log line *(Low)*
-- [ ] PS-24 — `pick_last_failure` filter fragility *(Low — STALE, hardening only)*
+- [x] PS-24 — `pick_last_failure` filter fragility *(Low — STALE, hardening only)*
 
 **Conventions, portability & cleanup**
-- [ ] PS-28 — top-level `std::os::unix` import makes core non-portable *(Cleanup)*
-- [ ] PS-29 — hardware `sensor_*`/`camera_*` fields in core config *(Cleanup)*
-- [ ] PS-30 — `/dev/gpiochip0` default hardcoded in core *(Cleanup)*
-- [ ] PS-31 — duplicated logic (clip-path, sidecar read, TLS builder, dir tally) *(Cleanup)*
-- [ ] PS-32 — dead crate-level `Error` enum + `Result` alias *(Cleanup)*
-- [ ] PS-33 — cooldown `last_outcome` write-only; doc comment is false *(Cleanup)*
+- [x] PS-28 — top-level `std::os::unix` import makes core non-portable *(Cleanup)*
+- [x] PS-29 — hardware `sensor_*`/`camera_*` fields in core config *(Cleanup)*
+- [x] PS-30 — `/dev/gpiochip0` default hardcoded in core *(Cleanup)*
+- [x] PS-31 — duplicated logic (clip-path, sidecar read, TLS builder, dir tally) *(Cleanup)*
+- [x] PS-32 — dead crate-level `Error` enum + `Result` alias *(Cleanup)*
+- [x] PS-33 — cooldown `last_outcome` write-only; doc comment is false *(Cleanup)*
 
 ## Summary
 
@@ -571,7 +571,7 @@ fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
 **Tests:** tracing.rs `mod tests`: `empty_registry_write_passes_through_untouched`; `len_counter_tracks_register_dedup` (register twice + empty → count == 1); keep a scrub test proving non-empty still redacts. Assert via the public `scrub()` + counter rather than real stderr.
 
 ## PS-24 — `pick_last_failure` filter fragility (**STALE — not a live bug**)
-**Severity:** Low · **Effort:** S · **Confidence:** plausible · **Status:** STALE (defensive hardening only)
+**Severity:** Low · **Effort:** S · **Confidence:** plausible · **Status:** done (hardening applied; was STALE — not a live bug)
 **Files:** `crates/perchstation-core/src/observability/status.rs:304-318`; `crates/perchstation-core/src/delivery/runner.rs:176-195`
 
 ```rust
@@ -591,7 +591,7 @@ fn pick_last_failure(delivered: &[ClipQueueEntry]) -> Option<FailureSnapshot> {
 # Conventions, portability & cleanup
 
 ## PS-28 — top-level `std::os::unix` import makes core non-portable
-**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/identity.rs:17-20,242-253`
 
 ```rust
@@ -604,7 +604,7 @@ use std::os::unix::fs::OpenOptionsExt;   // top-level, non-cfg-gated; used by .m
 **Tests:** No new behavioural test required; verify with a non-unix `cargo check`. If `write_mode` is split, gate `save_writes_all_four_files_with_correct_modes` (379-415) `#[cfg(unix)]`.
 
 ## PS-29 — hardware `sensor_*`/`camera_*` fields live in platform-agnostic core config
-**Severity:** Cleanup · **Effort:** L · **Confidence:** confirmed · **Status:** todo
+**Severity:** Cleanup · **Effort:** L · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/config.rs:109-145`
 **Depends on:** PS-30 (the `/dev/gpiochip0` default rides along)
 
@@ -620,7 +620,7 @@ use std::os::unix::fs::OpenOptionsExt;   // top-level, non-cfg-gated; used by .m
 **Tests:** A parse round-trip test in `perchstation-hw` proving the relocated config deserializes the `sensor_*`/`camera_*` keys with prior defaults. In core config.rs, assert `CaptureConfig` no longer exposes the hardware fields. Verify `deploy/config.example.toml` still parses end-to-end.
 
 ## PS-30 — `/dev/gpiochip0` Linux device-node literal hardcoded as a core default
-**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/config.rs:262-264,131-132`
 **Depends on:** PS-29 (clean fix is the shared relocation)
 
@@ -633,7 +633,7 @@ fn default_sensor_gpiochip() -> PathBuf { PathBuf::from("/dev/gpiochip0") }
 **Tests:** Covered by PS-29's hw-side round-trip test. If fixed standalone, a `perchstation-hw` test for the relocated default + confirm core no longer references the literal.
 
 ## PS-31 — duplicated logic that should be centralised
-**Severity:** Cleanup · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Cleanup · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** multi-file — `queue/store.rs:88-89,104,157-160,194,205-208,267-269,319-324`; `queue/policy.rs:107-128,245-262,272-273`; `observability/status.rs:230-264,281-284`; `perchpub/client.rs:114-147,187`; `enrollment/confirm.rs:195-217`; `capture/staging.rs:98-117`; `delivery/classify.rs:101-128`; `delivery/runner.rs:152`
 **Depends on:** PS-02 (the shared sidecar reader funnels corrupt-handling through one place)
 
@@ -647,7 +647,7 @@ fn default_sensor_gpiochip() -> PathBuf { PathBuf::from("/dev/gpiochip0") }
 **Tests:** (a) `media_name`/`sidecar_name` match the on-disk convention + round-trip through transitions. (b) shared `read_sidecar` corrupt-JSON test + regression in classify.rs/status.rs that their own Parse variant still surfaces. (c) shared builder rejects empty CA PEM; existing `new_rejects_empty_ca_chain`/`build_client_rejects_empty_ca_chain` keep passing. (d) extend `staging_bytes` / `bytes_on_disk_sums_*` tests against the unified scanner + a `count_queue` mixed-dir tally test.
 
 ## PS-32 — dead crate-level `Error` enum + `Result` alias
-**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/lib.rs:15-33`
 
 ```rust
@@ -662,7 +662,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 **Tests:** None (pure deletion). Verify via `cargo build/clippy/test --workspace` + the grep returning no hits.
 
 ## PS-33 — cooldown `last_outcome` is write-only; doc comment falsely claims it is surfaced on `capture.cooldown_skip`
-**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Cleanup · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/capture/cooldown.rs:10-12,26,37-46,61-64`; `crates/perchstation-core/src/capture/runner.rs:230-238`
 
 ```rust
