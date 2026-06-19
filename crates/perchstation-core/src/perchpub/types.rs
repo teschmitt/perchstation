@@ -47,6 +47,14 @@ pub enum ClassifyTaskStatus {
     Processing,
     Success,
     Failed,
+    /// Any status string perchpub returns that this station does not model
+    /// (e.g. a future `Cancelled`). PS-06: a 200 carrying an unknown status
+    /// must still deserialise — collapsing it to `Decode → Transient` would
+    /// re-upload an already-accepted clip / poll forever. Stays
+    /// non-terminal so a genuinely-still-running unknown keeps polling
+    /// (bounded by the poller's finite budget).
+    #[serde(other)]
+    Unknown,
 }
 
 impl ClassifyTaskStatus {
@@ -139,6 +147,33 @@ mod tests {
         assert!(!ClassifyTaskStatus::Prepared.is_terminal());
         assert!(!ClassifyTaskStatus::Queued.is_terminal());
         assert!(!ClassifyTaskStatus::Processing.is_terminal());
+        assert!(!ClassifyTaskStatus::Unknown.is_terminal());
+    }
+
+    #[test]
+    fn classify_status_unknown_deserialises() {
+        // An unknown status string (e.g. a future `Cancelled`) must map to
+        // `Unknown`, never fail the whole deserialise (PS-06).
+        let status: ClassifyTaskStatus = serde_json::from_str(r#""Cancelled""#).unwrap();
+        assert_eq!(status, ClassifyTaskStatus::Unknown);
+        assert!(!status.is_terminal());
+    }
+
+    #[test]
+    fn classify_task_public_with_unknown_status_deserialises() {
+        // A full 200 body whose `status` is unmodelled still parses.
+        let json = r#"{
+            "object_name": "clip-1.mp4",
+            "id": "00000000-0000-0000-0000-000000000010",
+            "status": "Cancelled",
+            "upload": {
+                "station_id": "00000000-0000-0000-0000-000000000001",
+                "object_name": "clip-1.mp4"
+            },
+            "observation": null
+        }"#;
+        let task: ClassifyTaskPublic = serde_json::from_str(json).unwrap();
+        assert_eq!(task.status, ClassifyTaskStatus::Unknown);
     }
 
     #[test]

@@ -15,9 +15,13 @@
 //! - any caller-supplied `retry_after_floor` (e.g., the `Retry-After`
 //!   header on 429) acts as a floor on the chosen delay.
 //!
-//! Jitter source: a `nanoseconds`-based crude PRNG. Tests pin
-//! `jitter_fraction = 0.0` for deterministic delays; production gets
-//! enough entropy from the wall-clock variation between retries.
+//! Jitter source (PS-11): seeded from the injected [`Clock`]'s sub-second
+//! nanos — never a direct `chrono::Utc::now()` call — so the scheduler is
+//! fully testable under a `FakeClock`. The mapping is monotonic in those
+//! nanos, which keeps oldest-first delivery intact: the runner schedules
+//! clips sequentially, so a newer clip lands at a later instant (larger
+//! nanos → longer backoff) and the older clip stays ahead. Tests pin
+//! `jitter_fraction = 0.0` for deterministic delays.
 
 use std::time::Duration;
 
@@ -104,6 +108,7 @@ pub fn error_kind(err: &ClientError) -> &'static str {
         ClientError::Http { .. } => "http_status",
         ClientError::Network { .. } => "network",
         ClientError::Decode { .. } => "decode",
+        ClientError::UndecodableSuccess { .. } => "undecodable_success",
         ClientError::OutboundDisallowed { .. } => "outbound_disallowed",
         ClientError::ClipOpen { .. } => "clip_open",
         ClientError::CredentialIo { .. }
@@ -121,7 +126,12 @@ pub fn classify_upload_error(err: &ClientError) -> FailureKind {
     match err {
         ClientError::Http { status, .. } => classify_status(*status),
         ClientError::Network { .. } | ClientError::Decode { .. } => FailureKind::Transient,
-        ClientError::OutboundDisallowed { .. }
+        // PS-06: an undecodable 2xx is terminal for the *upload* path — the
+        // clip is already stored, so the loop must stop. The runner
+        // intercepts this variant and records it delivered (not
+        // undeliverable). The remaining variants are genuine config/IO faults.
+        ClientError::UndecodableSuccess { .. }
+        | ClientError::OutboundDisallowed { .. }
         | ClientError::ClipOpen { .. }
         | ClientError::CredentialIo { .. }
         | ClientError::TlsConfig(_)
@@ -135,12 +145,22 @@ pub fn classify_upload_error(err: &ClientError) -> FailureKind {
 /// poller treats terminal as `classify.lost` rather than `Undeliverable`.
 #[must_use]
 pub fn classify_poll_error(err: &ClientError) -> FailureKind {
-    classify_upload_error(err)
+    match err {
+        // PS-06: on the poll path the classify task already exists; an
+        // undecodable 200 is "poll again" (bounded by the poller's finite
+        // budget), not the permanent "already stored" the upload path means.
+        ClientError::UndecodableSuccess { .. } => FailureKind::Transient,
+        other => classify_upload_error(other),
+    }
 }
 
 const fn classify_status(status: u16) -> FailureKind {
     match status {
-        408 | 425 | 429 | 500 | 502 | 503 | 504 => FailureKind::Transient,
+        // Documented transient HTTP codes (perchpub-api.md §2) plus any 2xx.
+        // PS-22: the 2xx range is defensive — the client now treats every
+        // 2xx as success, so a 2xx reaching here must never be Terminal
+        // (which would drop an accepted clip as Undeliverable).
+        200..=299 | 408 | 425 | 429 | 500 | 502 | 503 | 504 => FailureKind::Transient,
         _ => FailureKind::Terminal,
     }
 }
@@ -174,7 +194,7 @@ impl BackoffSchedule {
         }
 
         let base = self.base_delay(attempt);
-        let jittered = apply_jitter(base, self.jitter_fraction);
+        let jittered = apply_jitter(base, self.jitter_fraction, now);
         let delay = match retry_after_floor {
             Some(floor) if floor > jittered => floor,
             _ => jittered,
@@ -202,16 +222,25 @@ impl BackoffSchedule {
     }
 }
 
-fn apply_jitter(base: Duration, jitter_fraction: f64) -> Duration {
+/// Apply ±`jitter_fraction` jitter to `base`, seeded from the injected
+/// clock's sub-second nanos (PS-11) — never a direct `chrono::Utc::now()`.
+///
+/// The mapping is monotonic in `now`'s nanos (larger nanos → larger delay),
+/// which has two useful properties:
+///
+/// - **Testable** under a `FakeClock`: a fixed `now` yields a fixed delay.
+/// - **Preserves oldest-first** (FR-006): the runner schedules clips
+///   sequentially, so a newer clip is scheduled at a later instant with
+///   larger nanos and thus a longer backoff — keeping the older clip's
+///   `next_attempt_after` first (verified by `outage_recovery`). A per-clip
+///   hash seed was deliberately *not* used: it de-correlates the batch but
+///   reorders age, breaking oldest-first. The injected clock already
+///   de-correlates clips scheduled at distinct instants.
+fn apply_jitter(base: Duration, jitter_fraction: f64, now: DateTime<Utc>) -> Duration {
     if jitter_fraction <= 0.0 {
         return base;
     }
-    // Crude PRNG from nanosecond resolution of `Utc::now()` — coarse
-    // enough that successive calls within the same nanosecond would
-    // share jitter, fine enough that retries spaced by even a millisecond
-    // see different values. Good enough for ±20 % jitter; if a future
-    // change demands real randomness, swap to `getrandom`.
-    let nanos = chrono::Utc::now().timestamp_subsec_nanos();
+    let nanos = now.timestamp_subsec_nanos();
     let normalized = (f64::from(nanos) / 500_000_000.0) - 1.0; // [-1.0, 1.0)
     let factor = 1.0 + normalized.clamp(-1.0, 1.0) * jitter_fraction;
     Duration::from_secs_f64(base.as_secs_f64() * factor.max(0.0))
@@ -304,15 +333,17 @@ mod tests {
 
     #[test]
     fn jitter_stays_inside_pm_20_percent() {
-        let clock = FakeClock::new(fixed_now());
         let mut sched = no_jitter_schedule();
         sched.jitter_fraction = 0.2;
-        // Sample many times; the nanosecond clock varies, so we get a
-        // distribution. Base for attempt=1 is 10 s; envelope is [8, 12].
-        for _ in 0..50 {
-            match sched.schedule(&clock, 1, Some(fixed_now()), None) {
+        // Sweep the sub-second nanos (the jitter entropy source) across a
+        // whole second — no real-clock sleeps (PS-11). Base for attempt=1 is
+        // 10 s; the ±20 % envelope is [8, 12].
+        for step in 0..50_i64 {
+            let now = fixed_now() + chrono::Duration::nanoseconds(step * 20_000_000);
+            let clock = FakeClock::new(now);
+            match sched.schedule(&clock, 1, Some(now), None) {
                 NextAction::Retry(next) => {
-                    let ms = (next - fixed_now()).num_milliseconds();
+                    let ms = (next - now).num_milliseconds();
                     assert!(
                         (8_000..=12_000).contains(&ms),
                         "delay {ms} ms outside ±20 % envelope of 10 s",
@@ -320,8 +351,43 @@ mod tests {
                 }
                 NextAction::Exhausted => panic!("attempt 1 inside budget should retry"),
             }
-            std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn jitter_is_deterministic_under_fake_clock() {
+        // A fixed injected instant must yield byte-identical schedules — no
+        // live-clock entropy (PS-11); this is what lets the loop be tested.
+        let now = fixed_now() + chrono::Duration::nanoseconds(123_456_789);
+        let clock = FakeClock::new(now);
+        let mut sched = no_jitter_schedule();
+        sched.jitter_fraction = 0.2;
+        let a = sched.schedule(&clock, 1, Some(now), None);
+        let b = sched.schedule(&clock, 1, Some(now), None);
+        match (a, b) {
+            (NextAction::Retry(x), NextAction::Retry(y)) => assert_eq!(x, y),
+            other => panic!("expected two retries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jitter_varies_with_subsecond_nanos() {
+        // Distinct injected instants (distinct sub-second nanos) must give
+        // distinct jitter — the de-correlation that stops clips failing at
+        // different moments from synchronising their retries (PS-11). The
+        // mapping is monotonic in nanos, which is what preserves oldest-first.
+        let mut sched = no_jitter_schedule();
+        sched.jitter_fraction = 0.2;
+        let now_a = fixed_now() + chrono::Duration::nanoseconds(100_000_000);
+        let now_b = fixed_now() + chrono::Duration::nanoseconds(700_000_000);
+        let delay = |now| match sched.schedule(&FakeClock::new(now), 1, Some(now), None) {
+            NextAction::Retry(next) => next - now,
+            NextAction::Exhausted => panic!("retry expected"),
+        };
+        assert!(
+            delay(now_a) < delay(now_b),
+            "larger sub-second nanos must give a longer (monotonic) backoff",
+        );
     }
 
     #[test]
@@ -403,5 +469,29 @@ mod tests {
         let mut tweaked = sched;
         tweaked.per_clip_max_wallclock = Duration::from_secs(1);
         assert!(matches!(tweaked.schedule(&clock, 1, None, None), NextAction::Retry(_)));
+    }
+
+    #[test]
+    fn classify_status_2xx_is_not_terminal() {
+        // PS-22: a 2xx that somehow reaches the classifier must never be
+        // Terminal — that would drop an accepted clip as Undeliverable.
+        assert_ne!(classify_status(201), FailureKind::Terminal);
+        assert_ne!(classify_status(204), FailureKind::Terminal);
+    }
+
+    #[test]
+    fn classify_upload_error_undecodable_success_is_terminal() {
+        // PS-06: on the upload path an undecodable-but-accepted 2xx must NOT
+        // be Transient — re-uploading would duplicate an accepted clip.
+        let err = ClientError::UndecodableSuccess { url: "u".into(), message: "m".into() };
+        assert_eq!(classify_upload_error(&err), FailureKind::Terminal);
+    }
+
+    #[test]
+    fn classify_poll_error_undecodable_success_is_transient() {
+        // PS-06: on the poll path the task exists; an undecodable 200 just
+        // means "try again" (bounded by the poller's finite budget).
+        let err = ClientError::UndecodableSuccess { url: "u".into(), message: "m".into() };
+        assert_eq!(classify_poll_error(&err), FailureKind::Transient);
     }
 }

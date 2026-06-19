@@ -143,6 +143,12 @@ pub mod events {
     // Delivery
     pub const DELIVERY_ATTEMPT_STARTED: &str = "delivery.attempt_started";
     pub const DELIVERY_UPLOAD_SUCCEEDED: &str = "delivery.upload_succeeded";
+    /// A 2xx upload whose classify-task body could not be decoded (PS-06):
+    /// perchpub accepted the bytes, but the station could not read the
+    /// classify task, so the clip is recorded `Delivered` with an unknown
+    /// classify status. Distinct from `delivery.upload_succeeded` because it
+    /// carries no `classify_task_id`/`duration_ms`.
+    pub const DELIVERY_UPLOAD_UNDECODABLE: &str = "delivery.upload_undecodable";
     pub const DELIVERY_UPLOAD_TRANSIENT: &str = "delivery.upload_transient";
     pub const DELIVERY_UPLOAD_TERMINAL: &str = "delivery.upload_terminal";
     pub const DELIVERY_ATTEMPTS_EXHAUSTED: &str = "delivery.attempts_exhausted";
@@ -157,6 +163,10 @@ pub mod events {
     pub const SERVICE_READY: &str = "service.ready";
     pub const SERVICE_SHUTDOWN: &str = "service.shutdown";
     pub const SERVICE_CONFIG_INVALID: &str = "service.config_invalid";
+    /// SIGHUP-triggered hot reload of the on-disk mTLS credentials after a
+    /// re-enrollment, so the running delivery/classify workers present the
+    /// new station cert without a `serve` restart (PS-18).
+    pub const SERVICE_CREDENTIALS_RELOADED: &str = "service.credentials_reloaded";
     /// A supervised worker task ended unexpectedly (panic or non-cancellation
     /// error). The wrapper logs this and intentionally lets the other tasks
     /// keep running so a capture-side fault cannot stop delivery (and vice

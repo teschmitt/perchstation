@@ -24,9 +24,9 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 - [x] PS-21 — eviction-reason mislabel when both ceilings breach *(Low)*
 
 **Delivery, retry & backoff**
-- [ ] PS-06 — a 200 with undecodable body / unknown status → re-upload / infinite poll *(High)*
+- [x] PS-06 — a 200 with undecodable body / unknown status → re-upload / infinite poll *(High)*
 - [x] PS-08 — no numeric config validation → downstream overflow panics *(Medium)*
-- [ ] PS-11 — jitter bypasses the injected `Clock` → retry storms + untestable *(Medium)*
+- [x] PS-11 — jitter bypasses the injected `Clock` → retry storms + untestable *(Medium)*
 - [x] PS-12 — disk-full backoff defaults to 1 hour *(Medium)*
 - [x] PS-25 — `delivered/` never pruned → unbounded re-scan every tick *(Medium)*
 - [x] PS-27 — `apply_policy` runs synchronous all-sidecar reads on the reactor *(Medium)*
@@ -267,7 +267,7 @@ let reason = if clips + 1 > policy.max_clips {
 # Delivery, retry & backoff
 
 ## PS-06 — a 200 with undecodable body / unknown `ClassifyTaskStatus` → Transient → re-upload / infinite poll
-**Severity:** High · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** High · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/delivery/retry.rs:107-118`; `crates/perchstation-core/src/perchpub/types.rs:43-58`; `crates/perchstation-core/src/perchpub/client.rs:196-213`
 
 ```rust
@@ -314,7 +314,7 @@ Duration::from_secs_f64(capped.max(0.0))
 **Notes:** `multiplier`/`jitter_fraction` are hardcoded R-7 constants (retry.rs:31-34), not operator inputs.
 
 ## PS-11 — `apply_jitter` calls `chrono::Utc::now()` directly, bypassing the injected `Clock`
-**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/delivery/retry.rs:188-201` (jitter), `:144-165` (schedule)
 
 ```rust
@@ -406,7 +406,7 @@ tokio::spawn(async move {
 # Perchpub wire client
 
 ## PS-16 — response body read with no size cap → OOM on a Pi
-**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Medium · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/perchpub/client.rs:129-142,197-213,225-241`
 
 ```rust
@@ -420,7 +420,7 @@ response.json::<ClassifyTaskPublic>().await.map_err(...)          // success pat
 **Tests:** Stand up a loopback fake perchpub with a cert chaining to the test CA from `write_credentials`; (1) endpoint returns a body larger than the cap → error (Decode/new TooLarge) without OOM; (2) a normal small 200 `ClassifyTaskPublic` still decodes. If a TLS fake is too heavy, factor a `read_capped(response, max) -> Result<Vec<u8>, ClientError>` free function and unit-test it.
 
 ## PS-18 — `PerchpubClient` caches TLS identity for the process lifetime; re-enrollment needs a serve restart
-**Severity:** Low · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Low · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/perchpub/client.rs:88-154`
 
 **Problem:** `PerchpubClient::new` reads `station.crt`/`station.key`/`ca_chain.pem` exactly once and bakes them into the `reqwest::Client` (`inner`), which caches the TLS identity + root store for its lifetime. No `reload()`, no filesystem watch; the struct is `Clone` (Arc) so clones share the stale identity.
@@ -429,7 +429,7 @@ response.json::<ClassifyTaskPublic>().await.map_err(...)          // success pat
 **Tests:** (A) doc/comment + an entry in `deploy/RELEASE-CHECKLIST.md`. (B) client.rs: `write_credentials`, build, capture `authority()`, rewrite credentials with a fresh CA/leaf, `reload()` → `Ok` and `authority()` unchanged; negative `reload()` against an empty `ca_chain.pem` → `Err(TlsConfig)` without poisoning the existing client.
 
 ## PS-22 — 2xx-other status (201/202/204) collapsed to Terminal → clip wrongly marked `Undeliverable`
-**Severity:** Low · **Effort:** S · **Confidence:** plausible · **Status:** todo
+**Severity:** Low · **Effort:** S · **Confidence:** plausible · **Status:** done
 **Files:** `crates/perchstation-core/src/perchpub/client.rs:197-207,225-235`; `crates/perchstation-core/src/delivery/retry.rs:129-134`
 
 ```rust
@@ -443,7 +443,7 @@ if status != StatusCode::OK { ... return Err(ClientError::Http { status: status.
 **Tests:** retry.rs: assert a 2xx reaching `classify_status` is not Terminal once loosened. Integration (loopback fake perchpub, see PS-16): `/api/v1/upload/` returns 201 + valid body → `upload_clip` returns `Ok`.
 
 ## PS-23 — `Retry-After` HTTP-date form dropped → server backoff floor lost on 429/503
-**Severity:** Low · **Effort:** S · **Confidence:** confirmed · **Status:** todo
+**Severity:** Low · **Effort:** S · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/perchpub/client.rs:267-273`
 **Depends on:** PS-11 (Clock injection)
 

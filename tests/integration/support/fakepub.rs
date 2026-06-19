@@ -111,6 +111,18 @@ struct UploadResponseState {
     /// in the `Location` header. Used by T054 to verify the station's
     /// HTTP client does NOT follow redirects to off-allowlist hosts.
     redirect_to: Option<String>,
+    /// When set, every upload answers with this 2xx status (e.g. 201) and a
+    /// valid `ClassifyTaskPublic` body. Used by `wire_client.rs` (PS-22) to
+    /// verify the station treats any 2xx — not just 200 — as success.
+    success_status: Option<u16>,
+    /// When true, every upload answers `200` with a body that is NOT a
+    /// decodable `ClassifyTaskPublic`. Used by `wire_client.rs` (PS-06) to
+    /// verify the station records the clip delivered (not re-uploaded).
+    undecodable_body: bool,
+    /// When true, every upload answers `200` with a multi-megabyte body.
+    /// Used by `wire_client.rs` (PS-16) to verify the station caps the read
+    /// rather than buffering it unbounded.
+    oversized_body: bool,
 }
 
 /// Per-test knobs for the classify-task GET endpoint. The default
@@ -293,6 +305,25 @@ impl FakePerchpub {
     /// the configured perchpub authority (SC-007).
     pub fn redirect_uploads_to(&self, url: impl Into<String>) {
         self.state.upload_response.lock().unwrap().redirect_to = Some(url.into());
+    }
+
+    /// Answer every upload with `status` (a 2xx other than 200) plus a valid
+    /// `ClassifyTaskPublic` body. PS-22: the station must accept any 2xx.
+    pub fn respond_upload_status(&self, status: u16) {
+        self.state.upload_response.lock().unwrap().success_status = Some(status);
+    }
+
+    /// Answer every upload `200` with a body that won't decode into a
+    /// `ClassifyTaskPublic`. PS-06: the station must record the clip
+    /// delivered (no re-upload), not retry.
+    pub fn respond_upload_undecodable(&self) {
+        self.state.upload_response.lock().unwrap().undecodable_body = true;
+    }
+
+    /// Answer every upload `200` with a multi-megabyte body. PS-16: the
+    /// station must cap the read instead of buffering it unbounded.
+    pub fn respond_upload_oversized(&self) {
+        self.state.upload_response.lock().unwrap().oversized_body = true;
     }
 
     /// Clone-out the recorded request state for assertions.
@@ -504,6 +535,19 @@ async fn handle_upload(State(state): State<Arc<FakeState>>, mut multipart: Multi
         }
     }
 
+    // PS-06 / PS-16 wire-edge knobs (wire_client.rs).
+    {
+        let guard = state.upload_response.lock().unwrap();
+        if guard.oversized_body {
+            // PS-16: a body well past the station's 1 MiB cap.
+            return (StatusCode::OK, "x".repeat(2 * 1024 * 1024)).into_response();
+        }
+        if guard.undecodable_body {
+            // PS-06: a 2xx whose body is not a `ClassifyTaskPublic`.
+            return (StatusCode::OK, "{ definitely not a classify task").into_response();
+        }
+    }
+
     let task_id = Uuid::new_v4();
     let object_name = filename.unwrap_or_else(|| format!("clip-{task_id}.mp4"));
     let task = ClassifyTaskPublic {
@@ -520,6 +564,14 @@ async fn handle_upload(State(state): State<Arc<FakeState>>, mut multipart: Multi
         observation: None,
     };
     state.tasks.lock().unwrap().insert(task_id, task.clone());
+
+    // PS-22: optionally answer with a 2xx-other status (e.g. 201) and the
+    // valid body, to verify the station accepts any 2xx as success.
+    let success_status = state.upload_response.lock().unwrap().success_status;
+    if let Some(code) = success_status {
+        let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+        return (status, Json(task)).into_response();
+    }
 
     Json(task).into_response()
 }

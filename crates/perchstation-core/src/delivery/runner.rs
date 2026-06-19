@@ -47,6 +47,7 @@ use crate::hw_traits::Clock;
 use crate::identity::StationIdentity;
 use crate::observability::tracing as obs_tracing;
 use crate::perchpub::client::{ClientError, PerchpubClient};
+use crate::perchpub::types::ClassifyTaskStatus;
 use crate::queue::store::QueueStore;
 use crate::queue::{ClipQueueEntry, LastError, Outcome, QueueError};
 
@@ -278,6 +279,14 @@ impl DeliveryRunner {
         entry: ClipQueueEntry,
         err: &ClientError,
     ) -> Result<(), RunnerError> {
+        // PS-06: an undecodable 2xx means perchpub already stored the clip.
+        // Record it delivered (classify status unknown) instead of routing it
+        // through the terminal path (which would mark it Undeliverable) or the
+        // transient path (which would re-upload an accepted clip).
+        if let ClientError::UndecodableSuccess { message, .. } = err {
+            return self.mark_delivered_undecodable(entry, message);
+        }
+
         let kind = error_kind(err);
         let status = match err {
             ClientError::Http { status, .. } => Some(*status),
@@ -339,6 +348,34 @@ impl DeliveryRunner {
             Some(LastError { kind: kind.into(), status, message: message.to_string() });
         self.store.transition_delivered(&undeliverable)?;
         emit_attempts_exhausted(&clip_id, attempts, wallclock_secs, kind, status, message);
+        Ok(())
+    }
+
+    /// PS-06: perchpub accepted the bytes (a 2xx) but the station could not
+    /// decode the classify task from the response body. Record the clip
+    /// `Delivered` with an unknown classify status and no task id to poll, so
+    /// it is never re-uploaded. Preserves `transition_delivered`'s invariants.
+    fn mark_delivered_undecodable(
+        &self,
+        entry: ClipQueueEntry,
+        message: &str,
+    ) -> Result<(), RunnerError> {
+        let clip_id = entry.clip_id.clone();
+        let attempt = entry.attempts;
+        let mut delivered = entry;
+        delivered.outcome = Some(Outcome::Delivered);
+        delivered.classify_task_id = None;
+        delivered.last_classify_status = Some(ClassifyTaskStatus::Unknown);
+        delivered.delivered_at = Some(self.clock.now());
+        delivered.last_error = None;
+        self.store.transition_delivered(&delivered)?;
+        tracing::warn!(
+            event = obs_tracing::events::DELIVERY_UPLOAD_UNDECODABLE,
+            clip_id = %clip_id,
+            attempt = attempt,
+            message = message,
+            "upload accepted but classify-task body undecodable; recorded delivered with unknown classify status",
+        );
         Ok(())
     }
 
@@ -533,6 +570,44 @@ mod tests {
         );
         // Must be strictly positive so the loop cannot hot-spin on ENOSPC.
         assert!(disk_full_backoff(StdDuration::from_hours(1)) > StdDuration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn undecodable_success_upload_is_recorded_delivered_not_undeliverable() {
+        // PS-06: a 200 whose body the station couldn't decode means perchpub
+        // already stored the clip. It must land in delivered/ as `Delivered`
+        // (classify status unknown), NOT `Undeliverable`, and must NOT be
+        // re-queued to pending/ (which would re-upload an accepted clip).
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+        let runner = runner(dir.path(), store.clone());
+
+        let id = "20260527T120000Z-009";
+        let mut entry = ClipQueueEntry::new(id, instant("2026-05-27T12:00:00Z"), Utc::now(), 5);
+        entry.attempts = 1;
+        entry.first_attempt_at = Some(instant("2026-05-27T12:00:00Z"));
+
+        let err = ClientError::UndecodableSuccess {
+            url: "https://perchpub/api/v1/upload/".into(),
+            message: "trailing garbage".into(),
+        };
+        runner.handle_upload_error(entry, &err).expect("undecodable success must not error");
+
+        let delivered = store.delivered_dir().join(format!("{id}.json"));
+        assert!(delivered.is_file(), "undecodable-success clip must be recorded in delivered/");
+        let recorded: ClipQueueEntry =
+            serde_json::from_slice(&std::fs::read(&delivered).unwrap()).unwrap();
+        assert_eq!(
+            recorded.outcome,
+            Some(Outcome::Delivered),
+            "must be Delivered, not Undeliverable"
+        );
+        assert!(recorded.classify_task_id.is_none(), "no classify task id was decodable");
+        assert!(recorded.last_error.is_none(), "delivered, so no failure error");
+        assert!(
+            !store.pending_dir().join(format!("{id}.json")).exists(),
+            "must NOT re-queue an already-accepted clip",
+        );
     }
 
     #[tokio::test]

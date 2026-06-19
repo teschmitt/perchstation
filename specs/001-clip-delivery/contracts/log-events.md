@@ -56,6 +56,7 @@ listed below and changes only with an explicit version bump.
 | ----------------------------- | ------ | -------------------------------------- | --------------------------------------------------------- |
 | `delivery.attempt_started`    | info   | `clip_id`, `attempt`                  | Entry transitioned `pending/` → `inflight/`               |
 | `delivery.upload_succeeded`   | info   | `clip_id`, `classify_task_id`, `attempt`, `duration_ms` | 200 from `/upload/`                                       |
+| `delivery.upload_undecodable` | warn   | `clip_id`, `attempt`, `message`       | 2xx accepted but classify-task body undecodable (PS-06); entry → `Delivered`, classify status unknown |
 | `delivery.upload_transient`   | warn   | `clip_id`, `attempt`, `kind`, `status?`, `next_attempt_after` | Retryable failure                                         |
 | `delivery.upload_terminal`    | error  | `clip_id`, `attempt`, `kind`, `status?`, `message` | Non-retryable failure; entry → `Undeliverable`            |
 | `delivery.attempts_exhausted` | error  | `clip_id`, `attempts`, `wallclock_secs`| Per-clip retry budget exhausted; entry → `Undeliverable`  |
@@ -67,7 +68,7 @@ listed below and changes only with an explicit version bump.
 | ----------------------------- | ------ | -------------------------------------- | --------------------------------------------------------- |
 | `classify.polled`             | debug  | `clip_id`, `classify_task_id`, `status`| Successful poll, non-terminal                             |
 | `classify.terminal`           | info   | `clip_id`, `classify_task_id`, `status`, `observation_id?` | Poll observed `Success` or `Failed`                       |
-| `classify.lost`               | error  | `clip_id`, `classify_task_id`, `kind`, `status?` | 404/422 or other terminal poll failure                    |
+| `classify.lost`               | error  | `clip_id`, `classify_task_id`, `kind`, `status?` | 404/422, other terminal poll failure, or `kind=poll_timeout` once the finite poll budget is exhausted (PS-06) |
 
 ### Lifecycle
 
@@ -76,6 +77,7 @@ listed below and changes only with an explicit version bump.
 | `service.ready`               | info   | `pending_at_start`                    | After boot reconciliation, just before `sd_notify(READY)` |
 | `service.shutdown`            | info   | `reason`                              | Clean shutdown (SIGTERM)                                  |
 | `service.config_invalid`      | error  | `path`, `message`                     | Config load failed                                        |
+| `service.credentials_reloaded`| info   | —                                     | SIGHUP hot-reloaded the mTLS credentials after re-enrollment (PS-18) |
 
 ## Field discipline
 

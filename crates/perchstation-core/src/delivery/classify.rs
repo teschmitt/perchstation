@@ -45,6 +45,14 @@ const DEFAULT_DELIVERED_RETENTION_HOURS: i64 = 24 * 7;
 /// cost is negligible against the millisecond poll tick.
 const PRUNE_INTERVAL: Duration = Duration::from_mins(5);
 
+/// Wall-clock budget (hours, anchored on `delivered_at`) for polling a
+/// single classify task before giving up (PS-06). A non-terminal status
+/// that never resolves — e.g. an unmodelled `Unknown` perchpub keeps
+/// returning — would otherwise be re-polled every tick until the retention
+/// prune removes it days later. Past the budget the entry is marked
+/// `classify_lost_at`; the upload itself stays `Delivered`.
+const CLASSIFY_POLL_MAX_HOURS: i64 = 24;
+
 #[derive(Debug, Error)]
 enum PollerError {
     #[error(transparent)]
@@ -195,7 +203,7 @@ impl ClassifyPoller {
                     continue;
                 }
             };
-            let entry: ClipQueueEntry = match serde_json::from_slice(&bytes) {
+            let mut entry: ClipQueueEntry = match serde_json::from_slice(&bytes) {
                 Ok(entry) => entry,
                 Err(err) => {
                     // PS-02: a single corrupt sidecar must not wedge the
@@ -224,9 +232,31 @@ impl ClassifyPoller {
                 self.seen_terminal.insert(entry.clip_id.clone());
                 continue;
             }
+            // PS-06: a non-terminal classify task that has outlived the poll
+            // budget is given up on — mark it lost (the upload stays
+            // Delivered) and stop re-polling it every tick.
+            if self.classify_budget_exhausted(&entry) {
+                entry.classify_lost_at = Some(self.clock.now());
+                self.store.update_delivered_sidecar(&entry)?;
+                self.seen_terminal.insert(entry.clip_id.clone());
+                if let Some(task_id) = entry.classify_task_id {
+                    emit_classify_lost(&entry.clip_id, task_id, "poll_timeout", None);
+                }
+                continue;
+            }
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    /// `true` once a still-non-terminal entry has been pollable for longer
+    /// than [`CLASSIFY_POLL_MAX_HOURS`] since `delivered_at` (PS-06). Entries
+    /// with no `delivered_at` (never the production path) are never timed out.
+    fn classify_budget_exhausted(&self, entry: &ClipQueueEntry) -> bool {
+        let Some(delivered_at) = entry.delivered_at else {
+            return false;
+        };
+        self.clock.now() - delivered_at >= chrono::Duration::hours(CLASSIFY_POLL_MAX_HOURS)
     }
 
     async fn poll_one(&mut self, mut entry: ClipQueueEntry) -> Result<(), PollerError> {
@@ -435,6 +465,53 @@ mod tests {
             !store.corrupt_dir().join(format!("{id}.json")).exists(),
             "skipped terminal sidecar must not be quarantined",
         );
+    }
+
+    #[test]
+    fn scan_stops_polling_after_budget_and_marks_lost() {
+        // PS-06: a non-terminal classify status (e.g. an unmodelled
+        // `Unknown`) that never resolves must not be polled forever. Past
+        // the poll budget (anchored on delivered_at) the entry is marked
+        // lost and dropped from the pollable set. The poller's clock is
+        // fixed at 2026-05-27T12:00:00Z.
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        let id = "20260526T100000Z-001";
+        let mut e = ClipQueueEntry::new(id, instant("2026-05-26T10:00:00Z"), Utc::now(), 1);
+        e.outcome = Some(Outcome::Delivered);
+        e.classify_task_id = Some(Uuid::new_v4());
+        e.last_classify_status = Some(ClassifyTaskStatus::Unknown);
+        e.delivered_at = Some(instant("2026-05-26T10:00:00Z")); // >24h before clock
+        write_delivered(&store, &e);
+
+        let mut poller = poller(dir.path(), store.clone());
+        let entries = poller.scan_non_terminal().expect("scan");
+        assert!(entries.is_empty(), "a budget-exhausted entry must not be polled");
+
+        let reread: ClipQueueEntry = serde_json::from_slice(
+            &std::fs::read(store.delivered_dir().join(format!("{id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(reread.classify_lost_at.is_some(), "budget exhaustion stamps classify_lost_at");
+    }
+
+    #[test]
+    fn scan_keeps_polling_within_budget() {
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        let id = "20260527T115900Z-001";
+        let mut e = ClipQueueEntry::new(id, instant("2026-05-27T11:59:00Z"), Utc::now(), 1);
+        e.outcome = Some(Outcome::Delivered);
+        e.classify_task_id = Some(Uuid::new_v4());
+        e.last_classify_status = Some(ClassifyTaskStatus::Processing);
+        e.delivered_at = Some(instant("2026-05-27T11:59:00Z")); // 1 min before clock
+        write_delivered(&store, &e);
+
+        let mut poller = poller(dir.path(), store);
+        let entries = poller.scan_non_terminal().expect("scan");
+        assert_eq!(entries.len(), 1, "an in-budget entry is still polled");
     }
 
     #[tokio::test]

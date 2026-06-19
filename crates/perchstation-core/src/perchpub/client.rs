@@ -16,13 +16,20 @@
 //! - [`PerchpubClient::upload_clip`] — streaming multipart `POST /api/v1/upload/`.
 //! - [`PerchpubClient::get_classify_task`] — `GET /api/v1/classify-task/{id}`.
 //!
-//! Non-200 responses surface as [`ClientError::Http`] in MVP; T046 / T052
-//! layer the per-status retry classification on top.
+//! Response handling: any 2xx is success (PS-22); a 2xx whose body won't
+//! decode becomes [`ClientError::UndecodableSuccess`] (PS-06, the clip is
+//! already stored — never re-uploaded); every non-2xx surfaces as
+//! [`ClientError::Http`] for the retry classifier (T046 / T052). All bodies
+//! are read under a fixed size cap to bound memory on the Pi (PS-16).
+//! Credentials can be hot-reloaded after re-enrollment via
+//! [`PerchpubClient::reload`] (PS-18) — no `serve` restart required.
 
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use reqwest::header;
 use reqwest::{Body, Certificate, Client, Identity, StatusCode, Url};
 use thiserror::Error;
@@ -61,6 +68,14 @@ pub enum ClientError {
     },
     #[error("could not decode response from `{url}`: {message}")]
     Decode { url: String, message: String },
+    /// A 2xx response whose body could not be decoded into the expected
+    /// schema (PS-06). On the upload path the bytes are *already stored* by
+    /// perchpub, so this must NOT trigger a re-upload — the runner records
+    /// the clip delivered (with an unknown classify status). Distinct from
+    /// [`ClientError::Decode`] precisely so the retry classifier can tell
+    /// "accepted but unreadable" apart from "retryable transport failure".
+    #[error("perchpub returned an undecodable 2xx body from `{url}`: {message}")]
+    UndecodableSuccess { url: String, message: String },
     #[error("could not open clip file `{path}`: {source}")]
     ClipOpen {
         path: PathBuf,
@@ -72,10 +87,81 @@ pub enum ClientError {
 /// `reqwest::Client` configured for mTLS against a specific perchpub
 /// origin. Clone is cheap (the inner client is internally `Arc`'d), so
 /// the delivery loop and the classify poller share a single instance.
+///
+/// The TLS material lives behind an `RwLock` so [`PerchpubClient::reload`]
+/// can hot-swap the identity + root store after a re-enrollment overwrites
+/// `credentials/` — without a `serve` restart (PS-18). All clones share the
+/// lock, so a reload via any handle is observed by the runner and poller.
 #[derive(Debug, Clone)]
 pub struct PerchpubClient {
     base_url: Url,
-    inner: Client,
+    /// `<data_dir>/credentials/`, retained so `reload()` can rebuild the
+    /// inner client from the latest on-disk TLS material.
+    creds_dir: PathBuf,
+    inner: Arc<RwLock<Client>>,
+}
+
+/// Build the mTLS `reqwest::Client` from the credential material in
+/// `creds` (`station.crt`, `station.key`, `ca_chain.pem`). Shared by
+/// [`PerchpubClient::new`] and [`PerchpubClient::reload`] so the two can
+/// never drift in their TLS hardening (PS-18).
+fn build_inner(creds: &Path) -> Result<Client, ClientError> {
+    let cert_path = creds.join(STATION_CERT_FILE);
+    let key_path = creds.join(STATION_KEY_FILE);
+    let ca_path = creds.join(CA_CHAIN_FILE);
+
+    let cert_pem = std::fs::read(&cert_path)
+        .map_err(|source| ClientError::CredentialIo { path: cert_path.clone(), source })?;
+    let key_pem = std::fs::read(&key_path)
+        .map_err(|source| ClientError::CredentialIo { path: key_path.clone(), source })?;
+    let ca_pem = std::fs::read(&ca_path)
+        .map_err(|source| ClientError::CredentialIo { path: ca_path.clone(), source })?;
+
+    // reqwest::Identity::from_pem wants cert(s) followed by the private
+    // key, all in one PEM-encoded buffer.
+    let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
+    identity_pem.extend_from_slice(&cert_pem);
+    if !cert_pem.ends_with(b"\n") {
+        identity_pem.push(b'\n');
+    }
+    identity_pem.extend_from_slice(&key_pem);
+
+    let identity = Identity::from_pem(&identity_pem)
+        .map_err(|err| ClientError::TlsConfig(format!("identity: {err}")))?;
+
+    let mut roots: Vec<Certificate> = Vec::new();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_slice())) {
+        let cert = cert.map_err(|err| ClientError::TlsConfig(format!("parse CA cert: {err}")))?;
+        let reqwest_cert = Certificate::from_der(cert.as_ref())
+            .map_err(|err| ClientError::TlsConfig(format!("convert CA cert: {err}")))?;
+        roots.push(reqwest_cert);
+    }
+    if roots.is_empty() {
+        return Err(ClientError::TlsConfig(format!(
+            "`{}` contained no certificates",
+            ca_path.display()
+        )));
+    }
+
+    let mut builder = Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .https_only(true)
+        .identity(identity)
+        // SC-007 / T060: redirects are not followed. A 3xx response
+        // from perchpub becomes a plain HTTP status the caller sees,
+        // not a transparent reconnect to a possibly-rogue Location.
+        // The allowlist gate (`check_authority`) catches caller-
+        // constructed URLs; this no-redirect policy catches
+        // server-driven URL swaps.
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_mins(1));
+    for root in roots {
+        builder = builder.add_root_certificate(root);
+    }
+
+    builder.build().map_err(|err| ClientError::TlsConfig(err.to_string()))
 }
 
 impl PerchpubClient {
@@ -87,70 +173,33 @@ impl PerchpubClient {
     /// the station leaf as the TLS client identity.
     pub fn new(data_dir: &Path, base_url: &str) -> Result<Self, ClientError> {
         let creds = data_dir.join(CREDENTIALS_DIR);
-
-        let cert_path = creds.join(STATION_CERT_FILE);
-        let key_path = creds.join(STATION_KEY_FILE);
-        let ca_path = creds.join(CA_CHAIN_FILE);
-
-        let cert_pem = std::fs::read(&cert_path)
-            .map_err(|source| ClientError::CredentialIo { path: cert_path.clone(), source })?;
-        let key_pem = std::fs::read(&key_path)
-            .map_err(|source| ClientError::CredentialIo { path: key_path.clone(), source })?;
-        let ca_pem = std::fs::read(&ca_path)
-            .map_err(|source| ClientError::CredentialIo { path: ca_path.clone(), source })?;
-
-        // reqwest::Identity::from_pem wants cert(s) followed by the private
-        // key, all in one PEM-encoded buffer.
-        let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
-        identity_pem.extend_from_slice(&cert_pem);
-        if !cert_pem.ends_with(b"\n") {
-            identity_pem.push(b'\n');
-        }
-        identity_pem.extend_from_slice(&key_pem);
-
-        let identity = Identity::from_pem(&identity_pem)
-            .map_err(|err| ClientError::TlsConfig(format!("identity: {err}")))?;
-
-        let mut roots: Vec<Certificate> = Vec::new();
-        for cert in rustls_pemfile::certs(&mut BufReader::new(ca_pem.as_slice())) {
-            let cert =
-                cert.map_err(|err| ClientError::TlsConfig(format!("parse CA cert: {err}")))?;
-            let reqwest_cert = Certificate::from_der(cert.as_ref())
-                .map_err(|err| ClientError::TlsConfig(format!("convert CA cert: {err}")))?;
-            roots.push(reqwest_cert);
-        }
-        if roots.is_empty() {
-            return Err(ClientError::TlsConfig(format!(
-                "`{}` contained no certificates",
-                ca_path.display()
-            )));
-        }
-
-        let mut builder = Client::builder()
-            .use_rustls_tls()
-            .tls_built_in_root_certs(false)
-            .min_tls_version(reqwest::tls::Version::TLS_1_2)
-            .https_only(true)
-            .identity(identity)
-            // SC-007 / T060: redirects are not followed. A 3xx response
-            // from perchpub becomes a plain HTTP status the caller sees,
-            // not a transparent reconnect to a possibly-rogue Location.
-            // The allowlist gate (`check_authority`) catches caller-
-            // constructed URLs; this no-redirect policy catches
-            // server-driven URL swaps.
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_mins(1));
-        for root in roots {
-            builder = builder.add_root_certificate(root);
-        }
-
-        let inner = builder.build().map_err(|err| ClientError::TlsConfig(err.to_string()))?;
+        let inner = build_inner(&creds)?;
 
         let base_url = Url::parse(base_url.trim_end_matches('/')).map_err(|err| {
             ClientError::InvalidUrl { url: base_url.to_string(), message: err.to_string() }
         })?;
 
-        Ok(Self { base_url, inner })
+        Ok(Self { base_url, creds_dir: creds, inner: Arc::new(RwLock::new(inner)) })
+    }
+
+    /// Rebuild the inner mTLS client from the current on-disk credentials and
+    /// hot-swap it in (PS-18). Call after a re-enrollment overwrites
+    /// `credentials/` so the long-running delivery loop / classify poller
+    /// present the new identity without a `serve` restart. On failure the
+    /// previous working client is left untouched — a bad reload never bricks
+    /// an already-running station. `base_url` / [`authority`](Self::authority)
+    /// are unaffected.
+    pub fn reload(&self) -> Result<(), ClientError> {
+        let rebuilt = build_inner(&self.creds_dir)?;
+        *self.inner.write().expect("perchpub client lock poisoned") = rebuilt;
+        Ok(())
+    }
+
+    /// Snapshot of the current inner client (a cheap `Arc` clone) for one
+    /// request. Taken under a short read lock so it never blocks a concurrent
+    /// [`reload`](Self::reload).
+    fn client(&self) -> Client {
+        self.inner.read().expect("perchpub client lock poisoned").clone()
     }
 
     /// Origin authority (`host[:port]`) of the configured perchpub. Used by
@@ -190,26 +239,12 @@ impl PerchpubClient {
         let form = reqwest::multipart::Form::new().part("file", part);
 
         let response =
-            self.inner.post(url.clone()).multipart(form).send().await.map_err(|err| {
+            self.client().post(url.clone()).multipart(form).send().await.map_err(|err| {
                 ClientError::Network { url: url.to_string(), message: err.to_string() }
             })?;
 
-        let status = response.status();
-        if status != StatusCode::OK {
-            let retry_after = parse_retry_after(response.headers());
-            let message = response.text().await.unwrap_or_default();
-            return Err(ClientError::Http {
-                url: url.to_string(),
-                status: status.as_u16(),
-                message,
-                retry_after,
-            });
-        }
-
-        response
-            .json::<ClassifyTaskPublic>()
-            .await
-            .map_err(|err| ClientError::Decode { url: url.to_string(), message: err.to_string() })
+        let capped = read_capped(response, Utc::now(), url.as_str()).await?;
+        classify_response(&capped, url.as_str())
     }
 
     /// `GET /api/v1/classify-task/{id}` — fetch the latest perchpub-side
@@ -218,26 +253,12 @@ impl PerchpubClient {
         let url = self.endpoint(&format!("/api/v1/classify-task/{id}"))?;
         self.check_authority(&url)?;
 
-        let response = self.inner.get(url.clone()).send().await.map_err(|err| {
+        let response = self.client().get(url.clone()).send().await.map_err(|err| {
             ClientError::Network { url: url.to_string(), message: err.to_string() }
         })?;
 
-        let status = response.status();
-        if status != StatusCode::OK {
-            let retry_after = parse_retry_after(response.headers());
-            let message = response.text().await.unwrap_or_default();
-            return Err(ClientError::Http {
-                url: url.to_string(),
-                status: status.as_u16(),
-                message,
-                retry_after,
-            });
-        }
-
-        response
-            .json::<ClassifyTaskPublic>()
-            .await
-            .map_err(|err| ClientError::Decode { url: url.to_string(), message: err.to_string() })
+        let capped = read_capped(response, Utc::now(), url.as_str()).await?;
+        classify_response(&capped, url.as_str())
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, ClientError> {
@@ -264,17 +285,118 @@ impl PerchpubClient {
     }
 }
 
-/// Parse a `Retry-After` header value as a delta-seconds. HTTP-date
-/// form is not supported (perchpub's Traefik front sends seconds).
-fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
-    let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
-    let secs: u64 = raw.trim().parse().ok()?;
-    Some(Duration::from_secs(secs))
+/// Maximum response body the station will buffer from perchpub (PS-16).
+/// The bodies we parse (`ClassifyTaskPublic`, `HTTPValidationError`) are a
+/// few hundred bytes; 1 MiB is a generous ceiling that still stops a
+/// buggy/compromised — but CA-pinned — perchpub from OOM-killing the Pi by
+/// streaming a multi-gigabyte body under the request timeout.
+const MAX_RESPONSE_BYTES: u64 = 1 << 20;
+
+/// A perchpub response read into memory under the [`MAX_RESPONSE_BYTES`]
+/// cap, with the status and `Retry-After` captured before the body was
+/// consumed (so they survive an over-limit bail).
+#[derive(Debug)]
+struct CappedResponse {
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    body: Vec<u8>,
+}
+
+/// Buffer a response body into memory, refusing anything larger than
+/// [`MAX_RESPONSE_BYTES`] (PS-16). `status` and `Retry-After` are read
+/// before the body is consumed. The streaming accumulator is the real
+/// guard; a `Content-Length` over the cap short-circuits before any read.
+async fn read_capped(
+    response: reqwest::Response,
+    now: DateTime<Utc>,
+    url: &str,
+) -> Result<CappedResponse, ClientError> {
+    let status = response.status();
+    let retry_after = parse_retry_after(response.headers(), now);
+
+    // Defence-in-depth: reject before reading when the server advertises an
+    // over-cap Content-Length (chunked responses report none, hence the
+    // streaming guard below is the real enforcement).
+    if response.content_length().is_some_and(|len| len > MAX_RESPONSE_BYTES) {
+        return Err(ClientError::Decode {
+            url: url.to_string(),
+            message: format!("response Content-Length exceeds {MAX_RESPONSE_BYTES}-byte cap"),
+        });
+    }
+
+    let mut response = response;
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() as u64 + chunk.len() as u64 > MAX_RESPONSE_BYTES {
+                    return Err(ClientError::Decode {
+                        url: url.to_string(),
+                        message: format!("response body exceeds {MAX_RESPONSE_BYTES}-byte cap"),
+                    });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                return Err(ClientError::Network {
+                    url: url.to_string(),
+                    message: err.to_string(),
+                });
+            }
+        }
+    }
+    Ok(CappedResponse { status, retry_after, body })
+}
+
+/// Turn a (size-capped) perchpub response into a [`ClassifyTaskPublic`] or
+/// a typed error. Pure, so unit-testable without a live server.
+fn classify_response(
+    capped: &CappedResponse,
+    url: &str,
+) -> Result<ClassifyTaskPublic, ClientError> {
+    // PS-22: any 2xx is success — perchpub or its Traefik front may answer
+    // 201/202 for an accepted upload.
+    if !capped.status.is_success() {
+        return Err(ClientError::Http {
+            url: url.to_string(),
+            status: capped.status.as_u16(),
+            message: String::from_utf8_lossy(&capped.body).into_owned(),
+            retry_after: capped.retry_after,
+        });
+    }
+    // PS-06: a 2xx whose body won't decode means the clip is already stored
+    // — `UndecodableSuccess` (not `Decode`) so the retry classifier keeps it
+    // off the re-upload path. An *unknown status string* decodes fine now
+    // (`ClassifyTaskStatus::Unknown`), so this only fires on malformed JSON.
+    serde_json::from_slice::<ClassifyTaskPublic>(&capped.body).map_err(|err| {
+        ClientError::UndecodableSuccess { url: url.to_string(), message: err.to_string() }
+    })
+}
+
+/// Parse a `Retry-After` header into a delay relative to `now`.
+///
+/// Both RFC-7231 forms are honoured (PS-23): the delta-seconds fast path
+/// and the HTTP-date (IMF-fixdate / RFC-2822-compatible) form. A date in
+/// the past clamps to zero; an unparseable value yields `None`. `now` is
+/// passed in (rather than read from a `Clock`) because this free function
+/// has none in scope — the caller supplies `chrono::Utc::now()`.
+fn parse_retry_after(headers: &header::HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+    let raw = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    // Fast path: delta-seconds.
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // Fallback: HTTP-date form (`Wed, 21 Oct 2015 07:28:00 GMT`), which is
+    // RFC-2822-compatible. A past date clamps to zero.
+    let when = DateTime::parse_from_rfc2822(raw).ok()?.with_timezone(&Utc);
+    Some((when - now).to_std().unwrap_or(Duration::ZERO))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::perchpub::types::ClassifyTaskStatus;
     use rcgen::{
         BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
     };
@@ -345,6 +467,42 @@ mod tests {
         assert!(matches!(err, ClientError::TlsConfig(_)));
     }
 
+    #[test]
+    fn reload_rebuilds_with_fresh_credentials() {
+        // PS-18: after re-enrollment overwrites credentials/, reload() picks
+        // up the new TLS material and the configured authority is unchanged.
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        write_credentials(dir.path());
+        let client = PerchpubClient::new(dir.path(), "https://perchpub.example.org").unwrap();
+        let before = client.authority().to_string();
+
+        // Re-enroll: a brand-new CA + leaf land in credentials/.
+        write_credentials(dir.path());
+        client.reload().expect("reload with fresh valid credentials");
+        assert_eq!(client.authority(), before, "reload must not change the pinned authority");
+    }
+
+    #[test]
+    fn reload_failure_leaves_client_usable() {
+        // PS-18: a bad reload (empty ca_chain.pem) must NOT poison the
+        // already-running client; the previous identity stays in place and a
+        // later valid reload still succeeds.
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        write_credentials(dir.path());
+        let client = PerchpubClient::new(dir.path(), "https://perchpub.example.org").unwrap();
+
+        let creds = dir.path().join(CREDENTIALS_DIR);
+        fs::write(creds.join(CA_CHAIN_FILE), b"").unwrap();
+        let err = client.reload().expect_err("empty ca chain must fail reload");
+        assert!(matches!(err, ClientError::TlsConfig(_)), "got {err:?}");
+        // Still usable: authority intact, and restoring valid creds reloads.
+        assert_eq!(client.authority(), "perchpub.example.org");
+        write_credentials(dir.path());
+        client.reload().expect("valid reload after a failed one");
+    }
+
     #[tokio::test]
     async fn upload_refuses_to_change_authority() {
         // Force the URL pre-flight gate by handing the endpoint a different
@@ -363,5 +521,127 @@ mod tests {
             }
             other => panic!("expected OutboundDisallowed, got {other:?}"),
         }
+    }
+
+    // --- PS-23: Retry-After parsing (delta-seconds + HTTP-date forms) ---
+
+    fn retry_after_headers(value: &str) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, value.parse().expect("header value"));
+        headers
+    }
+
+    fn ra_now() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 5, 27, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn retry_after_delta_seconds() {
+        assert_eq!(
+            parse_retry_after(&retry_after_headers("120"), ra_now()),
+            Some(Duration::from_mins(2)),
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_future_returns_delta() {
+        // IMF-fixdate 2 min in the future of `ra_now()`.
+        let got =
+            parse_retry_after(&retry_after_headers("Wed, 27 May 2026 12:02:00 GMT"), ra_now());
+        assert_eq!(got, Some(Duration::from_mins(2)));
+    }
+
+    #[test]
+    fn retry_after_http_date_past_clamps_to_zero() {
+        let got =
+            parse_retry_after(&retry_after_headers("Wed, 27 May 2026 11:58:00 GMT"), ra_now());
+        assert_eq!(got, Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_garbage_is_none() {
+        assert!(parse_retry_after(&retry_after_headers("not-a-date"), ra_now()).is_none());
+    }
+
+    #[test]
+    fn retry_after_absent_is_none() {
+        assert!(parse_retry_after(&header::HeaderMap::new(), ra_now()).is_none());
+    }
+
+    // --- PS-16 / PS-22 / PS-06: capped read + response classification ---
+
+    fn valid_task_json() -> Vec<u8> {
+        br#"{"object_name":"clip-1.mp4","status":"Prepared","id":"00000000-0000-0000-0000-000000000010","upload":{"station_id":"00000000-0000-0000-0000-000000000001","object_name":"clip-1.mp4"},"observation":null}"#.to_vec()
+    }
+
+    fn capped(status: u16, body: Vec<u8>) -> CappedResponse {
+        CappedResponse { status: StatusCode::from_u16(status).unwrap(), retry_after: None, body }
+    }
+
+    #[test]
+    fn classify_response_accepts_200() {
+        let task = classify_response(&capped(200, valid_task_json()), "https://p/x").unwrap();
+        assert_eq!(task.object_name, "clip-1.mp4");
+    }
+
+    #[test]
+    fn classify_response_accepts_2xx_other() {
+        // PS-22: a 201/202 from perchpub or its Traefik front is success,
+        // not a `Http`→Terminal→Undeliverable drop.
+        let task = classify_response(&capped(201, valid_task_json()), "https://p/x").unwrap();
+        assert_eq!(task.status, ClassifyTaskStatus::Prepared);
+    }
+
+    #[test]
+    fn classify_response_unknown_status_2xx_is_ok() {
+        // PS-06: an unknown status string still yields a decoded task.
+        let body = br#"{"object_name":"c.mp4","status":"Cancelled","id":"00000000-0000-0000-0000-000000000010","upload":{"station_id":"00000000-0000-0000-0000-000000000001","object_name":"c.mp4"},"observation":null}"#.to_vec();
+        let task = classify_response(&capped(200, body), "https://p/x").unwrap();
+        assert_eq!(task.status, ClassifyTaskStatus::Unknown);
+    }
+
+    #[test]
+    fn classify_response_undecodable_2xx_is_undecodable_success() {
+        // PS-06: a 2xx whose body genuinely won't parse means the clip is
+        // already stored — surface `UndecodableSuccess`, never `Decode`
+        // (which the runner would retry → re-upload an accepted clip).
+        let err = classify_response(&capped(200, b"{ not json".to_vec()), "https://p/x")
+            .expect_err("undecodable success");
+        assert!(matches!(err, ClientError::UndecodableSuccess { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn classify_response_non_2xx_is_http_preserving_retry_after() {
+        let c = CappedResponse {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(Duration::from_secs(7)),
+            body: b"down".to_vec(),
+        };
+        match classify_response(&c, "https://p/x") {
+            Err(ClientError::Http { status, retry_after, .. }) => {
+                assert_eq!(status, 503);
+                assert_eq!(retry_after, Some(Duration::from_secs(7)));
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_capped_rejects_oversized_body() {
+        // PS-16: a body over the cap must error out rather than buffer
+        // unboundedly (OOM on a Pi).
+        let big = vec![b'x'; usize::try_from(MAX_RESPONSE_BYTES).unwrap() + 1];
+        let resp = reqwest::Response::from(http::Response::new(big));
+        let err = read_capped(resp, ra_now(), "https://p/x").await.expect_err("over cap");
+        assert!(matches!(err, ClientError::Decode { .. }), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn read_capped_returns_small_body() {
+        let resp = reqwest::Response::from(http::Response::new(valid_task_json()));
+        let capped = read_capped(resp, ra_now(), "https://p/x").await.unwrap();
+        assert_eq!(capped.status, StatusCode::OK);
+        assert_eq!(capped.body, valid_task_json());
     }
 }

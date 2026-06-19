@@ -115,6 +115,10 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
         schedule,
         identity.clone(),
     );
+    // Retained so SIGHUP can hot-swap the mTLS identity after re-enrollment
+    // (PS-18). All clones share the inner `RwLock`, so a reload here is seen
+    // by the runner and poller without a restart.
+    let reload_client = client.clone();
     let poller = ClassifyPoller::new(store.clone(), client, clock.clone())
         .with_delivered_retention_hours(config.queue.delivered_retention_hours);
 
@@ -142,15 +146,7 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
         capture_shutdown.clone(),
     );
 
-    let mut sigterm = signal(SignalKind::terminate())
-        .map_err(|err| CommandError::Io(anyhow!("install SIGTERM handler: {err}")))?;
-    let mut sigint = signal(SignalKind::interrupt())
-        .map_err(|err| CommandError::Io(anyhow!("install SIGINT handler: {err}")))?;
-
-    let reason = tokio::select! {
-        _ = sigterm.recv() => "sigterm",
-        _ = sigint.recv() => "sigint",
-    };
+    let reason = await_shutdown(&reload_client).await?;
 
     tracing::info!(
         event = obs_tracing::events::SERVICE_SHUTDOWN,
@@ -172,6 +168,35 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     }
 
     Ok(())
+}
+
+/// Block until a terminating signal, hot-reloading the mTLS credentials on
+/// each SIGHUP (PS-18) so a re-enrollment takes effect without a restart.
+/// Returns the shutdown reason for the `service.shutdown` event.
+async fn await_shutdown(reload_client: &PerchpubClient) -> Result<&'static str, CommandError> {
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|err| CommandError::Io(anyhow!("install SIGTERM handler: {err}")))?;
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|err| CommandError::Io(anyhow!("install SIGINT handler: {err}")))?;
+    let mut sighup = signal(SignalKind::hangup())
+        .map_err(|err| CommandError::Io(anyhow!("install SIGHUP handler: {err}")))?;
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => return Ok("sigterm"),
+            _ = sigint.recv() => return Ok("sigint"),
+            _ = sighup.recv() => match reload_client.reload() {
+                Ok(()) => tracing::info!(
+                    event = obs_tracing::events::SERVICE_CREDENTIALS_RELOADED,
+                    "reloaded mTLS credentials on SIGHUP",
+                ),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "credential reload failed; keeping the previous identity",
+                ),
+            },
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

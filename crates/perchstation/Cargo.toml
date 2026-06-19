@@ -38,6 +38,11 @@ path    = "../../tests/integration/delivery_happy.rs"
 harness = true
 
 [[test]]
+name    = "wire_client"
+path    = "../../tests/integration/wire_client.rs"
+harness = true
+
+[[test]]
 name    = "reenroll_conflict"
 path    = "../../tests/integration/reenroll_conflict.rs"
 harness = true
