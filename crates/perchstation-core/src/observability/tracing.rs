@@ -17,6 +17,7 @@
 //! routed through the configured writer can leak it.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing_subscriber::EnvFilter;
@@ -216,6 +217,20 @@ pub mod events {
 #[derive(Debug, Default)]
 pub struct RedactionRegistry {
     secrets: Mutex<Vec<String>>,
+    /// Count of registered secrets, mirroring `secrets.len()`. Read
+    /// lock-free by [`RedactingWriter::write`] so the common steady-state
+    /// path (no secrets registered) never locks or clones the `Vec` per
+    /// log line (PS-26). Only ever incremented, under the `secrets` lock,
+    /// when a genuinely new secret is pushed.
+    ///
+    /// The increment is `Release` and the read is `Acquire`: skipping the
+    /// `secrets` mutex on the fast path would otherwise drop the
+    /// synchronisation the old unconditional `snapshot()` lock provided, so
+    /// a writer observing the bump is guaranteed to also see the pushed
+    /// secret. This keeps the redaction guarantee — a secret registered
+    /// before a line is emitted is always scrubbed — independent of how
+    /// registration and logging threads happen to be ordered.
+    len: AtomicUsize,
 }
 
 impl RedactionRegistry {
@@ -235,6 +250,11 @@ impl RedactionRegistry {
         let mut guard = self.secrets.lock().expect("registry lock poisoned");
         if !guard.iter().any(|existing| existing == &secret) {
             guard.push(secret);
+            // Bump the fast-path counter only on a real insertion, while
+            // still holding the lock, so it stays in lock-step with the Vec.
+            // `Release` so a writer that reads the new count (Acquire) also
+            // sees the pushed secret.
+            self.len.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -246,10 +266,13 @@ impl RedactionRegistry {
         guard.iter().any(|secret| text.contains(secret))
     }
 
-    /// Number of registered secrets. Convenience for tests.
+    /// Number of registered secrets. Reads the lock-free counter rather
+    /// than locking the `Vec`. `Acquire` pairs with the `Release` bump in
+    /// [`register`](Self::register) so a non-zero read also makes the pushed
+    /// secret visible.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.secrets.lock().expect("registry lock poisoned").len()
+        self.len.load(Ordering::Acquire)
     }
 
     /// `true` if no secrets are registered.
@@ -314,8 +337,9 @@ impl<'a> MakeWriter<'a> for RedactingMakeWriter {
 /// payload before forwarding to stderr.
 ///
 /// Each `tracing-subscriber` fmt event emits one `write_all` call with
-/// the complete formatted line + trailing newline. We snapshot the
-/// registry at the start of `write`, decode the input lossily as UTF-8,
+/// the complete formatted line + trailing newline. If no secrets are
+/// registered we forward the bytes verbatim (the common steady state);
+/// otherwise we snapshot the registry, decode the input lossily as UTF-8,
 /// and replace every registered marker with `[REDACTED]`. Non-UTF-8
 /// inputs (impossible for the fmt JSON layer in practice, but theoretically
 /// possible for arbitrary writers) are passed through unchanged — the
@@ -327,15 +351,18 @@ pub struct RedactingWriter {
 
 impl Write for RedactingWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let secrets = self.registry.snapshot();
-        let mut stderr = io::stderr().lock();
-        if secrets.is_empty() {
-            stderr.write_all(buf)?;
+        // Fast path for the steady state (no secrets registered, e.g. once
+        // enrollment is done): the lock-free length read lets us forward the
+        // buffer verbatim without locking or cloning the secrets `Vec` on
+        // every log line (PS-26).
+        if self.registry.is_empty() {
+            io::stderr().lock().write_all(buf)?;
             return Ok(buf.len());
         }
+        let secrets = self.registry.snapshot();
         let text = String::from_utf8_lossy(buf);
         let scrubbed = scrub(&text, &secrets);
-        stderr.write_all(scrubbed.as_bytes())?;
+        io::stderr().lock().write_all(scrubbed.as_bytes())?;
         Ok(buf.len())
     }
 
@@ -376,6 +403,48 @@ mod tests {
         assert!(reg.contains_any("the password is hunter2 today"));
         assert!(reg.contains_any("api-key-7"));
         assert!(!reg.contains_any("nothing to see here"));
+    }
+
+    #[test]
+    fn len_counter_tracks_register_dedup() {
+        // The fast-path counter must advance only when a genuinely new
+        // secret is pushed: a duplicate and an empty string both leave it
+        // untouched (PS-26).
+        let reg = RedactionRegistry::new();
+        reg.register("token-abc");
+        reg.register("token-abc"); // duplicate → no increment
+        reg.register(""); // empty → ignored
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn empty_registry_write_passes_through_untouched() {
+        // With nothing registered the writer takes the lock-free fast path
+        // and forwards the buffer verbatim — i.e. scrubbing against the
+        // empty snapshot is the identity (PS-26).
+        let reg = RedactionRegistry::new();
+        assert_eq!(reg.len(), 0);
+        assert!(reg.is_empty());
+        let secrets = reg.snapshot();
+        assert!(secrets.is_empty());
+        let line = "plain log line, nothing secret here";
+        assert_eq!(scrub(line, &secrets), line);
+    }
+
+    #[test]
+    fn non_empty_registry_still_redacts_each_secret() {
+        // The slow path must remain correct: every registered secret is
+        // replaced, even when several appear on one line.
+        let reg = RedactionRegistry::new();
+        reg.register("auth-token-xyz");
+        reg.register("csr-pem-body");
+        assert!(!reg.is_empty());
+        let secrets = reg.snapshot();
+        let scrubbed = scrub("sent auth-token-xyz with csr-pem-body inline", &secrets);
+        assert!(!scrubbed.contains("auth-token-xyz"));
+        assert!(!scrubbed.contains("csr-pem-body"));
+        assert_eq!(scrubbed.matches(REDACTED_PLACEHOLDER).count(), 2);
     }
 
     #[test]

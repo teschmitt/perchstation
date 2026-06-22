@@ -36,10 +36,10 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 - [x] PS-10 — eviction races `transition_inflight` on `pending/` with no lock *(Medium)*
 
 **Perchpub wire client**
-- [ ] PS-16 — response body read with no size cap → OOM *(Medium)*
-- [ ] PS-18 — client never reloads creds after re-enrollment *(Low)*
-- [ ] PS-22 — 2xx-other status collapsed to Terminal → `Undeliverable` *(Low)*
-- [ ] PS-23 — `Retry-After` HTTP-date form dropped *(Low)*
+- [x] PS-16 — response body read with no size cap → OOM *(Medium)*
+- [x] PS-18 — client never reloads creds after re-enrollment *(Low)*
+- [x] PS-22 — 2xx-other status collapsed to Terminal → `Undeliverable` *(Low)*
+- [x] PS-23 — `Retry-After` HTTP-date form dropped *(Low)*
 
 **Enrollment & identity (security)**
 - [x] PS-13 — `validate_chain` accepts expired / non-CA certs *(High)*
@@ -49,7 +49,7 @@ Each finding is a self-contained unit: **Problem** (what's wrong) → **Trigger*
 - [x] PS-19 — `cert_is_expired` strict `<` boundary *(Low)*
 
 **Observability**
-- [ ] PS-26 — `RedactingWriter` clones the secrets `Vec` on every log line *(Low)*
+- [x] PS-26 — `RedactingWriter` clones the secrets `Vec` on every log line *(Low)*
 - [x] PS-24 — `pick_last_failure` filter fragility *(Low — STALE, hardening only)*
 
 **Conventions, portability & cleanup**
@@ -555,7 +555,7 @@ pub fn cert_is_expired(&self, now: DateTime<Utc>) -> bool {
 # Observability
 
 ## PS-26 — `RedactingWriter` clones the secrets `Vec` on every log line
-**Severity:** Low · **Effort:** M · **Confidence:** confirmed · **Status:** todo
+**Severity:** Low · **Effort:** M · **Confidence:** confirmed · **Status:** done
 **Files:** `crates/perchstation-core/src/observability/tracing.rs:298-310,231-238`
 
 ```rust
