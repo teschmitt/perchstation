@@ -90,9 +90,16 @@ libcamera-hello --list-cameras
 Edit `/etc/perchstation/config.toml`. Minimum change:
 
 ```toml
-perchpub_url = "https://perchpub"          # or "https://perchpub:8443" if non-default port
+perchpub_url = "https://perchpub"          # enrollment base (:443 Traefik entrypoint)
+# upload_url = "https://perchpub:8443"     # optional: uploads default to perchpub_url's host on :8443
 data_dir     = "/var/lib/perchstation"     # leave as-is; systemd StateDirectory handles it
 ```
+
+Uploads go to a dedicated mTLS entrypoint (`:8443` by default), derived from
+`perchpub_url` unless you set `upload_url` explicitly. The upload client
+validates perchpub's *server* certificate against the public root store (the
+edge presents a publicly-rooted, e.g. Let's Encrypt, cert) while presenting the
+station's enrollment-issued leaf as its mTLS *client* identity.
 
 Everything else in the example config is a sensible default. Worth a
 glance for your dev setup:
@@ -163,7 +170,8 @@ A few common dev-loop failures, in order of likelihood:
 
 | Symptom | Likely cause |
 | --- | --- |
-| `delivery.upload_terminal` with TLS error | Pi doesn't trust perchpub's server cert; the `ca_chain.pem` in `credentials/` doesn't match the chain perchpub presents. Verify with `openssl s_client -showcerts -connect perchpub:443 </dev/null` on the Pi (match the host:port in `perchpub_url`) and compare against `ca_chain.pem`. |
+| `delivery.upload_terminal` with TLS error | The upload client validates perchpub's *server* cert against the public root store, so the edge must present a publicly-rooted (e.g. Let's Encrypt) chain on the upload entrypoint, **including intermediates**. Verify with `openssl s_client -showcerts -connect perchpub:8443 </dev/null` on the Pi (match the host:port in `upload_url`, default `:8443`) and confirm the chain terminates at a public root and includes the intermediate(s). |
+| `queue.oversize_skipped` (clip Undeliverable, never uploaded) | Clip exceeds the 50 MiB upload ceiling and was refused locally (UPL-7). Lower `[capture] clip_duration_secs`/`camera_bitrate_bps` so clips stay under the limit. |
 | `enrollment.session_invalid` | QR session expired (perchpub-side TTL) or already consumed — regenerate. |
 | Re-enrollment refused (exit 76) | Expected — pass `--force` if you genuinely want to overwrite, or `sudo rm -rf /var/lib/perchstation/credentials/` for a clean dev reset. |
 | `capture.sensor_degraded kind=unavailable` | GPIO line wiring or `sensor_gpiochip`/`sensor_line` doesn't match the physical setup. |

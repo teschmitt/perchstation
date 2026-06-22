@@ -47,10 +47,11 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     // every numeric bound (PS-03/PS-08), so a malformed config fails fast
     // here instead of panicking deep in the capture/retry math later.
     config.ensure_runtime_ready().map_err(|err| CommandError::Config(anyhow!("{err}")))?;
-    let perchpub_url =
-        config.perchpub_url.as_deref().filter(|url| !url.is_empty()).ok_or_else(|| {
-            CommandError::Config(anyhow!("`perchpub_url` is required for `perchstation serve`"))
-        })?;
+    // The upload / mTLS client targets the perchpub edge's dedicated mTLS
+    // entrypoint (`:8443` by default), distinct from the `:443` enrollment
+    // base that `enroll` uses (PRV-2/UPL-1). When `upload_url` is unset this
+    // derives it from `perchpub_url`.
+    let upload_base = config.upload_base().map_err(|err| CommandError::Config(anyhow!("{err}")))?;
 
     let identity = match StationIdentity::load(&config.data_dir) {
         Ok(id) => id,
@@ -71,7 +72,7 @@ pub async fn run(config: &Config) -> Result<(), CommandError> {
     // do not need scrubbing.
     register_station_key_secrets(&config.data_dir)?;
 
-    let client = PerchpubClient::new(&config.data_dir, perchpub_url)
+    let client = PerchpubClient::new(&config.data_dir, &upload_base)
         .map_err(|err| CommandError::Io(anyhow!("perchpub client init: {err}")))?;
 
     let store = QueueStore::open(&config.data_dir)

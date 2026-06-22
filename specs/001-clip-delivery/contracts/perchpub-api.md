@@ -20,19 +20,34 @@ the perchpub web UI, not by us.
 
 ## Transport and authentication
 
-- **TLS**: TLS 1.2+ (TLS 1.3 expected in practice) terminating at perchpub's
-  Traefik front. The station validates perchpub's server certificate
-  against **only** the CA chain returned at enrollment time
-  (`credentials/ca_chain.pem`); the OS trust store is **not** consulted.
+- **Two entrypoints (PRV-2/UPL-1)**: perchpub's Traefik front terminates TLS on
+  two entrypoints — enrollment on the public `:443` (`perchpub_url`, default
+  `https://api.perchpub.net`) and clip uploads on a dedicated mTLS entrypoint
+  `:8443` (`upload_url`, default `https://api.perchpub.net:8443`, derived from
+  `perchpub_url` when unset).
+- **TLS**: TLS 1.2+ (TLS 1.3 expected in practice). Server-cert validation
+  differs by entrypoint:
+  - **Upload / classify-task (`:8443`, UPL-8)**: the station validates
+    perchpub's server certificate against the **public root store** (the edge
+    presents a publicly-rooted, e.g. Let's Encrypt, cert), and **additionally**
+    trusts the enrollment CA chain (`ca_chain.pem`) when present so a
+    privately-rooted deployment also validates. The host-authority allowlist
+    (SC-007) remains the outbound pin, and certificate verification is never
+    disabled (SEC-4).
+  - **Enrollment confirm (`:443`)**: validated against **only** the CA chain
+    delivered in the QR payload (later persisted as `credentials/ca_chain.pem`);
+    the OS/public trust store is **not** consulted on this bootstrap path.
 - **Client identity**: every call **except** `/enrollment/confirm` presents
   the station's enrollment-issued certificate as a TLS client certificate
   (mTLS) signed by `station.key`. Perchpub identifies the station server-
   side from the SPKI of the presented cert; the station MUST NOT add a
-  bearer token, cookie, or any other auth header.
+  bearer token, cookie, or any other auth header. The CSR — and therefore the
+  client cert — is **Ed25519** (KEY-1): an operator-verified divergence from
+  the EC P-256 convention, accepted by perchpub's CA and Traefik front.
 - **`/enrollment/confirm`** is special: the station has no client certificate
   yet. The call is made over plain TLS (no client cert presented). The
-  `auth_token` in the request body is the only credential. The same CA
-  pinning applies.
+  `auth_token` in the request body is the only credential. The QR-bound CA
+  pinning above applies.
 
 ---
 
@@ -58,8 +73,9 @@ the perchpub web UI, not by us.
 | ------ | --------------------- | ------------------------------------------------------------------------------------------------------------ |
 | 200    | `EnrollmentResponse`  | If `success == true` and `certificate_pem`, `ca_chain_pem`, and `station_id` are all present, persist atomically (see `data-model.md`). Otherwise treat as failure with `reason`. |
 | 422    | `HTTPValidationError` | Log structured error; do not retry (CSR is wrong; operator must re-enroll).                                  |
-| 4xx (other) | (any)            | Log and abort; operator must re-enroll.                                                                      |
-| 5xx / network failure | (any)     | Retry the *same* `session_id`/`auth_token` once after 5 s, then twice more at 30 s and 120 s. Beyond that, report enrollment failed and leave on-disk state untouched. |
+| 4xx (other, incl. 403) | (any)  | Log and abort; operator must re-enroll.                                                                      |
+| 502    | (any)                 | Terminal (LIF-1) — perchpub unreachable behind Traefik. Surface and re-provision the session; do **not** retry.  |
+| 5xx (≠ 502) / network failure | (any) | Retry the *same* `session_id`/`auth_token` after 5 s, then once more at 30 s (**3 attempts total** — perchpub's session counts every POST, LIF-1). Beyond that, report enrollment failed and leave on-disk state untouched. |
 
 ### Behavioural contract (station side)
 

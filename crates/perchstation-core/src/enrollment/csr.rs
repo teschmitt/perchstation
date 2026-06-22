@@ -10,6 +10,14 @@
 //! The CSR's subject is a placeholder (`station-enrollment`) — perchpub
 //! rewrites the subject server-side when it mints the leaf cert, per
 //! `contracts/perchpub-api.md` §1.
+//!
+//! **Key algorithm (KEY-1).** The station uses **Ed25519**, an intentional,
+//! operator-verified divergence from the enrollment/upload spec's EC P-256
+//! convention: perchpub's CA signs Ed25519 CSRs and its Traefik front accepts
+//! Ed25519 client certificates. This resolves `research.md`'s "first flag to
+//! flip" caveat — Ed25519 is confirmed compatible, so the deliberate choice
+//! stands. Switching to `PKCS_ECDSA_P256_SHA256` would be the fallback only if
+//! that compatibility ever regresses.
 
 use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
 use thiserror::Error;

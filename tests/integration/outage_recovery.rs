@@ -34,7 +34,10 @@ fn write_config(data_dir: &std::path::Path, perchpub_url: &str) -> std::path::Pa
     std::fs::write(
         &path,
         format!(
+            // Single-origin fake: pin upload_url to the same URL so the upload
+            // base does not derive the production :8443 entrypoint (PRV-2/UPL-1).
             "perchpub_url = \"{}\"\n\
+             upload_url = \"{}\"\n\
              data_dir = \"{}\"\n\
              \n\
              [retry]\n\
@@ -42,6 +45,7 @@ fn write_config(data_dir: &std::path::Path, perchpub_url: &str) -> std::path::Pa
              max_attempt_delay_secs       = 5\n\
              per_clip_max_attempts        = 6\n\
              per_clip_max_wallclock_hours = 1\n",
+            perchpub_url,
             perchpub_url,
             data_dir.display(),
         ),

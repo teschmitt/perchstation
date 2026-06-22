@@ -4,11 +4,14 @@
 //! TLS against the QR-bound CA pin and has no client certificate. This
 //! one:
 //!
-//! - Pins to `credentials/ca_chain.pem` (the same CA, re-loaded from disk).
+//! - Validates perchpub's *server* certificate against the public root store
+//!   (UPL-8): the perchpub edge terminates TLS with a publicly-rooted (e.g.
+//!   Let's Encrypt) cert. The enrollment CA chain (`ca_chain.pem`) is trusted
+//!   *additionally* when present, so a privately-rooted deployment works too.
 //! - Presents the station's enrollment-issued cert (`station.crt`/`station.key`)
-//!   as a TLS client identity (mTLS).
+//!   as a TLS *client* identity (mTLS).
 //! - Refuses any request whose host authority does not match the configured
-//!   `perchpub_url` — the SC-007 outbound-allowlist invariant, enforced
+//!   upload base — the SC-007 outbound-allowlist invariant, enforced
 //!   before the connection is opened.
 //!
 //! Endpoints implemented here (per `contracts/perchpub-api.md` §2 + §3):
@@ -39,7 +42,7 @@ use uuid::Uuid;
 use crate::identity::{CA_CHAIN_FILE, CREDENTIALS_DIR, STATION_CERT_FILE, STATION_KEY_FILE};
 use crate::perchpub::types::ClassifyTaskPublic;
 use crate::queue::store::QueueStore;
-use crate::tls::{TlsBuilderError, rustls_builder_with_roots};
+use crate::tls::{TlsBuilderError, rustls_builder_for_upload};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -103,21 +106,20 @@ pub struct PerchpubClient {
     inner: Arc<RwLock<Client>>,
 }
 
-/// Build the mTLS `reqwest::Client` from the credential material in
-/// `creds` (`station.crt`, `station.key`, `ca_chain.pem`). Shared by
-/// [`PerchpubClient::new`] and [`PerchpubClient::reload`] so the two can
-/// never drift in their TLS hardening (PS-18).
+/// Build the mTLS `reqwest::Client` from the credential material in `creds`:
+/// `station.crt` + `station.key` for the client identity (both required), and
+/// — if present — `ca_chain.pem` as a supplementary server-trust anchor on top
+/// of the public roots (UPL-8). Shared by [`PerchpubClient::new`] and
+/// [`PerchpubClient::reload`] so the two can never drift in their TLS
+/// hardening (PS-18).
 fn build_inner(creds: &Path) -> Result<Client, ClientError> {
     let cert_path = creds.join(STATION_CERT_FILE);
     let key_path = creds.join(STATION_KEY_FILE);
-    let ca_path = creds.join(CA_CHAIN_FILE);
 
     let cert_pem = std::fs::read(&cert_path)
         .map_err(|source| ClientError::CredentialIo { path: cert_path.clone(), source })?;
     let key_pem = std::fs::read(&key_path)
         .map_err(|source| ClientError::CredentialIo { path: key_path.clone(), source })?;
-    let ca_pem = std::fs::read(&ca_path)
-        .map_err(|source| ClientError::CredentialIo { path: ca_path.clone(), source })?;
 
     // reqwest::Identity::from_pem wants cert(s) followed by the private
     // key, all in one PEM-encoded buffer.
@@ -131,14 +133,27 @@ fn build_inner(creds: &Path) -> Result<Client, ClientError> {
     let identity = Identity::from_pem(&identity_pem)
         .map_err(|err| ClientError::TlsConfig(format!("identity: {err}")))?;
 
-    // Shared hardened rustls base (PS-31): rustls backend, no platform roots,
-    // TLS >= 1.2, HTTPS-only, no redirect following, CA pinned. The mTLS
-    // client layers on its station identity and a 1-minute request timeout.
-    // The no-redirect policy (SC-007 / T060) catches server-driven URL swaps;
-    // the allowlist gate (`check_authority`) catches caller-built URLs.
-    let builder = rustls_builder_with_roots(&ca_pem).map_err(|err| match err {
+    // Additionally trust the operator's enrollment CA chain when present
+    // (UPL-8): always there in a normal deployment, absent only for a pure
+    // public-edge setup. `NotFound` is fine (public roots suffice); any other
+    // read error surfaces.
+    let ca_path = creds.join(CA_CHAIN_FILE);
+    let ca_pem = match std::fs::read(&ca_path) {
+        Ok(pem) => Some(pem),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(source) => return Err(ClientError::CredentialIo { path: ca_path, source }),
+    };
+
+    // Hardened rustls base (PS-31) validating perchpub's *server* cert against
+    // the public root store plus the enrollment CA when present (UPL-8):
+    // rustls backend, TLS >= 1.2, HTTPS-only, no redirect following. The mTLS
+    // client layers on its station leaf as the *client* identity plus a
+    // 1-minute request timeout. The no-redirect policy (SC-007 / T060) catches
+    // server-driven URL swaps; the allowlist gate (`check_authority`) catches
+    // caller-built URLs.
+    let builder = rustls_builder_for_upload(ca_pem.as_deref()).map_err(|err| match err {
         TlsBuilderError::EmptyRoots => {
-            ClientError::TlsConfig(format!("`{}` contained no certificates", ca_path.display()))
+            ClientError::TlsConfig("upload TLS builder produced no roots".to_owned())
         }
         TlsBuilderError::Parse(message) => ClientError::TlsConfig(message),
     })?;
@@ -152,11 +167,11 @@ fn build_inner(creds: &Path) -> Result<Client, ClientError> {
 
 impl PerchpubClient {
     /// Build a client from `<data_dir>/credentials/` and the configured
-    /// perchpub URL.
+    /// upload base URL.
     ///
-    /// Reads `station.crt`, `station.key`, and `ca_chain.pem`; constructs
-    /// a `rustls` `RootCertStore` containing only the pinned CA; presents
-    /// the station leaf as the TLS client identity.
+    /// Reads `station.crt` and `station.key` for the mTLS client identity, and
+    /// `ca_chain.pem` (if present) as a supplementary server-trust anchor on
+    /// top of the public roots (UPL-8).
     pub fn new(data_dir: &Path, base_url: &str) -> Result<Self, ClientError> {
         let creds = data_dir.join(CREDENTIALS_DIR);
         let inner = build_inner(&creds)?;
@@ -433,6 +448,22 @@ mod tests {
     }
 
     #[test]
+    fn new_builds_without_pinned_ca() {
+        // UPL-8: the upload client validates perchpub's *server* cert against
+        // the public root store (the edge presents a Let's Encrypt cert), so
+        // it no longer needs `ca_chain.pem` on disk — only the station leaf +
+        // key for its mTLS *client* identity.
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        write_credentials(dir.path());
+        let creds = dir.path().join(CREDENTIALS_DIR);
+        fs::remove_file(creds.join(CA_CHAIN_FILE)).unwrap();
+        let client = PerchpubClient::new(dir.path(), "https://api.perchpub.net:8443")
+            .expect("upload client builds without a pinned CA on disk");
+        assert_eq!(client.authority(), "api.perchpub.net:8443");
+    }
+
+    #[test]
     fn new_rejects_invalid_base_url() {
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
@@ -442,15 +473,17 @@ mod tests {
     }
 
     #[test]
-    fn new_rejects_empty_ca_chain() {
+    fn new_rejects_missing_station_cert() {
+        // The mTLS client identity is still mandatory — a missing
+        // `station.crt` must surface, even though the pinned CA is gone.
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
         write_credentials(dir.path());
         let creds = dir.path().join(CREDENTIALS_DIR);
-        fs::write(creds.join(CA_CHAIN_FILE), b"").unwrap();
-        let err =
-            PerchpubClient::new(dir.path(), "https://perchpub.example.org").expect_err("empty ca");
-        assert!(matches!(err, ClientError::TlsConfig(_)));
+        fs::remove_file(creds.join(STATION_CERT_FILE)).unwrap();
+        let err = PerchpubClient::new(dir.path(), "https://perchpub.example.org")
+            .expect_err("missing station cert");
+        assert!(matches!(err, ClientError::CredentialIo { .. }), "got {err:?}");
     }
 
     #[test]
@@ -471,17 +504,21 @@ mod tests {
 
     #[test]
     fn reload_failure_leaves_client_usable() {
-        // PS-18: a bad reload (empty ca_chain.pem) must NOT poison the
-        // already-running client; the previous identity stays in place and a
-        // later valid reload still succeeds.
+        // PS-18: a bad reload (here a corrupt station.crt — no parseable
+        // client identity) must NOT poison the already-running client; the
+        // previous identity stays in place and a later valid reload succeeds.
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
         write_credentials(dir.path());
         let client = PerchpubClient::new(dir.path(), "https://perchpub.example.org").unwrap();
 
         let creds = dir.path().join(CREDENTIALS_DIR);
-        fs::write(creds.join(CA_CHAIN_FILE), b"").unwrap();
-        let err = client.reload().expect_err("empty ca chain must fail reload");
+        fs::write(
+            creds.join(STATION_CERT_FILE),
+            b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let err = client.reload().expect_err("corrupt station cert must fail reload");
         assert!(matches!(err, ClientError::TlsConfig(_)), "got {err:?}");
         // Still usable: authority intact, and restoring valid creds reloads.
         assert_eq!(client.authority(), "perchpub.example.org");

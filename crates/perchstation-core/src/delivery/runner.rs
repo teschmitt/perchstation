@@ -223,11 +223,18 @@ impl DeliveryRunner {
         // Pre-flight: zero-length or unreadable → emit warning and mark
         // the entry undeliverable without sending bytes (FR-013, T049).
         if let Some(reason) = preflight_check(&mp4_path) {
+            // Oversize gets its own event (UPL-7); zero-length / unreadable
+            // keep the original readability-skip event.
+            let event = if reason == "oversize" {
+                obs_tracing::events::QUEUE_OVERSIZE_SKIPPED
+            } else {
+                obs_tracing::events::QUEUE_ZERO_LENGTH_SKIPPED
+            };
             tracing::warn!(
-                event = obs_tracing::events::QUEUE_ZERO_LENGTH_SKIPPED,
+                event = event,
                 clip_id = %clip_id,
                 kind = reason,
-                "clip failed pre-flight readability check",
+                "clip failed pre-flight check; marking undeliverable",
             );
             let mut undeliverable = entry;
             undeliverable.outcome = Some(Outcome::Undeliverable);
@@ -494,10 +501,18 @@ fn emit_attempts_exhausted(
 fn preflight_check(clip_path: &std::path::Path) -> Option<&'static str> {
     match std::fs::metadata(clip_path) {
         Ok(meta) if meta.len() == 0 => Some("zero_length"),
+        // UPL-7: refuse a clip past the 50 MiB upload ceiling locally rather
+        // than streaming it only for perchpub's edge to answer 413.
+        Ok(meta) if meta.len() > MAX_UPLOAD_BYTES => Some("oversize"),
         Ok(_) => None,
         Err(_) => Some("unreadable"),
     }
 }
+
+/// Maximum clip size the station will attempt to upload (UPL-7). perchpub's
+/// edge rejects larger uploads with 413; refusing them here skips the wasted
+/// round-trip and records the clip Undeliverable with a clear local event.
+const MAX_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -607,6 +622,73 @@ mod tests {
         assert!(
             !store.pending_dir().join(format!("{id}.json")).exists(),
             "must NOT re-queue an already-accepted clip",
+        );
+    }
+
+    #[test]
+    fn preflight_flags_oversize_clip() {
+        // UPL-7: a clip larger than the 50 MiB upload ceiling is flagged so the
+        // runner can mark it Undeliverable locally instead of round-tripping to
+        // a 413. Sparse `set_len` keeps the test cheap (no bytes written).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.mp4");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_UPLOAD_BYTES + 1).unwrap();
+        assert_eq!(preflight_check(&path), Some("oversize"));
+    }
+
+    #[test]
+    fn preflight_allows_clip_at_the_size_ceiling() {
+        // The ceiling itself is allowed; only strictly-larger clips are refused.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("exact.mp4");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_UPLOAD_BYTES).unwrap();
+        assert_eq!(preflight_check(&path), None);
+    }
+
+    #[tokio::test]
+    async fn try_once_marks_oversize_clip_undeliverable_without_uploading() {
+        // UPL-7: a pending clip over the ceiling is recorded Undeliverable
+        // without ever contacting perchpub (the fake client points at an
+        // unserved loopback port, so an attempted upload would error instead).
+        let dir = TempDir::new().unwrap();
+        let store = QueueStore::open(dir.path()).unwrap();
+
+        let id = "20260527T120000Z-050";
+        let entry = ClipQueueEntry::new(
+            id,
+            instant("2026-05-27T12:00:00Z"),
+            Utc::now(),
+            MAX_UPLOAD_BYTES + 1,
+        );
+        std::fs::write(
+            store.pending_dir().join(format!("{id}.json")),
+            serde_json::to_vec_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+        // Sparse media just over the ceiling — `transition_inflight` renames it
+        // (O(1), sparseness preserved), so no 50 MiB is ever touched.
+        let media =
+            std::fs::File::create(store.pending_dir().join(QueueStore::media_name(id))).unwrap();
+        media.set_len(MAX_UPLOAD_BYTES + 1).unwrap();
+
+        let runner = runner(dir.path(), store.clone());
+        let progressed = runner.try_once().await.expect("oversize preflight must not error");
+        assert!(progressed, "marking an oversize clip undeliverable counts as progress");
+
+        let delivered = store.delivered_dir().join(format!("{id}.json"));
+        assert!(delivered.is_file(), "oversize clip must land in delivered/");
+        let recorded: ClipQueueEntry =
+            serde_json::from_slice(&std::fs::read(&delivered).unwrap()).unwrap();
+        assert_eq!(recorded.outcome, Some(Outcome::Undeliverable), "must be Undeliverable");
+        assert_eq!(
+            recorded.last_error.as_ref().expect("oversize records a last_error").kind,
+            "oversize",
+        );
+        assert!(
+            !store.pending_dir().join(format!("{id}.json")).exists(),
+            "oversize clip must leave pending/",
         );
     }
 

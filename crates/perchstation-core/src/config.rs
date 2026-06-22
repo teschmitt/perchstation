@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use reqwest::Url;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -36,10 +37,21 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Required at runtime: the perchpub origin the station talks to.
-    /// Optional in the deserialised struct so `status` can run without it.
+    /// Required at runtime: the perchpub origin the station *enrolls*
+    /// against. Per the perchpub Traefik edge topology this is the public
+    /// `:443` entrypoint (default `https://api.perchpub.net`). Optional in
+    /// the deserialised struct so `status` can run without it.
     #[serde(default)]
     pub perchpub_url: Option<String>,
+
+    /// Optional override for the base the station *uploads* to. The perchpub
+    /// edge terminates mTLS uploads on a dedicated entrypoint (conventionally
+    /// `:8443`, default `https://api.perchpub.net:8443`), separate from the
+    /// `:443` enrollment entrypoint (PRV-2/UPL-1). When unset, the upload base
+    /// is derived from [`Config::perchpub_url`] by switching the port to
+    /// [`UPLOAD_PORT`]; set this only to point uploads at a distinct host.
+    #[serde(default)]
+    pub upload_url: Option<String>,
 
     /// Filesystem root for credentials and the queue.
     #[serde(default = "default_data_dir")]
@@ -164,6 +176,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             perchpub_url: None,
+            upload_url: None,
             data_dir: default_data_dir(),
             queue: QueueConfig::default(),
             retry: RetryConfig::default(),
@@ -191,6 +204,24 @@ impl Config {
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         toml::from_str(text)
             .map_err(|source| ConfigError::Parse { path: PathBuf::from("<inline>"), source })
+    }
+
+    /// The base URL the upload / mTLS client targets, distinct from the
+    /// enrollment base [`Config::perchpub_url`] (PRV-2/UPL-1). If
+    /// [`Config::upload_url`] is set it is returned verbatim; otherwise it is
+    /// derived from `perchpub_url` by switching the port to [`UPLOAD_PORT`]
+    /// (`:8443`), the perchpub edge's dedicated mTLS upload entrypoint. Errors
+    /// if neither a usable `upload_url` nor a usable `perchpub_url` is present.
+    pub fn upload_base(&self) -> Result<String, ConfigError> {
+        if let Some(explicit) = self.upload_url.as_deref().filter(|s| !s.is_empty()) {
+            return Ok(explicit.to_owned());
+        }
+        let enrollment = self
+            .perchpub_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or(ConfigError::MissingRequired { field: "perchpub_url" })?;
+        derive_upload_url(enrollment)
     }
 
     /// Reject a config that cannot drive `serve` or `enroll`: requires
@@ -272,6 +303,26 @@ impl Config {
 
         Ok(())
     }
+}
+
+/// The perchpub edge's dedicated mTLS upload entrypoint port (UPL-1). The
+/// upload base is derived from `perchpub_url` by switching to this port when
+/// no explicit `upload_url` is configured.
+const UPLOAD_PORT: u16 = 8443;
+
+/// Derive the upload base from the enrollment URL by switching its port to
+/// [`UPLOAD_PORT`] (`:8443`). Preserves scheme/host/path and strips any
+/// trailing `/` so the client's `endpoint()` concatenation stays correct.
+fn derive_upload_url(enrollment_url: &str) -> Result<String, ConfigError> {
+    let mut url = Url::parse(enrollment_url).map_err(|err| ConfigError::OutOfRange {
+        field: "perchpub_url",
+        reason: format!("not a valid URL: {err}"),
+    })?;
+    url.set_port(Some(UPLOAD_PORT)).map_err(|()| ConfigError::OutOfRange {
+        field: "perchpub_url",
+        reason: format!("cannot set upload port {UPLOAD_PORT} on `{enrollment_url}`"),
+    })?;
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 /// Upper bound on a single clip's recording duration (1 hour).
@@ -378,6 +429,45 @@ mod tests {
         let cfg = Config::from_toml_str(toml).expect("parses");
         assert_eq!(cfg.perchpub_url.as_deref(), Some("https://perchpub.example.org"));
         cfg.ensure_runtime_ready().expect("runtime ready");
+    }
+
+    #[test]
+    fn upload_base_derives_8443_from_perchpub_url() {
+        // PRV-2/UPL-1: with no explicit upload_url, the upload (mTLS) base is
+        // the enrollment host on the dedicated :8443 Traefik entrypoint.
+        let cfg = Config::from_toml_str("perchpub_url = \"https://api.perchpub.net\"\n").unwrap();
+        assert_eq!(cfg.upload_base().unwrap(), "https://api.perchpub.net:8443");
+    }
+
+    #[test]
+    fn upload_base_uses_explicit_upload_url_when_set() {
+        // PRV-2: an operator may point uploads at a distinct host/port.
+        let cfg = Config::from_toml_str(
+            "perchpub_url = \"https://api.perchpub.net\"\nupload_url = \"https://upload.perchpub.net:9000\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.upload_base().unwrap(), "https://upload.perchpub.net:9000");
+    }
+
+    #[test]
+    fn upload_base_overrides_existing_port_with_8443() {
+        // Deriving always targets the dedicated mTLS entrypoint, even when the
+        // enrollment URL carried an explicit (non-8443) port.
+        let cfg =
+            Config::from_toml_str("perchpub_url = \"https://api.perchpub.net:443\"\n").unwrap();
+        assert_eq!(cfg.upload_base().unwrap(), "https://api.perchpub.net:8443");
+    }
+
+    #[test]
+    fn upload_base_errors_without_perchpub_url() {
+        // No enrollment base and no explicit upload_url → nothing to derive.
+        assert!(Config::default().upload_base().is_err());
+    }
+
+    #[test]
+    fn upload_base_errors_on_unparseable_perchpub_url() {
+        let cfg = Config::from_toml_str("perchpub_url = \"not a url\"\n").unwrap();
+        assert!(matches!(cfg.upload_base(), Err(ConfigError::OutOfRange { .. })));
     }
 
     #[test]

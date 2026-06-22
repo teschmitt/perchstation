@@ -10,10 +10,13 @@
 //! - Disables the platform trust store entirely — the QR-bound CA is the
 //!   only acceptable trust anchor.
 //!
-//! Retry schedule (`contracts/perchpub-api.md` §1):
-//! transient 5xx / network → 5 s, 30 s, 120 s (then give up).
+//! Retry schedule (`contracts/perchpub-api.md` §1), capped at the 3-POST
+//! session budget (LIF-1):
+//! transient 5xx (≠ 502) / network → 5 s, 30 s (3 attempts total, then give up).
+//! 502 → terminal, surfaced as [`ConfirmError::ServerRejected`] (perchpub
+//!   unreachable behind Traefik; re-provision the session).
 //! 422 → terminal, surfaced as [`ConfirmError::SessionInvalid`].
-//! Other 4xx → terminal, surfaced as [`ConfirmError::ServerRejected`].
+//! Other 4xx (incl. 403) → terminal, surfaced as [`ConfirmError::ServerRejected`].
 
 use std::io::BufReader;
 use std::time::Duration;
@@ -70,10 +73,11 @@ pub enum ConfirmError {
 }
 
 /// Retry schedule for transient 5xx / network errors. Each entry is the
-/// sleep between attempts; `&[5s, 30s, 120s]` means: attempt → 5s → attempt
-/// → 30s → attempt → 120s → final attempt (4 attempts total).
-pub const TRANSIENT_BACKOFF: &[Duration] =
-    &[Duration::from_secs(5), Duration::from_secs(30), Duration::from_mins(2)];
+/// sleep between attempts; `&[5s, 30s]` means: attempt → 5s → attempt → 30s →
+/// final attempt (**3 attempts total**). Capped at three because perchpub's
+/// enrollment session counts every POST — even a failed one — and allows only
+/// three before the session must be re-provisioned (LIF-1, perchpub-api.md §1).
+pub const TRANSIENT_BACKOFF: &[Duration] = &[Duration::from_secs(5), Duration::from_secs(30)];
 
 /// Send the enrollment confirm request. Drives the retry loop, parses the
 /// response, and validates the returned cert against the local keypair and
@@ -183,6 +187,23 @@ fn classify_non_terminal_status(status: StatusCode, location: Option<String>) ->
     }
 }
 
+/// Classify a 5xx from the enrollment confirm endpoint (LIF-1). Per the
+/// session budget (`contracts/perchpub-api.md` §1) a 502 means the perchpub
+/// app is unreachable behind its Traefik front: surface it as terminal so the
+/// operator re-provisions, rather than spending one of the three allowed
+/// session POSTs on a doomed retry. Every other 5xx is a genuine transient
+/// blip and stays retryable within the budget.
+fn classify_server_error(status: StatusCode, body: String) -> AttemptError {
+    if status == StatusCode::BAD_GATEWAY {
+        AttemptError::Terminal(ConfirmError::ServerRejected {
+            status: status.as_u16(),
+            message: body,
+        })
+    } else {
+        AttemptError::Transient(format!("HTTP {status}: {body}"))
+    }
+}
+
 async fn attempt_once(
     client: &reqwest::Client,
     url: &str,
@@ -221,7 +242,9 @@ async fn attempt_once(
 
     if status.is_server_error() {
         let message = response.text().await.unwrap_or_default();
-        return Err(AttemptError::Transient(format!("HTTP {status}: {message}")));
+        // LIF-1: 502 is terminal (perchpub unreachable behind Traefik); other
+        // 5xx remain transient within the 3-POST session budget.
+        return Err(classify_server_error(status, message));
     }
 
     // 1xx / 3xx. Redirect-following is disabled at the client
@@ -631,5 +654,42 @@ mod tests {
             classify_non_terminal_status(StatusCode::CONTINUE, None),
             AttemptError::Transient(_)
         ));
+    }
+
+    #[test]
+    fn bad_gateway_is_terminal() {
+        // LIF-1: a 502 means perchpub is unreachable behind its Traefik front.
+        // Surface it (operator must re-provision) instead of spending one of
+        // the three allowed session POSTs on a doomed retry.
+        match classify_server_error(StatusCode::BAD_GATEWAY, "bad gateway".into()) {
+            AttemptError::Terminal(ConfirmError::ServerRejected { status, .. }) => {
+                assert_eq!(status, 502);
+            }
+            other => panic!("expected Terminal ServerRejected(502), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_5xx_stays_transient() {
+        // The session budget only forbids retrying 403/502; a 500/503/504 is a
+        // genuine transient blip and may still be retried within the budget.
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert!(
+                matches!(classify_server_error(status, "x".into()), AttemptError::Transient(_)),
+                "{status} must stay transient on the enrollment path",
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_session_budget_is_at_most_three_posts() {
+        // LIF-1: perchpub's enrollment session counts every POST (even
+        // failures) and allows only three. attempts = backoff.len() + 1.
+        let max_attempts = TRANSIENT_BACKOFF.len() + 1;
+        assert!(max_attempts <= 3, "confirm must not exceed 3 POSTs (got {max_attempts})");
     }
 }

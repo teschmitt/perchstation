@@ -16,10 +16,17 @@ use assert_cmd::cargo::cargo_bin;
 /// Schema mirrors `crates/perchstation-core/src/config.rs::Config` —
 /// `perchpub_url` is required at runtime by `ensure_runtime_ready`, and
 /// `data_dir` overrides the production default of `/var/lib/perchstation`.
+///
+/// The single-origin `FakePerchpub` serves enrollment *and* uploads on one
+/// ephemeral port, so `upload_url` is pinned to the same URL — otherwise the
+/// upload base would derive the production `:8443` entrypoint (PRV-2/UPL-1)
+/// and miss the fake's port.
 pub fn write_config_toml(data_dir: &Path, perchpub_url: &str) -> PathBuf {
     let path = data_dir.join("config.toml");
-    let body =
-        format!("perchpub_url = \"{perchpub_url}\"\ndata_dir = \"{}\"\n", data_dir.display());
+    let body = format!(
+        "perchpub_url = \"{perchpub_url}\"\nupload_url = \"{perchpub_url}\"\ndata_dir = \"{}\"\n",
+        data_dir.display()
+    );
     std::fs::write(&path, body).expect("write config.toml");
     path
 }

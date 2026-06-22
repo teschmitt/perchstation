@@ -4,10 +4,17 @@
 # the global `--config` flag (default `/etc/perchstation/config.toml`).
 # Every field has a built-in default; override only what you need.
 
-# perchpub mTLS endpoint URL the station uploads to. Fixed at enrollment
-# time — changing it requires re-enrollment so the station's cert chain
-# matches the new authority.
-perchpub_url = "https://perchpub.example.org"
+# perchpub *enrollment* base URL — the public Traefik entrypoint the station
+# enrolls against (`:443`). Fixed at enrollment time; changing it requires
+# re-enrollment so the station's cert chain matches the new authority.
+perchpub_url = "https://api.perchpub.net"
+
+# Optional override for the *upload* base — perchpub's edge terminates mTLS
+# uploads on a dedicated entrypoint (`:8443`), separate from the `:443`
+# enrollment entrypoint above. Leave unset to derive it automatically by
+# switching `perchpub_url` to port 8443 (e.g. https://api.perchpub.net:8443);
+# set it only to point uploads at a distinct host or port.
+# upload_url = "https://api.perchpub.net:8443"
 
 # Filesystem root for credentials/ and queue/{pending,inflight,delivered}/.
 # Under the bundled systemd unit this is `/var/lib/perchstation` via the

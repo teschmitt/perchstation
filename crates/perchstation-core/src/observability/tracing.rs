@@ -122,6 +122,10 @@ pub mod events {
     pub const QUEUE_RECOVERED_INFLIGHT: &str = "queue.recovered_inflight";
     pub const QUEUE_EVICTED: &str = "queue.evicted";
     pub const QUEUE_ZERO_LENGTH_SKIPPED: &str = "queue.zero_length_skipped";
+    /// A clip exceeding the 50 MiB upload ceiling was marked Undeliverable
+    /// before any upload was attempted, instead of round-tripping to a 413
+    /// at the perchpub edge (UPL-7).
+    pub const QUEUE_OVERSIZE_SKIPPED: &str = "queue.oversize_skipped";
     pub const QUEUE_DISK_FULL: &str = "queue.disk_full";
     /// A `pending/`/`delivered/` sidecar failed to deserialise and was
     /// moved to `corrupt/` so the scan head advances instead of failing on
