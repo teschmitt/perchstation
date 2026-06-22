@@ -16,6 +16,13 @@ path = "src/main.rs"
 name = "fakepub"
 path = "src/bin/fakepub.rs"
 
+# Dev-only helper: mint an enrollment QR PNG from a perchpub
+# `/enrollment/create` response plus a CA chain, so a camera-less host can
+# enrol with `enroll --qr-source file`. Not shipped in release artefacts.
+[[bin]]
+name = "mint-enroll-qr"
+path = "src/bin/mint-enroll-qr.rs"
+
 # Workspace-root contract tests live under `tests/contract/`. Each file is
 # attached individually here so `cargo test --workspace` picks them up.
 [[test]]
@@ -212,6 +219,9 @@ uuid         = { workspace = true }
 rcgen        = { workspace = true }
 rustls       = { workspace = true }
 rustls-pemfile = { workspace = true }
+# Used by the mint-enroll-qr helper bin to render the enrollment QR PNG.
+qrcode       = { workspace = true }
+image        = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
