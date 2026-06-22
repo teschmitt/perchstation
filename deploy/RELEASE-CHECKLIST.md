@@ -63,6 +63,20 @@ This document is the operator checklist for those steps.
    - Any `enrollment.refused*`, `enrollment.failed`, or
      `enrollment.session_invalid` event appears.
 
+> **Watch — gate-run 2026-06-18 finding B (confirm interop).** The first
+> on-device gate saw the confirm POST return `HTTP 502` against a
+> *cleartext* proxy path (a `curl` with a proper CSR got `200` on the same
+> box), and the client took the full 30 s confirm timeout
+> (`crates/perchstation-core/src/enrollment/confirm.rs`) to surface it
+> before retrying. That path is not how the release binary talks to
+> perchpub, so this enrollment MUST be done against the real Traefik mTLS
+> `:443` edge, where the 502 is expected to be absent. **If confirm
+> returns 502 (or any non-2xx) against the real edge:** capture
+> perchpub-side logs and open a follow-up to decide whether the confirm
+> client should fail fast on a definitive non-retryable status instead of
+> waiting out the 30 s timeout. Until this is observed clean on mTLS, treat
+> enrollment interop as unproven.
+
 ## Step 2 — Real perchpub interop
 
 1. Enable + start the service:
