@@ -27,10 +27,21 @@ companion UI. The on-device release smoke test in
 [`deploy/RELEASE-CHECKLIST.md`](deploy/RELEASE-CHECKLIST.md) is the
 release gate; no build ships without it.
 
+Two limitations are tracked against that gate. `perchstation status`
+runs in its own process and cannot read `serve`'s in-memory capture
+state, so its capture-side fields always render as "never observed" —
+watch live capture through the journal (`capture.*` events) instead. And
+enrollment-confirm interop must be validated against the real mTLS `:443`
+edge: a cleartext proxy path has shown 502s and client hangs. Both are
+recorded in
+[`deploy/RELEASE-CHECKLIST.md`](deploy/RELEASE-CHECKLIST.md).
+
 ## How it fits together
 
 `perchstation` is a single binary running as a systemd service on the Pi.
-Inside `perchstation serve` two cooperating tasks share one Tokio runtime:
+Inside `perchstation serve` three supervised tasks share one Tokio
+runtime: the capture loop, the delivery loop, and a classify-task poller
+that rides alongside delivery. The diagram traces the data plane:
 
 ```text
   motion sensor ─┐
@@ -49,13 +60,25 @@ The only data-plane contact between the two halves is the `Inbox` trait
 touches queue directories directly; the delivery loop never knows where
 clips come from. Either half can panic and the other keeps running.
 
+The perchpub side is a Traefik edge with two TLS entrypoints, and the
+station treats them differently. Enrollment talks to `perchpub_url`
+(the `:443` entrypoint) and pins **only** the CA chain delivered in the
+enrollment QR — the public trust store is disabled. Clip uploads go to
+`upload_url` (`:8443` by default) over mTLS and validate the perchpub
+server against the **public** root store (e.g. Let's Encrypt) *plus*
+the enrollment CA when present, so both publicly-rooted and
+privately-rooted perchpub deployments work. Which *host* the station
+will talk to is pinned by the outbound-authority allowlist (see
+[Privacy & networking posture](#privacy--networking-posture)), not by
+the trust store.
+
 The workspace is a deliberate split along the hardware boundary:
 
 | Crate | Role |
 | --- | --- |
 | `crates/perchstation-core` | Platform-agnostic: delivery state machine, capture state machine, queue, perchpub client, enrollment, observability. Compiles on any host. |
 | `crates/perchstation-hw` | The only place hardware lives (Linux-gated): `GpioMotionSensor`, `LibcameraVidCamera`, camera QR source, monotonic `Clock`. |
-| `crates/perchstation` | The operator-facing binary (`enroll` / `serve` / `status`) and the dev-only `fakepub` binary. |
+| `crates/perchstation` | The operator-facing binary (`enroll` / `serve` / `status`) plus two dev-only binaries: `fakepub` (a perchpub stand-in) and `mint-enroll-qr` (renders an enrollment QR for camera-less hosts). |
 
 This split is a constitutional rule, not a stylistic one — see
 [`.specify/memory/constitution.md`](.specify/memory/constitution.md)
@@ -147,12 +170,18 @@ The full annotated configuration template lives in
 [`deploy/config.example.toml`](deploy/config.example.toml). The
 highlights:
 
-- `perchpub_url` — the mTLS endpoint; fixed at enrollment time.
+- `perchpub_url` — the enrollment base (the perchpub edge's `:443`
+  entrypoint); fixed at enrollment time, since changing it invalidates
+  the pinned cert chain.
+- `upload_url` — optional override for the mTLS upload base. Defaults to
+  `perchpub_url` with the port switched to `:8443`; set it only to point
+  uploads at a distinct host or port.
 - `data_dir` — root for `credentials/`, `queue/`, and `capture-staging/`.
   Defaults to `/var/lib/perchstation`, populated by systemd via
   `StateDirectory=perchstation`.
-- `[queue]` — `max_clips`, `max_bytes`, and an explicit `eviction`
-  policy (`drop_oldest_undelivered` or `refuse_new`).
+- `[queue]` — `max_clips`, `max_bytes`, `delivered_retention_hours`, and
+  an explicit `eviction` policy (`drop_oldest_undelivered` or
+  `refuse_new`).
 - `[retry]` — exponential backoff with jitter, capped per-attempt delay,
   per-clip attempt ceiling and wall-clock budget.
 - `[capture]` — clip duration, cooldown, sensor liveness threshold,
@@ -198,6 +227,15 @@ cargo run -p perchstation --bin fakepub -- --listen 127.0.0.1:8443 \
     --tls-cert <pem> --tls-key <pem> --ca <pem> --ca-key <pem>
 ```
 
+To enrol a camera-less host, mint an enrollment QR PNG from a perchpub
+`/enrollment/create` response plus its CA chain, then feed it to
+`enroll --qr-source file`:
+
+```sh
+cargo run -p perchstation --bin mint-enroll-qr -- \
+    --create-response <create.json|-> --ca-chain <ca-chain.pem> --out <qr.png|->
+```
+
 Cross-build for the Pi:
 
 ```sh
@@ -217,16 +255,25 @@ post-mortems for shipped features live in [`docs/`](docs/).
 ## Privacy & networking posture
 
 The station emits **no telemetry**. The only outbound traffic it makes
-is to the configured perchpub authority, plus the system-configured time
-and name-resolution services it depends on. This is enforced as a
-tested invariant (`tests/integration/outbound_allowlist.rs`) and
-spot-checked by hand on real hardware via Step 4 of the release
-checklist.
+is to the configured perchpub authority (enrollment on `perchpub_url`,
+uploads on `upload_url`), plus the system-configured time and
+name-resolution services it depends on. This is enforced as a tested
+invariant (`tests/integration/outbound_allowlist.rs`) — every request's
+authority is checked against the configured base and 3xx redirects are
+refused — and spot-checked by hand on real hardware via Step 4 of the
+release checklist. TLS verification is never disabled; the trust stores
+differ by entrypoint, as described under
+[How it fits together](#how-it-fits-together).
 
 Private keys are generated on-device during enrollment and never leave
-it. The systemd unit hardens the process with `ProtectSystem=strict`,
-`PrivateDevices=true`, a narrow `SystemCallFilter=@system-service`, and
-`MemoryDenyWriteExecute=true`; see
+it. The systemd unit (`Type=notify`, run as an unprivileged
+`perchstation` user) hardens the process with `ProtectSystem=strict`,
+`MemoryDenyWriteExecute=true`, `NoNewPrivileges=true`, and a narrow
+`SystemCallFilter=@system-service`. Rather than `PrivateDevices=true`
+(which would hide the camera and GPIO nodes the capture loop needs), it
+uses a closed device policy that grants only the GPIO character device
+(`DeviceAllow=/dev/gpiochip0`). Further `Protect*`, `Restrict*`, and
+`Lock*` directives round it out; see
 [`deploy/systemd/perchstation.service`](deploy/systemd/perchstation.service).
 
 ## License
