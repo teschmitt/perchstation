@@ -5,10 +5,14 @@
 //! [`crate::perchpub::client`]:
 //!
 //! - Uses plain TLS (no client certificate is presented).
-//! - Pins to the CA chain delivered through the QR payload, not
-//!   `credentials/ca_chain.pem` (which doesn't exist yet).
-//! - Disables the platform trust store entirely — the QR-bound CA is the
-//!   only acceptable trust anchor.
+//! - Validates the public `:443` edge against the **system/public trust
+//!   store** (§7): that edge is served with a publicly trusted (Let's Encrypt)
+//!   certificate, so system trust — not the QR's device CA — is what anchors
+//!   it. Certificate verification is never disabled (SEC-4).
+//! - The QR's `ca_chain_pem` is the **device CA**, not the edge CA. It is
+//!   added only as an *additive* trust anchor (so a privately-rooted dev/edge
+//!   deployment still validates) and is used by [`validate_chain`] to verify
+//!   the device-issued leaf — it does *not* anchor the `:443` edge.
 //!
 //! Retry schedule (`contracts/perchpub-api.md` §1), capped at the 3-POST
 //! session budget (LIF-1):
@@ -28,7 +32,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::perchpub::types::{EnrollmentRequest, EnrollmentResponse, HTTPValidationError};
-use crate::tls::{TlsBuilderError, rustls_builder_with_roots};
+use crate::tls::{TlsBuilderError, rustls_builder_for_upload};
 
 /// Successful confirm response, validated end-to-end against the station's
 /// in-memory keypair. The cert and CA chain returned here are what
@@ -260,16 +264,25 @@ async fn attempt_once(
 }
 
 fn build_client(ca_chain_pem: &str) -> Result<reqwest::Client, ConfirmError> {
-    // Shared hardened rustls base (PS-31): rustls backend, no platform roots,
-    // TLS >= 1.2, HTTPS-only, no redirect following, CA pinned. The confirm
-    // client presents no identity (plain TLS) and uses a 30-second timeout.
-    // The no-redirect policy is essential here: a 307/308 preserves method +
-    // body, so following it would re-POST the bearer auth_token + CSR to
-    // whatever host the server names in Location.
-    let builder = rustls_builder_with_roots(ca_chain_pem.as_bytes()).map_err(|err| match err {
-        TlsBuilderError::EmptyRoots => ConfirmError::CaChainEmpty,
-        TlsBuilderError::Parse(message) => ConfirmError::TlsConfig(message),
-    })?;
+    // F2/§7: validate the `:443` enrollment edge against the system/public
+    // trust store — that edge is a publicly trusted (Let's Encrypt) cert, not
+    // a device-CA-issued one. The QR's device CA is still required (the empty
+    // check below), but only as an *additive* anchor and for verifying the
+    // device-issued leaf in `validate_chain` — not to anchor the public edge,
+    // so the QR no longer needs to smuggle the edge's public intermediate.
+    //
+    // Hardened rustls base (PS-31): rustls backend, TLS >= 1.2, HTTPS-only, no
+    // redirect following — a 307/308 preserves method + body, so following it
+    // would re-POST the bearer auth_token + CSR to a server-named host.
+    // Certificate verification is never disabled (SEC-4). The confirm client
+    // presents no identity (plain TLS) and uses a 30-second timeout.
+    if ca_chain_pem.trim().is_empty() {
+        return Err(ConfirmError::CaChainEmpty);
+    }
+    let builder =
+        rustls_builder_for_upload(Some(ca_chain_pem.as_bytes())).map_err(|err| match err {
+            TlsBuilderError::Parse(message) => ConfirmError::TlsConfig(message),
+        })?;
     builder
         .timeout(Duration::from_secs(30))
         .build()
@@ -466,6 +479,12 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).single().unwrap()
     }
 
+    /// Install the ring crypto provider the rustls backend needs to `build()`
+    /// a reqwest client. Process-global and idempotent.
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[test]
     fn validate_response_accepts_well_formed_chain() {
         let (ca_pem, ca_cert, ca_key) = build_ca();
@@ -621,8 +640,25 @@ mod tests {
 
     #[test]
     fn build_client_accepts_valid_ca() {
+        install_crypto_provider();
         let (ca_pem, _, _) = build_ca();
         build_client(&ca_pem).expect("a valid CA chain builds a client");
+    }
+
+    #[test]
+    fn build_client_validates_public_edge_with_device_ca_additive() {
+        // F2/§7: the confirm client validates the public `:443` edge against
+        // system trust, with the QR's device CA added only as an extra anchor
+        // — so a build over a *device-CA-only* chain (no public/edge
+        // intermediate) succeeds. The old builder pinned only that CA and
+        // disabled public roots; this asserts that model is gone. The live
+        // public-edge handshake is exercised end-to-end by
+        // tests/integration/enrollment_happy.rs, where the station validates
+        // fakepub's server cert via the additive device CA.
+        install_crypto_provider();
+        let (device_ca_pem, _, _) = build_ca();
+        build_client(&device_ca_pem)
+            .expect("device-CA-only chain builds a system-trust confirm client");
     }
 
     #[test]

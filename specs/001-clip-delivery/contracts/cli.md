@@ -55,27 +55,34 @@ Flags:
 | -------------- | ---- | ---------- | ------------------------------------------------------------------------------------ |
 | `--qr-source`  | enum | `camera`   | `camera` uses the on-board camera; `file` reads a PNG/JPEG (recovery path).          |
 | `--qr-file`    | path | —          | Required when `--qr-source=file`.                                                    |
-| `--force`      | bool | false      | Permit overwriting existing on-disk credentials; **logs prominently**, never silent. |
+| `--force`      | bool | false      | Enroll as a **new** station: mint a fresh keypair (new SPKI), discarding any existing identity. Without it, a re-enroll **reuses** the persisted keypair (same station). The new-identity path **logs prominently**, never silent. |
 
 Behaviour:
 
-1. Verify no `credentials/identity.json` exists. If one does and `--force`
-   is not set, exit `76` with a clear message naming the existing
-   `station_id` and `cert_not_after`.
+1. Decide the keypair (device-cert contract §2/§8 — the keypair *is* the
+   station identity). With `--force`, generate a fresh keypair (a deliberately
+   new station, new SPKI). Otherwise reuse the persisted `credentials/station.key`
+   if present (same station — the issued leaf keeps the same SPKI, refreshing
+   the certificate; the §8 manual-renewal path); if no key exists yet, this is
+   the first enrollment and a keypair is generated. A present-but-unreadable
+   key without `--force` is an error (exit `74`), never a silent re-mint.
 2. Acquire one QR frame from the configured source.
 3. Decode the QR; parse the JSON payload to `EnrollmentSessionMaterial`.
-4. Generate an Ed25519 keypair in memory; build a CSR; serialise the CSR
-   to PEM.
+4. Build a CSR over the chosen keypair (CN == first DNS SAN == a stable,
+   unique `station-<id>`, device-cert contract §3); serialise it to PEM.
 5. Call `POST /api/v1/enrollment/confirm/{session_id}` with `auth_token`
    and `csr_pem`.
 6. On `success == true`, validate that the returned `certificate_pem`
    chains to `ca_chain_pem` and matches the held private key. Persist the
-   four files in `credentials/` atomically.
+   four files in `credentials/` atomically (overwriting on a re-enroll).
 7. Print a single human-readable confirmation line including the
-   `station_id`. Exit `0`.
+   `station_id`. Exit `0`. A `--force` re-enroll additionally emits a
+   prominent `WARN`-level audit naming both the old and new `station_id`.
 
 Failures, in priority order:
-- Existing identity present, no `--force`: exit `76`.
+- Existing `station.key` present but unreadable, no `--force`: exit `74`
+  (re-run with `--force` to enroll as a new station rather than risk
+  orphaning the identity).
 - QR not found / undecodable: exit `74`.
 - Network/TLS error reaching perchpub: retry per the enrollment-tier
   schedule in `contracts/perchpub-api.md`; after exhaustion, exit `75`.

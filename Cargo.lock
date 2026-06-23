@@ -1437,6 +1437,7 @@ dependencies = [
  "qrcode",
  "rcgen",
  "reqwest",
+ "ring",
  "rqrr",
  "rustls",
  "rustls-pemfile",

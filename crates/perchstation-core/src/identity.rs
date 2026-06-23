@@ -19,6 +19,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
+use rcgen::KeyPair;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -45,6 +46,8 @@ pub enum IdentityError {
     },
     #[error("certificate file `{path}` is not valid PEM: {message}")]
     CertPem { path: PathBuf, message: String },
+    #[error("private key file `{path}` is not a usable keypair: {message}")]
+    KeyPem { path: PathBuf, message: String },
     #[error("certificate file `{path}` does not contain a parsable X.509: {message}")]
     CertX509 { path: PathBuf, message: String },
     #[error("certificate `not_after` ({timestamp}) is not representable as a UTC timestamp")]
@@ -135,7 +138,8 @@ pub struct SaveOptions<'a> {
 
 /// Return the `station_id` recorded in `<data_dir>/credentials/identity.json`
 /// if the file is present and parseable. Used by the enrollment command to
-/// build the `enrollment.refused_overwrite` event before refusing.
+/// name the prior station in the `enrollment.overwritten` audit when `--force`
+/// mints a new identity.
 ///
 /// Returns `Ok(None)` if `identity.json` is absent — the directory may not
 /// exist at all (fresh station) or may have been partially staged.
@@ -150,6 +154,22 @@ pub fn peek_existing_station_id(data_dir: &Path) -> Result<Option<Uuid>, Identit
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(IdentityError::Io { path: identity_path, source }),
     }
+}
+
+/// Load the persisted private key back into an rcgen [`KeyPair`].
+///
+/// Reads `<data_dir>/credentials/station.key` (PEM) and parses it. This is the
+/// generate-once / reuse-for-life path (device-cert contract §2/§8): a renewal
+/// or a same-station re-enroll rebuilds its CSR over *this* key (via
+/// [`crate::enrollment::csr::build_from_keypair`]) so the issued leaf keeps the
+/// same `SHA256(SubjectPublicKeyInfo)` and perchpub recognises the same
+/// station with no server-side re-pin. The returned key never leaves the device.
+pub fn load_keypair(data_dir: &Path) -> Result<KeyPair, IdentityError> {
+    let key_path = data_dir.join(CREDENTIALS_DIR).join(STATION_KEY_FILE);
+    let pem = std::fs::read_to_string(&key_path)
+        .map_err(|source| IdentityError::Io { path: key_path.clone(), source })?;
+    KeyPair::from_pem(&pem)
+        .map_err(|err| IdentityError::KeyPem { path: key_path, message: err.to_string() })
 }
 
 /// Atomically persist a freshly-enrolled identity into
@@ -407,6 +427,31 @@ mod tests {
         params.not_after = rcgen::date_time_ymd(2099, 1, 1);
         let cert = params.self_signed(&key).expect("self-sign");
         (cert.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn load_keypair_round_trips_to_same_spki() {
+        // §2/§8: a saved-then-loaded key must yield the same SPKI, so a CSR
+        // rebuilt from the reloaded key re-presents the same station identity.
+        let dir = TempDir::new().expect("tempdir");
+        let creds = dir.path().join(CREDENTIALS_DIR);
+        fs::create_dir_all(&creds).unwrap();
+        let original = KeyPair::generate_for(&PKCS_ED25519).expect("keypair");
+        fs::write(creds.join(STATION_KEY_FILE), original.serialize_pem()).unwrap();
+
+        let loaded = load_keypair(dir.path()).expect("load station.key");
+        assert_eq!(
+            loaded.public_key_der(),
+            original.public_key_der(),
+            "reloaded key has a different SPKI",
+        );
+    }
+
+    #[test]
+    fn load_keypair_reports_missing_key() {
+        let dir = TempDir::new().expect("tempdir");
+        let err = load_keypair(dir.path()).expect_err("no station.key present");
+        assert!(matches!(err, IdentityError::Io { .. }));
     }
 
     #[test]

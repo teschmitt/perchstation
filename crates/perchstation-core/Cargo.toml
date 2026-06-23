@@ -27,6 +27,7 @@ thiserror            = { workspace = true }
 uuid                 = { workspace = true }
 chrono               = { workspace = true }
 x509-parser          = { workspace = true }
+ring                 = { workspace = true }
 async-trait          = { workspace = true }
 futures              = { workspace = true }
 

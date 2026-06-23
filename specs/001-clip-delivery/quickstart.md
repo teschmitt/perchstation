@@ -178,17 +178,19 @@ JSON form:
 cargo run -p perchstation -- --config "$PERCHSTATION_DATA/config.toml" status --json | jq .
 ```
 
-## 5. Re-enrollment is refused
+## 5. Re-enrollment reuses the keypair
 
 ```sh
 cargo run -p perchstation -- \
     --config "$PERCHSTATION_DATA/config.toml" \
     enroll --qr-source file --qr-file "$FIXTURES/enroll-session.png"
-# exit code 76, message names the existing station_id and cert expiry.
+# exit 0: reuses the persisted station.key (same SPKI = same station) and
+# refreshes the certificate — the device-cert contract §8 manual-renewal path.
 ```
 
-`--force` is required to overwrite; the event log records
-`enrollment.refused_overwrite` either way.
+Add `--force` to enroll as a *new* station instead: it mints a fresh keypair
+(new SPKI), discards the prior identity, and logs a prominent
+`enrollment.overwritten` audit naming both the old and new `station_id`.
 
 ## 6. (Optional) Cross-build for a Pi
 

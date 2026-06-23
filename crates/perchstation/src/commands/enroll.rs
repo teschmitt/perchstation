@@ -40,30 +40,13 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
             CommandError::Config(anyhow!("`perchpub_url` is required for enrollment"))
         })?;
 
-    // FR-003 — refuse to clobber an existing identity. The log event
-    // fires *before* we touch the source, so the operator sees the
-    // refusal even if the QR was unreachable.
-    if !args.force {
-        match identity::peek_existing_station_id(&config.data_dir) {
-            Ok(Some(existing_station_id)) => {
-                tracing::error!(
-                    event = obs_tracing::events::ENROLLMENT_REFUSED_OVERWRITE,
-                    existing_station_id = %existing_station_id,
-                    data_dir = %config.data_dir.display(),
-                    "credentials already exist; re-run with --force to replace"
-                );
-                return Err(CommandError::Unrecoverable(anyhow!(
-                    "credentials already exist for station {existing_station_id}; pass --force to replace"
-                )));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Err(CommandError::Io(anyhow!(
-                    "could not inspect existing credentials: {err}"
-                )));
-            }
-        }
-    }
+    // Re-enroll semantics (device-cert contract §2/§8): the keypair *is* the
+    // station identity — perchpub pins its SPKI — so it is generated once and
+    // reused for the station's life. A plain re-enroll therefore REUSES the
+    // persisted key (same station, refreshed certificate; the §8 manual-renewal
+    // path); only `--force` mints a fresh keypair = a deliberately NEW station
+    // (new SPKI, prior identity discarded). The CSR step below applies that
+    // choice; here we just record the prior `station_id` for the audit log.
     let previous_station_id = identity::peek_existing_station_id(&config.data_dir).ok().flatten();
 
     // --- 1. Acquire a QR frame ---
@@ -86,19 +69,57 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
         "decoded enrollment QR"
     );
 
-    // --- 3. Generate Ed25519 keypair + CSR ---
-    let csr = csr::generate().map_err(|err| {
-        tracing::error!(
-            event = obs_tracing::events::ENROLLMENT_FAILED,
-            kind = "csr",
-            message = %err,
-            "CSR generation failed"
-        );
-        CommandError::Io(anyhow!("CSR generation failed: {err}"))
-    })?;
+    // --- 3. Obtain the station keypair + build the CSR ---
+    //
+    // The fresh-key path (`csr::generate`) is reachable ONLY at initial
+    // enrollment (no persisted key) or under `--force` (deliberate new
+    // station). Every other re-enroll loads `station.key` and builds the CSR
+    // over it (`csr::build_from_keypair`) so the issued leaf keeps the same
+    // SPKI (§2/§8). A present-but-unreadable key without `--force` is an error,
+    // never a silent re-mint — that would orphan the station's identity.
+    let (csr, reused_key) = if args.force {
+        (build_fresh_csr()?, false)
+    } else {
+        match identity::load_keypair(&config.data_dir) {
+            Ok(existing_key) => {
+                let built = csr::build_from_keypair(existing_key).map_err(|err| {
+                    tracing::error!(
+                        event = obs_tracing::events::ENROLLMENT_FAILED,
+                        kind = "csr",
+                        message = %err,
+                        "CSR build over the persisted keypair failed"
+                    );
+                    CommandError::Io(anyhow!("CSR build failed: {err}"))
+                })?;
+                (built, true)
+            }
+            Err(IdentityError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                (build_fresh_csr()?, false)
+            }
+            Err(err) => {
+                tracing::error!(
+                    event = obs_tracing::events::ENROLLMENT_FAILED,
+                    kind = "key_load",
+                    message = %err,
+                    "existing station.key could not be loaded; pass --force to enroll as a NEW station"
+                );
+                return Err(CommandError::Io(anyhow!(
+                    "existing station.key is unreadable: {err}; pass --force to enroll as a new station"
+                )));
+            }
+        }
+    };
     tracing::info!(
         event = obs_tracing::events::ENROLLMENT_CSR_GENERATED,
-        "built fresh Ed25519 keypair and CSR"
+        key_origin = if reused_key { "reused" } else { "generated" },
+        "{}",
+        if reused_key {
+            "reusing the persisted keypair (same SPKI, same station); refreshing the certificate"
+        } else {
+            "built a fresh Ed25519 keypair and CSR (new station identity / SPKI)"
+        }
     );
 
     // --- 4. POST /enrollment/confirm ---
@@ -126,14 +147,21 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
     };
 
     // --- 5. Atomically persist credentials ---
-    let identity = persist_identity(config, &confirmed, &csr, args.force)?;
+    // Overwrite whenever we are replacing an existing set — a reused key (same
+    // station, refreshed cert), a `--force` new-station mint, or any prior
+    // credentials on disk.
+    let overwrite = reused_key || args.force || previous_station_id.is_some();
+    let identity = persist_identity(config, &confirmed, &csr, overwrite)?;
 
-    if let Some(prev) = previous_station_id {
+    // Audit the identity transition. A reused key is the same station (no loud
+    // event); a fresh key over a prior identity orphans it — loud, operator-
+    // visible audit naming both the old and the new station.
+    if !reused_key && let Some(prev) = previous_station_id {
         tracing::warn!(
             event = obs_tracing::events::ENROLLMENT_OVERWRITTEN,
             previous_station_id = %prev,
             station_id = %identity.station_id,
-            "--force replaced an existing identity"
+            "minted a NEW keypair (new SPKI); the previous station identity was discarded"
         );
     }
 
@@ -141,6 +169,7 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
         event = obs_tracing::events::ENROLLMENT_PERSISTED,
         station_id = %identity.station_id,
         cert_not_after = %identity.cert_not_after.to_rfc3339(),
+        key_origin = if reused_key { "reused" } else { "generated" },
         "enrollment complete"
     );
 
@@ -151,6 +180,21 @@ pub async fn run(args: EnrollArgs, config: &Config) -> Result<(), CommandError> 
     );
 
     Ok(())
+}
+
+/// Generate a fresh Ed25519 keypair and build a conformant CSR over it — the
+/// initial-enrollment / `--force` (new-station) path. Logs and maps the failure
+/// to the I/O exit code.
+fn build_fresh_csr() -> Result<csr::EnrollmentCsr, CommandError> {
+    csr::generate().map_err(|err| {
+        tracing::error!(
+            event = obs_tracing::events::ENROLLMENT_FAILED,
+            kind = "csr",
+            message = %err,
+            "CSR generation failed"
+        );
+        CommandError::Io(anyhow!("CSR generation failed: {err}"))
+    })
 }
 
 fn build_qr_source(
@@ -262,7 +306,7 @@ fn persist_identity(
     config: &Config,
     confirmed: &ConfirmedEnrollment,
     csr: &csr::EnrollmentCsr,
-    force: bool,
+    overwrite: bool,
 ) -> Result<perchstation_core::identity::StationIdentity, CommandError> {
     identity::save(
         &config.data_dir,
@@ -273,7 +317,7 @@ fn persist_identity(
             station_key_pem: &csr.keypair.serialize_pem(),
             station_cert_pem: &confirmed.certificate_pem,
             ca_chain_pem: &confirmed.ca_chain_pem,
-            overwrite: force,
+            overwrite,
         },
     )
     .map_err(|err| match err {

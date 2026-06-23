@@ -86,8 +86,10 @@ pub struct EnrollArgs {
     #[arg(long, value_name = "PATH")]
     pub qr_file: Option<PathBuf>,
 
-    /// Permit overwriting existing on-disk credentials. Logged prominently;
-    /// never silent.
+    /// Enroll as a NEW station: mint a fresh keypair (new SPKI), discarding any
+    /// existing identity. Without `--force`, re-enrolling reuses the persisted
+    /// keypair (same station, refreshed certificate). The new-identity path is
+    /// logged prominently; never silent.
     #[arg(long)]
     pub force: bool,
 }

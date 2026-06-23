@@ -35,8 +35,12 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     create_response: String,
 
-    /// Perchpub CA-chain PEM file: the CA that signs both perchpub's server
-    /// certificate and the issued station certificate.
+    /// Perchpub **device CA** chain PEM file: the CA that signs issued station
+    /// certificates (intermediate [+ root]). Device-CA-only — it does **not**
+    /// carry the public/Let's Encrypt `:443` edge intermediate, because the
+    /// station validates that edge against system trust (device-cert contract
+    /// §7). The station uses this chain to verify the issued leaf and as the
+    /// upload server-trust additive anchor.
     #[arg(long, value_name = "FILE")]
     ca_chain: PathBuf,
 
@@ -48,8 +52,9 @@ struct Args {
 /// Render the enrollment QR PNG bytes for the given session material.
 ///
 /// EC level `L` maximises capacity (~2953 bytes) because the PNG is decoded
-/// from a clean file, not a noisy camera frame; a multi-cert CA chain is
-/// already near that ceiling.
+/// from a clean file, not a noisy camera frame; a multi-cert device-CA chain
+/// can still approach that ceiling (now smaller — the public/edge intermediate
+/// is no longer carried, per device-cert contract §7).
 fn render_enrollment_qr_png(
     session_id: Uuid,
     auth_token: &str,
@@ -91,6 +96,21 @@ struct CreateResponse {
 /// Extract `(session_id, auth_token)` from a `/enrollment/create` JSON body.
 /// Extra fields such as `expires_at` are ignored.
 fn parse_create_response(json: &str) -> anyhow::Result<(Uuid, String)> {
+    // A failed create returns a perchpub error envelope (`{"detail": ...}`)
+    // instead of a session — e.g. an expired/invalid bearer token yields
+    // `{"detail":"Could not validate credentials"}`. Surface that legibly
+    // rather than the cryptic serde "missing field `session_id`".
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(json)
+        && let Some(detail) = map.get("detail")
+        && !map.contains_key("session_id")
+    {
+        return Err(anyhow!(
+            "the /enrollment/create call did not return a session — perchpub responded with an \
+             error: {detail}. The usual cause is an expired or invalid bearer token; refresh it \
+             and retry."
+        ));
+    }
+
     let parsed: CreateResponse = serde_json::from_str(json)
         .map_err(|e| anyhow!("parse /enrollment/create JSON response: {e}"))?;
     if parsed.auth_token.is_empty() {
@@ -180,6 +200,22 @@ mod tests {
         let err = render_enrollment_qr_png(Uuid::new_v4(), "tok", "   \n")
             .expect_err("blank CA chain must be refused");
         assert!(err.to_string().contains("CA chain"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_create_response_surfaces_perchpub_error_envelope() {
+        // A failed create (e.g. an expired bearer token) returns
+        // `{"detail": ...}` and no session. The helper must explain that —
+        // not emit a cryptic "missing field `session_id`".
+        let err = parse_create_response(r#"{"detail":"Could not validate credentials"}"#)
+            .expect_err("an error envelope must not parse as a session");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not return a session")
+                && msg.contains("Could not validate credentials"),
+            "error should name the perchpub detail; got: {msg}"
+        );
+        assert!(!msg.contains("missing field"), "should not leak the raw serde error; got: {msg}");
     }
 
     #[test]

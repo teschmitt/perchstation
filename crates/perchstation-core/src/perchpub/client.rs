@@ -121,28 +121,45 @@ fn build_inner(creds: &Path) -> Result<Client, ClientError> {
     let key_pem = std::fs::read(&key_path)
         .map_err(|source| ClientError::CredentialIo { path: key_path.clone(), source })?;
 
-    // reqwest::Identity::from_pem wants cert(s) followed by the private
-    // key, all in one PEM-encoded buffer.
-    let mut identity_pem = Vec::with_capacity(cert_pem.len() + key_pem.len() + 1);
-    identity_pem.extend_from_slice(&cert_pem);
-    if !cert_pem.ends_with(b"\n") {
-        identity_pem.push(b'\n');
-    }
-    identity_pem.extend_from_slice(&key_pem);
-
-    let identity = Identity::from_pem(&identity_pem)
-        .map_err(|err| ClientError::TlsConfig(format!("identity: {err}")))?;
-
     // Additionally trust the operator's enrollment CA chain when present
     // (UPL-8): always there in a normal deployment, absent only for a pure
     // public-edge setup. `NotFound` is fine (public roots suffice); any other
-    // read error surfaces.
+    // read error surfaces. The same chain also supplies the issuing
+    // intermediate appended to the client identity below.
     let ca_path = creds.join(CA_CHAIN_FILE);
     let ca_pem = match std::fs::read(&ca_path) {
         Ok(pem) => Some(pem),
         Err(err) if err.kind() == io::ErrorKind::NotFound => None,
         Err(source) => return Err(ClientError::CredentialIo { path: ca_path, source }),
     };
+
+    // §6 (F5): present the FULL client chain — leaf, then the issuing
+    // intermediate (selected from `ca_chain.pem` by matching the leaf's issuer;
+    // a self-signed root is never sent), then the private key, all in one
+    // PEM-encoded buffer as `reqwest::Identity::from_pem` expects. perchpub's
+    // edge does `RequireAndVerifyClientCert` against the device CA and checks
+    // `leaf.verify_directly_issued_by(intermediate)`, so presenting the
+    // intermediate lets the edge build the chain. When no intermediate is found
+    // (leaf issued directly by a root, or no chain on disk) the handshake
+    // presents the leaf alone, exactly as before.
+    let intermediate_pem = ca_pem.as_deref().and_then(|ca| issuing_intermediate_pem(&cert_pem, ca));
+    let intermediate_len = intermediate_pem.as_ref().map_or(0, String::len);
+    let mut identity_pem =
+        Vec::with_capacity(cert_pem.len() + intermediate_len + key_pem.len() + 2);
+    identity_pem.extend_from_slice(&cert_pem);
+    if !cert_pem.ends_with(b"\n") {
+        identity_pem.push(b'\n');
+    }
+    if let Some(intermediate) = &intermediate_pem {
+        identity_pem.extend_from_slice(intermediate.as_bytes());
+        if !intermediate.ends_with('\n') {
+            identity_pem.push(b'\n');
+        }
+    }
+    identity_pem.extend_from_slice(&key_pem);
+
+    let identity = Identity::from_pem(&identity_pem)
+        .map_err(|err| ClientError::TlsConfig(format!("identity: {err}")))?;
 
     // Hardened rustls base (PS-31) validating perchpub's *server* cert against
     // the public root store plus the enrollment CA when present (UPL-8):
@@ -152,9 +169,6 @@ fn build_inner(creds: &Path) -> Result<Client, ClientError> {
     // server-driven URL swaps; the allowlist gate (`check_authority`) catches
     // caller-built URLs.
     let builder = rustls_builder_for_upload(ca_pem.as_deref()).map_err(|err| match err {
-        TlsBuilderError::EmptyRoots => {
-            ClientError::TlsConfig("upload TLS builder produced no roots".to_owned())
-        }
         TlsBuilderError::Parse(message) => ClientError::TlsConfig(message),
     })?;
 
@@ -163,6 +177,57 @@ fn build_inner(creds: &Path) -> Result<Client, ClientError> {
         .timeout(Duration::from_mins(1))
         .build()
         .map_err(|err| ClientError::TlsConfig(err.to_string()))
+}
+
+/// Find the issuing intermediate's PEM block within `ca_chain_pem`: the cert
+/// whose Subject equals the leaf's Issuer and that is **not** self-signed (the
+/// root is never sent, §6). Selection is by issuer match, not by position.
+///
+/// Returns `None` — so the handshake falls back to a leaf-only identity — when
+/// the chain has no such intermediate (leaf issued directly by a root), or when
+/// the leaf / chain cannot be parsed. Chain assembly is best-effort: a parse
+/// hiccup must not brick an otherwise-valid mTLS client.
+fn issuing_intermediate_pem(leaf_pem: &[u8], ca_chain_pem: &[u8]) -> Option<String> {
+    let leaf_issuer = {
+        let (_, pem) = x509_parser::pem::parse_x509_pem(leaf_pem).ok()?;
+        let leaf = pem.parse_x509().ok()?;
+        leaf.tbs_certificate.issuer.as_raw().to_vec()
+    };
+    for block in pem_cert_blocks(ca_chain_pem) {
+        let Ok((_, pem)) = x509_parser::pem::parse_x509_pem(block.as_bytes()) else { continue };
+        let Ok(cert) = pem.parse_x509() else { continue };
+        let subject = cert.tbs_certificate.subject.as_raw();
+        let issuer = cert.tbs_certificate.issuer.as_raw();
+        // The issuing intermediate signed the leaf (its Subject == the leaf's
+        // Issuer) and is not a self-signed root (Subject != Issuer).
+        if subject == leaf_issuer.as_slice() && subject != issuer {
+            return Some(block);
+        }
+    }
+    None
+}
+
+/// Split a PEM bundle into its individual `CERTIFICATE` blocks (each including
+/// its `-----BEGIN/END-----` armor), preserving the original text so a matched
+/// block can be appended verbatim. Non-certificate lines are ignored.
+fn pem_cert_blocks(pem: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(pem);
+    let mut blocks = Vec::new();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE-----") {
+            current = Some(String::new());
+        }
+        let ends = line.starts_with("-----END CERTIFICATE-----");
+        if let Some(buf) = current.as_mut() {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+        if ends && let Some(buf) = current.take() {
+            blocks.push(buf);
+        }
+    }
+    blocks
 }
 
 impl PerchpubClient {
@@ -399,7 +464,8 @@ mod tests {
     use super::*;
     use crate::perchpub::types::ClassifyTaskStatus;
     use rcgen::{
-        BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
+        KeyUsagePurpose, PKCS_ED25519,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -438,6 +504,64 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
+    /// Write a three-tier `root → intermediate → leaf` credential set:
+    /// `station.crt` = leaf, `station.key` = leaf key, `ca_chain.pem` =
+    /// `intermediate + root`. Returns `(leaf_pem, intermediate_pem, root_pem)`.
+    fn write_three_tier_credentials(dir: &Path) -> (String, String, String) {
+        // Distinct CNs per tier so the chain has real issuer→subject links —
+        // rcgen's *default* DN is identical across certs, which would make the
+        // intermediate's subject equal its own issuer and look self-signed.
+        let dn = |cn: &str| {
+            let mut dn = DistinguishedName::new();
+            dn.push(DnType::CommonName, cn);
+            dn
+        };
+
+        let root_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut root_params = CertificateParams::new(vec!["test-root-ca".into()]).unwrap();
+        root_params.distinguished_name = dn("test-root-ca");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        root_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        root_params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        root_params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+        let root = root_params.self_signed(&root_key).unwrap();
+        let root_pem = root.pem();
+
+        let int_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let mut int_params = CertificateParams::new(vec!["test-intermediate-ca".into()]).unwrap();
+        int_params.distinguished_name = dn("test-intermediate-ca");
+        int_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        int_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        int_params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        int_params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+        let intermediate = int_params.signed_by(&int_key, &root, &root_key).unwrap();
+        let intermediate_pem = intermediate.pem();
+
+        let leaf_key = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+        let station_cn = format!("station-{}", Uuid::new_v4());
+        let mut leaf_params = CertificateParams::new(vec![station_cn.clone()]).unwrap();
+        leaf_params.distinguished_name = dn(&station_cn);
+        leaf_params.not_before = rcgen::date_time_ymd(2026, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+        let leaf = leaf_params.signed_by(&leaf_key, &intermediate, &int_key).unwrap();
+        let leaf_pem = leaf.pem();
+        let key_pem = leaf_key.serialize_pem();
+
+        let creds = dir.join(CREDENTIALS_DIR);
+        fs::create_dir_all(&creds).unwrap();
+        fs::write(creds.join(STATION_CERT_FILE), &leaf_pem).unwrap();
+        fs::write(creds.join(STATION_KEY_FILE), &key_pem).unwrap();
+        fs::write(creds.join(CA_CHAIN_FILE), format!("{intermediate_pem}{root_pem}")).unwrap();
+        fs::write(creds.join("identity.json"), "{}").unwrap();
+        (leaf_pem, intermediate_pem, root_pem)
+    }
+
+    /// DER bytes of a single PEM cert, for identity-comparing two PEM blocks.
+    fn cert_der(pem: &str) -> Vec<u8> {
+        let (_, parsed) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).expect("pem");
+        parsed.contents
+    }
+
     #[test]
     fn new_loads_credentials_and_builds_client() {
         install_crypto_provider();
@@ -461,6 +585,40 @@ mod tests {
         let client = PerchpubClient::new(dir.path(), "https://api.perchpub.net:8443")
             .expect("upload client builds without a pinned CA on disk");
         assert_eq!(client.authority(), "api.perchpub.net:8443");
+    }
+
+    #[test]
+    fn build_inner_presents_leaf_then_issuing_intermediate() {
+        // §6/F5: the upload mTLS identity is leaf + issuing intermediate (the
+        // self-signed root is not sent). The live upload-auth path is covered
+        // by tests/integration/wire_client.rs; here we assert the chain
+        // selection and that the client builds with the full-chain identity.
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let (leaf_pem, intermediate_pem, root_pem) = write_three_tier_credentials(dir.path());
+
+        let ca_chain = format!("{intermediate_pem}{root_pem}");
+        let picked = issuing_intermediate_pem(leaf_pem.as_bytes(), ca_chain.as_bytes())
+            .expect("an issuing intermediate is found in the chain");
+        assert_eq!(cert_der(&picked), cert_der(&intermediate_pem), "selected the wrong cert");
+        assert_ne!(cert_der(&picked), cert_der(&root_pem), "must not select the self-signed root");
+
+        let client = PerchpubClient::new(dir.path(), "https://perchpub.example.org")
+            .expect("client builds with a leaf+intermediate identity");
+        assert_eq!(client.authority(), "perchpub.example.org");
+    }
+
+    #[test]
+    fn issuing_intermediate_skips_self_signed_root_chain() {
+        // A 2-tier chain (self-signed CA → leaf): the only CA cert is the root
+        // that directly issued the leaf, so nothing is appended (the root is
+        // not sent) and the identity stays leaf-only, preserving prior behavior.
+        let dir = TempDir::new().unwrap();
+        let (cert_pem, _key_pem, ca_pem) = write_credentials(dir.path());
+        assert!(
+            issuing_intermediate_pem(cert_pem.as_bytes(), ca_pem.as_bytes()).is_none(),
+            "a self-signed issuing root must not be appended to the client chain",
+        );
     }
 
     #[test]

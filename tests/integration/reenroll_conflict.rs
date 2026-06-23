@@ -1,24 +1,25 @@
-//! T022 — refuse to clobber existing credentials, RED.
+//! Re-enroll keypair semantics (device-cert contract §2/§8).
 //!
 //! Two passes against the same pre-populated `credentials/` dir:
 //!
-//! 1. `perchstation enroll` (no `--force`) must refuse with exit 76 and
-//!    emit `enrollment.refused_overwrite` carrying the existing
-//!    `station_id`. The on-disk credentials must be byte-for-byte
-//!    unchanged.
-//! 2. `perchstation enroll --force` must overwrite, emit
-//!    `enrollment.persisted`, and additionally emit at least one
-//!    WARN-or-higher event that names both the old and the new
-//!    `station_id` (operator-visible audit trail per cli.md §enroll).
+//! 1. `perchstation enroll` (no `--force`) must **reuse** the persisted
+//!    keypair: it succeeds (exit 0), the on-disk `station.key` keeps the
+//!    **same SPKI** (so perchpub sees the same station), the certificate is
+//!    refreshed, and no scary overwrite/refusal event fires — this is the §8
+//!    manual-renewal path.
+//! 2. `perchstation enroll --force` must enroll as a **new** station: it
+//!    succeeds, mints a **fresh** keypair (a *different* SPKI), and emits at
+//!    least one WARN-or-higher audit event naming both the old and the new
+//!    `station_id` (`enrollment.overwritten`, per cli.md §enroll).
 //!
-//! Currently RED because `commands::enroll::run` is `unimplemented!()`:
-//! the first pass panics → exit code 101 (not 76), and no events fire.
-//!
-//! Covers spec.md §US1 acceptance #4 and FR-003.
+//! Supersedes the original "refuse to clobber" behavior: FR-003's protected
+//! asset is now the keypair *identity* (preserved on a plain re-enroll), not
+//! the whole credentials directory.
 
 #[path = "support/mod.rs"]
 mod support;
 
+use rcgen::KeyPair;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -27,20 +28,26 @@ use support::fixtures::{build_qr_png, build_station_keypair, write_test_credenti
 use support::harness::{perchstation_bin, write_config_toml};
 use support::logs::{find_event, parse_json_events};
 
-const PERCHSTATION_EXIT_UNRECOVERABLE: i32 = 76;
+/// SPKI (`SubjectPublicKeyInfo`, DER) of the persisted `station.key` — the
+/// value perchpub pins. Equal SPKI ⇒ same station identity.
+fn station_key_spki(data_dir: &std::path::Path) -> Vec<u8> {
+    let pem = std::fs::read_to_string(data_dir.join("credentials/station.key"))
+        .expect("read station.key");
+    KeyPair::from_pem(&pem).expect("parse station.key").public_key_der()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // linear two-pass setup; splitting hurts readability
-async fn reenroll_refuses_then_force_succeeds() {
+async fn reenroll_reuses_key_then_force_mints_new() {
     let pub_ = FakePerchpub::start().await;
     let data_dir = tempfile::tempdir().expect("temp dir");
     let config_path = write_config_toml(data_dir.path(), pub_.url());
 
-    // Pre-populate the credentials dir with a known station_id so we can
-    // assert "unchanged" later and check `existing_station_id` in the
-    // refusal event.
+    // Pre-populate credentials with a known station_id + keypair so we can
+    // assert "same SPKI" (reuse) and "different SPKI" (force) afterwards.
     let existing_station_id = Uuid::new_v4();
     let existing_key = build_station_keypair();
+    let existing_spki = existing_key.public_key_der();
     let existing_cert = pub_.mint_station_cert(&existing_key, existing_station_id);
     write_test_credentials(
         data_dir.path(),
@@ -52,19 +59,15 @@ async fn reenroll_refuses_then_force_succeeds() {
     )
     .expect("seed credentials");
 
-    let identity_path = data_dir.path().join("credentials/identity.json");
-    let identity_before = std::fs::read(&identity_path).expect("read identity before");
-
-    // Build a fresh QR that would, absent the existing-credentials check,
-    // successfully enrol the station.
+    // A fresh QR that drives the enrollment exchange.
     let qr_path = data_dir.path().join("enroll.png");
     let session_id = Uuid::new_v4();
-    let auth_token = "test-auth-token-T022";
+    let auth_token = "test-auth-token-reenroll";
     std::fs::write(&qr_path, build_qr_png(session_id, auth_token, pub_.ca_pem()))
         .expect("write QR png");
 
-    // ===== Pass 1: enroll without --force; must refuse =====
-    let refusal = perchstation_bin()
+    // ===== Pass 1: enroll WITHOUT --force; must reuse the key =====
+    let reuse = perchstation_bin()
         .args([
             "--config",
             &config_path.display().to_string(),
@@ -79,40 +82,47 @@ async fn reenroll_refuses_then_force_succeeds() {
         .output()
         .expect("run perchstation enroll (no --force)");
 
-    let refusal_events = parse_json_events(&refusal.stderr);
-
-    assert_eq!(
-        refusal.status.code(),
-        Some(PERCHSTATION_EXIT_UNRECOVERABLE),
-        "expected exit 76 (UNRECOVERABLE) on re-enroll without --force; got {:?}\nstderr: {}",
-        refusal.status,
-        String::from_utf8_lossy(&refusal.stderr),
+    let reuse_events = parse_json_events(&reuse.stderr);
+    assert!(
+        reuse.status.success(),
+        "expected exit 0 on a same-station re-enroll; got {:?}\nstderr: {}",
+        reuse.status,
+        String::from_utf8_lossy(&reuse.stderr),
     );
 
-    let refused =
-        find_event(&refusal_events, "enrollment.refused_overwrite").unwrap_or_else(|| {
-            panic!(
-                "missing enrollment.refused_overwrite event; saw {:?}",
-                refusal_events
-                    .iter()
-                    .filter_map(|e| e.get("event").and_then(Value::as_str))
-                    .collect::<Vec<_>>(),
-            )
-        });
+    // The keypair — and therefore the station identity — is preserved.
     assert_eq!(
-        refused.get("existing_station_id").and_then(Value::as_str),
-        Some(existing_station_id.to_string().as_str()),
-        "enrollment.refused_overwrite missing/wrong existing_station_id: {refused}",
+        station_key_spki(data_dir.path()),
+        existing_spki,
+        "a non-force re-enroll must REUSE the persisted keypair (same SPKI)",
     );
 
-    // Credentials must not have been touched.
-    let identity_after_refusal = std::fs::read(&identity_path).expect("read identity after");
-    assert_eq!(
-        identity_before, identity_after_refusal,
-        "identity.json changed after a refused re-enroll",
+    // It persisted, and did NOT fire the refusal or the loud overwrite audit.
+    assert!(
+        find_event(&reuse_events, "enrollment.persisted").is_some(),
+        "missing enrollment.persisted after a reusing re-enroll; saw {:?}",
+        reuse_events
+            .iter()
+            .filter_map(|e| e.get("event").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        find_event(&reuse_events, "enrollment.refused_overwrite").is_none(),
+        "a reusing re-enroll must not refuse",
+    );
+    assert!(
+        find_event(&reuse_events, "enrollment.overwritten").is_none(),
+        "reusing the same keypair must not emit the new-identity audit",
     );
 
-    // ===== Pass 2: enroll --force; must overwrite =====
+    // The station_id perchpub assigned on this confirm (now in identity.json).
+    let id_after_reuse = std::fs::read(data_dir.path().join("credentials/identity.json"))
+        .expect("read identity after reuse");
+    let id_after_reuse: Value = serde_json::from_slice(&id_after_reuse).expect("identity json");
+    let station_after_reuse =
+        id_after_reuse.get("station_id").and_then(Value::as_str).expect("station_id").to_owned();
+
+    // ===== Pass 2: enroll --force; must mint a NEW keypair =====
     let forced = perchstation_bin()
         .args([
             "--config",
@@ -130,7 +140,6 @@ async fn reenroll_refuses_then_force_succeeds() {
         .expect("run perchstation enroll --force");
 
     let forced_events = parse_json_events(&forced.stderr);
-
     assert!(
         forced.status.success(),
         "expected exit 0 on enroll --force; got {:?}\nstderr: {}",
@@ -138,59 +147,41 @@ async fn reenroll_refuses_then_force_succeeds() {
         String::from_utf8_lossy(&forced.stderr),
     );
 
+    // --force mints a brand-new keypair: a different SPKI = a new station.
+    assert_ne!(
+        station_key_spki(data_dir.path()),
+        existing_spki,
+        "--force must mint a FRESH keypair (different SPKI)",
+    );
+
     let persisted = find_event(&forced_events, "enrollment.persisted").unwrap_or_else(|| {
         panic!(
-            "missing enrollment.persisted event after --force; saw {:?}",
+            "missing enrollment.persisted after --force; saw {:?}",
             forced_events
                 .iter()
                 .filter_map(|e| e.get("event").and_then(Value::as_str))
                 .collect::<Vec<_>>(),
         )
     });
-    let new_station_id = persisted
-        .get("station_id")
-        .and_then(Value::as_str)
-        .expect("enrollment.persisted carries station_id");
-    assert_ne!(
-        new_station_id,
-        existing_station_id.to_string(),
-        "new station_id matches existing one; fake perchpub should mint a fresh UUID",
-    );
+    let new_station_id =
+        persisted.get("station_id").and_then(Value::as_str).expect("persisted station_id");
 
-    // Prominent audit: at least one WARN-or-higher event mentions both the
-    // old and the new station_id. (Contract test T055 will pin the exact
-    // event name / field layout once the producer site is wired up.)
+    // Prominent audit: at least one WARN-or-higher event names both the old
+    // (post-reuse) and the new `station_id` (the `enrollment.overwritten` audit).
     let prominent = forced_events.iter().any(|ev| {
-        let level_loud = matches!(
+        let loud = matches!(
             ev.get("level").and_then(Value::as_str),
             Some("WARN" | "warn" | "ERROR" | "error"),
         );
         let serialized = ev.to_string();
-        level_loud
-            && serialized.contains(&existing_station_id.to_string())
-            && serialized.contains(new_station_id)
+        loud && serialized.contains(&station_after_reuse) && serialized.contains(new_station_id)
     });
     assert!(
         prominent,
-        "no WARN+ event names both old ({existing_station_id}) and new ({new_station_id}) station IDs; events: {:?}",
+        "no WARN+ event names both old ({station_after_reuse}) and new ({new_station_id}) station IDs; events: {:?}",
         forced_events
             .iter()
             .map(|e| (e.get("level").cloned(), e.get("event").cloned()))
             .collect::<Vec<_>>(),
-    );
-
-    // identity.json now carries the new station_id (and differs from the
-    // pre-populated bytes).
-    let identity_after_force = std::fs::read(&identity_path).expect("read identity post-force");
-    assert_ne!(
-        identity_before, identity_after_force,
-        "identity.json was not overwritten by --force",
-    );
-    let identity_json: Value =
-        serde_json::from_slice(&identity_after_force).expect("identity.json valid JSON post-force");
-    assert_eq!(
-        identity_json.get("station_id").and_then(Value::as_str),
-        Some(new_station_id),
-        "identity.json's station_id does not match the persisted event",
     );
 }

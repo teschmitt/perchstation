@@ -50,6 +50,11 @@ path    = "../../tests/integration/wire_client.rs"
 harness = true
 
 [[test]]
+name    = "upload_full_chain_mtls"
+path    = "../../tests/integration/upload_full_chain_mtls.rs"
+harness = true
+
+[[test]]
 name    = "reenroll_conflict"
 path    = "../../tests/integration/reenroll_conflict.rs"
 harness = true

@@ -76,6 +76,11 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 uuid          = { version = "1", features = ["v4", "serde"] }
 chrono        = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 x509-parser   = "0.16"
+# SHA-256 of the keypair SubjectPublicKeyInfo, used to derive the station's
+# stable DNS identity (enrollment/csr.rs). Already in the tree as the
+# rustls/rcgen crypto backend (the `ring` feature on both), so this declares
+# an existing crate rather than pulling a new one.
+ring          = "0.17"
 sd-notify     = "0.4"
 
 # Dev-only deps (used by integration tests and the fakepub dev binary).

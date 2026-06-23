@@ -31,12 +31,12 @@ listed below and changes only with an explicit version bump.
 | `event`                       | Level  | Required fields beyond common         | Triggered when                                            |
 | ----------------------------- | ------ | -------------------------------------- | --------------------------------------------------------- |
 | `enrollment.qr_decoded`       | info   | `session_id`                          | QR successfully decoded into session material             |
-| `enrollment.csr_generated`    | info   | (none)                                 | Keypair + CSR built in memory                             |
+| `enrollment.csr_generated`    | info   | `key_origin` (`reused`\|`generated`)   | Keypair + CSR built in memory (`reused` = persisted key, same SPKI; `generated` = fresh key) |
 | `enrollment.sent`             | info   | `session_id`, `perchpub_url`          | `POST /enrollment/confirm` returned 200                   |
-| `enrollment.persisted`        | info   | `station_id`, `cert_not_after`        | Credentials written to disk                               |
+| `enrollment.persisted`        | info   | `station_id`, `cert_not_after`, `key_origin` | Credentials written to disk                         |
 | `enrollment.refused`          | warn   | `reason`                              | `EnrollmentResponse.success == false`                     |
-| `enrollment.refused_overwrite`| error  | `existing_station_id`                 | `enroll` invoked with credentials present, no `--force`   |
-| `enrollment.overwritten`      | warn   | `previous_station_id`, `station_id`   | `enroll --force` replaced an existing identity (audit trail) |
+| `enrollment.refused_overwrite`| error  | `existing_station_id`                 | Defence-in-depth: `save` refused to clobber existing credentials (should not occur in normal flow) |
+| `enrollment.overwritten`      | warn   | `previous_station_id`, `station_id`   | `enroll --force` minted a NEW keypair (new SPKI), discarding the prior identity (audit trail) |
 | `enrollment.failed`           | error  | `kind`, `message`                     | Network/TLS/validation failure (no credentials written)   |
 | `enrollment.session_invalid`  | error  | `status`                              | perchpub rejected the enrollment session (422); operator must restart enrollment |
 

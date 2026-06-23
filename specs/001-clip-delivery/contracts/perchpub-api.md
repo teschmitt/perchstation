@@ -34,9 +34,12 @@ the perchpub web UI, not by us.
     privately-rooted deployment also validates. The host-authority allowlist
     (SC-007) remains the outbound pin, and certificate verification is never
     disabled (SEC-4).
-  - **Enrollment confirm (`:443`)**: validated against **only** the CA chain
-    delivered in the QR payload (later persisted as `credentials/ca_chain.pem`);
-    the OS/public trust store is **not** consulted on this bootstrap path.
+  - **Enrollment confirm (`:443`)**: validated against the **public/system
+    trust store** (the edge presents a publicly-rooted, e.g. Let's Encrypt,
+    cert), exactly like the upload entrypoint. The QR's `ca_chain_pem` is the
+    **device CA**, added only as an *additive* anchor and used to verify the
+    device-issued leaf — it does **not** anchor the `:443` edge (§7).
+    Certificate verification is never disabled (SEC-4).
 - **Client identity**: every call **except** `/enrollment/confirm` presents
   the station's enrollment-issued certificate as a TLS client certificate
   (mTLS) signed by `station.key`. Perchpub identifies the station server-
@@ -46,8 +49,9 @@ the perchpub web UI, not by us.
   the EC P-256 convention, accepted by perchpub's CA and Traefik front.
 - **`/enrollment/confirm`** is special: the station has no client certificate
   yet. The call is made over plain TLS (no client cert presented). The
-  `auth_token` in the request body is the only credential. The QR-bound CA
-  pinning above applies.
+  `auth_token` in the request body is the only credential. The `:443` edge is
+  validated against system trust as described above; the QR's device CA is an
+  additive anchor, not the edge's trust anchor.
 
 ---
 
@@ -79,10 +83,18 @@ the perchpub web UI, not by us.
 
 ### Behavioural contract (station side)
 
-- The CSR sent in the body MUST be signed by `station.key` generated on
-  this device during this enrollment attempt; no key reuse across attempts.
-- The CSR's subject is not required to encode anything specific; perchpub
-  rewrites the subject in the issued cert.
+- The CSR sent in the body MUST be signed by the station's on-device
+  `station.key`. That keypair is generated **once** and **reused** for the life
+  of the station, including across re-enrollments and renewals — so the issued
+  leaf keeps the same `SHA256(SubjectPublicKeyInfo)` and perchpub recognises the
+  same station (device-cert contract §2/§8). A fresh keypair (new SPKI) is minted
+  only to enroll as a deliberately *new* station (`enroll --force`).
+- The CSR's subject MUST be conformant (device-cert contract §3): the Subject
+  CommonName MUST equal the first `dNSName` SubjectAltName, and that identity
+  MUST be a stable, unique, DNS-valid `station-<id>` (never the rcgen default
+  CommonName). perchpub authorises step-ca off the first DNS SAN and does
+  **not** rewrite the subject; a non-conformant CSR is rejected
+  (`502 "certificate issuance failed"`, §10).
 - The station MUST NOT log `auth_token` or `csr_pem` at any level.
 - On a successful `EnrollmentResponse`, the station MUST validate that the
   returned `certificate_pem` chains to `ca_chain_pem` and that the cert's
