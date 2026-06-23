@@ -30,19 +30,22 @@
 
 ## 4. Renewal client + response validation (perchstation-core)
 
-- [ ] 4.1 Add request/response types and a renewal client that POSTs the CSR over
-  mTLS using the station identity and `tls::rustls_builder_for_upload`
+- [ ] 4.1 Add request/response types and a renewal client that POSTs a CSR built
+  over the station's **existing** keypair (same SPKI, §8 — reusing the
+  `cert-contract-conformance` build-CSR-from-key path + `identity::load_keypair()`)
+  over mTLS using the station identity and `tls::rustls_builder_for_upload`
   (public roots + enrollment CA) against the renewal base.
 - [ ] 4.2 Reuse `confirm::validate_chain` (or factor it shared) to validate the
   renewed leaf: chain to trusted CA, validity window contains now, public key
-  matches the freshly generated key. (TDD) Unit-test accept + each rejection
+  matches the station's existing key. (TDD) Unit-test accept + each rejection
   path.
 
 ## 5. Atomic credential rotation (identity.rs)
 
-- [ ] 5.1 Implement a crash-safe rotation that stages the new key/cert/chain
-  (and re-stamped `identity.json`) and swaps them as a unit (staging dir +
-  rename or equivalent), never leaving a key/cert mismatch.
+- [ ] 5.1 Implement a crash-safe rotation that stages the renewed cert/chain (the
+  reused key is unchanged, §8) plus a re-stamped `identity.json` and swaps them as
+  a unit (staging dir + rename or equivalent), never leaving a leaf that
+  mismatches the persisted key.
 - [ ] 5.2 (TDD) Unit tests: post-rotation `load` yields the new
   `cert_not_after` and a key/cert that match; a simulated interruption leaves a
   complete old-or-new set.

@@ -16,8 +16,9 @@ was explicitly deferred by `001`/`002`.
 - The station renews its certificate **automatically** before expiry, on a
   schedule driven by remaining lifetime, with no operator action.
 - Renewal authenticates with the **current station mTLS identity** (not a
-  one-shot QR session token), submits a freshly generated Ed25519 keypair + CSR,
-  and receives a new certificate (and updated CA chain when provided).
+  one-shot QR session token), submits a CSR over its **existing** keypair (same
+  SPKI, per device-cert contract §8), and receives a new certificate (and updated
+  CA chain when provided).
 - **BREAKING (wire contract, perchpub-side)**: introduces a new mTLS-authenticated
   perchpub endpoint, `POST /api/v1/enrollment/renew`. The station side is inert
   until perchpub ships it; the contract is specified here (the maintainer owns

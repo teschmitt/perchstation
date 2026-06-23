@@ -27,10 +27,11 @@ The station SHALL perform renewal over an mTLS-authenticated channel using its c
 
 Renewal SHALL present the current `station.crt` / `station.key` as the mTLS
 client identity (never the one-shot QR session `auth_token`), and SHALL submit a
-freshly generated Ed25519 keypair and CSR (a new key per renewal, not the
-existing one). The renewed certificate SHALL be validated — it MUST chain to a
-trusted CA, its validity window MUST contain the current time, and its subject
-public key MUST match the newly generated private key — before it is adopted. A
+CSR built over the station's **existing** keypair — the same key, so the renewed
+leaf keeps the same `SHA256(SubjectPublicKeyInfo)` (device-cert contract §8), not
+a freshly generated key. The renewed certificate SHALL be validated — it MUST
+chain to a trusted CA, its validity window MUST contain the current time, and its
+subject public key MUST match the station's private key — before it is adopted. A
 response that fails validation SHALL be rejected and treated as a failed attempt.
 
 #### Scenario: Valid renewal is accepted
@@ -48,7 +49,7 @@ response that fails validation SHALL be rejected and treated as a failed attempt
 
 ### Requirement: Atomic credential rotation with in-process reload
 
-On a validated renewal the station SHALL replace its key, certificate, and CA chain atomically, such that it never operates with a mismatched key and certificate.
+On a validated renewal the station SHALL replace its leaf certificate and CA chain atomically — the reused keypair (§8) is unchanged — such that it never operates with a leaf that mismatches its key.
 
 The rotation SHALL be crash-safe: an interruption at any point MUST leave a
 complete, usable credential set — either the previous one or the renewed one,

@@ -47,8 +47,9 @@ rule from `contracts/perchpub-api.md` that *every* call except
 - **Channel/base**: the mTLS upload edge (`upload_url`, `:8443`), reusing
   `tls::rustls_builder_for_upload` (public roots + enrollment CA) and the
   station identity — the same trust model the upload client already uses.
-- **Request**: `{ "csr_pem": "<PKCS#10>" }` from a freshly generated Ed25519
-  keypair.
+- **Request**: `{ "csr_pem": "<PKCS#10>" }` — a CSR built over the station's
+  **existing** persisted keypair (same SPKI, per device-cert contract §8; see the
+  "Reuse the existing keypair across renewals" decision below).
 - **Response**: `{ "certificate_pem": "...", "ca_chain_pem": "..." }`, mirroring
   `EnrollmentResponse` so `validate_chain` is reused verbatim.
 - **Errors**: 4xx → terminal for this attempt (no retry of a rejected CSR); 5xx /
@@ -57,11 +58,18 @@ rule from `contracts/perchpub-api.md` that *every* call except
 The station side ships behind a `[renewal] enabled` flag and is inert until
 perchpub implements the endpoint; a `fakepub` handler provides it for tests.
 
-### Renew a new key each time
+### Reuse the existing keypair across renewals
 
-Each renewal calls `csr::generate()` for a fresh Ed25519 keypair, bounding key
-lifetime to one cert period. Rejected: reusing the existing key (simpler but
-keeps one key for the device's whole life).
+Each renewal builds its CSR over the station's **existing** persisted keypair, so
+the renewed leaf keeps the same `SHA256(SubjectPublicKeyInfo)` and perchpub
+recognizes the same station with no server-side re-pin (device-cert contract §8,
+`docs/perchstation-csr-contract.md`). This consumes the generate-once/reuse
+keypair and `identity::load_keypair()` introduced by the
+`cert-contract-conformance` change. Rejected: a fresh key per renewal — it changes
+the SPKI, which perchpub's enrollment-time pin would reject as an unknown station
+(`401` on every subsequent upload). (Supersedes the earlier draft decision, which
+called for a new key each renewal — a §8 violation surfaced by the cert-contract
+audit.)
 
 ### Dedicated supervised `RenewalRunner` task
 
@@ -77,14 +85,15 @@ independent failure domains and the delivery loop already halts on expiry.
 
 ### Atomic credential rotation
 
-Stage the renewed `station.key`/`station.crt`/`ca_chain.pem` (plus a possibly
+The reused keypair (§8) means `station.key` is unchanged across a renewal, so
+rotation stages the renewed `station.crt`/`ca_chain.pem` (plus a possibly
 re-stamped `identity.json`) in a temp location under `credentials/`, `fsync`,
-then swap atomically so a crash leaves either the old or new complete set — never
-a key/cert mismatch. Because three files must move together, the swap uses a
-staging directory + directory rename (or an equivalent transactional move),
-rather than three independent renames. After the swap, call
-`PerchpubClient::reload()` to pick up the new identity in-process; in-flight
-uploads finish under the old identity, new ones use the new.
+then swaps atomically so a crash leaves either the old or new complete set — never
+a leaf that mismatches the persisted key or a half-written chain. Because the
+files must move together, the swap uses a staging directory + directory rename (or
+an equivalent transactional move), rather than independent renames. After the
+swap, call `PerchpubClient::reload()` to pick up the new leaf in-process; in-flight
+uploads finish under the old leaf, new ones use the new.
 
 ### Approaching-expiry surfacing
 
