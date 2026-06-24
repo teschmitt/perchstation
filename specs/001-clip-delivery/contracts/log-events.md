@@ -57,6 +57,7 @@ listed below and changes only with an explicit version bump.
 | `delivery.attempt_started`    | info   | `clip_id`, `attempt`                  | Entry transitioned `pending/` → `inflight/`               |
 | `delivery.upload_succeeded`   | info   | `clip_id`, `classify_task_id`, `attempt`, `duration_ms` | 200 from `/upload/`                                       |
 | `delivery.upload_undecodable` | warn   | `clip_id`, `attempt`, `message`       | 2xx accepted but classify-task body undecodable (PS-06); entry → `Delivered`, classify status unknown |
+| `delivery.upload_response_framing` | warn | `url`, `status`, `version`, `content_length`, `transfer_encoding`, `connection`, `server`, `received_bytes`, `body` | Diagnostic for the above: wire framing + received body of an undecodable 2xx, to tell a truncated/mis-framed response apart from a complete-but-schema-divergent one (PS-06) |
 | `delivery.upload_transient`   | warn   | `clip_id`, `attempt`, `kind`, `status?`, `next_attempt_after` | Retryable failure                                         |
 | `delivery.upload_terminal`    | error  | `clip_id`, `attempt`, `kind`, `status?`, `message` | Non-retryable failure; entry → `Undeliverable`            |
 | `delivery.attempts_exhausted` | error  | `clip_id`, `attempts`, `wallclock_secs`| Per-clip retry budget exhausted; entry → `Undeliverable`  |

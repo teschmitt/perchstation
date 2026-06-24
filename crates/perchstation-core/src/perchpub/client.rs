@@ -40,6 +40,7 @@ use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::identity::{CA_CHAIN_FILE, CREDENTIALS_DIR, STATION_CERT_FILE, STATION_KEY_FILE};
+use crate::observability::tracing as obs_tracing;
 use crate::perchpub::types::ClassifyTaskPublic;
 use crate::queue::store::QueueStore;
 use crate::tls::{TlsBuilderError, rustls_builder_for_upload};
@@ -309,8 +310,7 @@ impl PerchpubClient {
                 ClientError::Network { url: url.to_string(), message: err.to_string() }
             })?;
 
-        let capped = read_capped(response, Utc::now(), url.as_str()).await?;
-        classify_response(&capped, url.as_str())
+        read_and_classify(response, Utc::now(), url.as_str()).await
     }
 
     /// `GET /api/v1/classify-task/{id}` — fetch the latest perchpub-side
@@ -323,8 +323,7 @@ impl PerchpubClient {
             ClientError::Network { url: url.to_string(), message: err.to_string() }
         })?;
 
-        let capped = read_capped(response, Utc::now(), url.as_str()).await?;
-        classify_response(&capped, url.as_str())
+        read_and_classify(response, Utc::now(), url.as_str()).await
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, ClientError> {
@@ -365,6 +364,12 @@ const MAX_RESPONSE_BYTES: u64 = 1 << 20;
 struct CappedResponse {
     status: StatusCode,
     retry_after: Option<Duration>,
+    /// HTTP version + response headers, captured before the body is consumed.
+    /// Surfaced only in the `UndecodableSuccess` diagnostic (PS-06) so an
+    /// undecodable 2xx can be traced to its wire framing (`Content-Length` /
+    /// `Transfer-Encoding` / `Connection`) from journald — no packet capture.
+    version: String,
+    headers: header::HeaderMap,
     body: Vec<u8>,
 }
 
@@ -379,6 +384,10 @@ async fn read_capped(
 ) -> Result<CappedResponse, ClientError> {
     let status = response.status();
     let retry_after = parse_retry_after(response.headers(), now);
+    // Captured up front for the `UndecodableSuccess` diagnostic — the body
+    // read below consumes `response`, after which the framing is gone.
+    let version = format!("{:?}", response.version());
+    let headers = response.headers().clone();
 
     // Defence-in-depth: reject before reading when the server advertises an
     // over-cap Content-Length (chunked responses report none, hence the
@@ -412,7 +421,7 @@ async fn read_capped(
             }
         }
     }
-    Ok(CappedResponse { status, retry_after, body })
+    Ok(CappedResponse { status, retry_after, version, headers, body })
 }
 
 /// Turn a (size-capped) perchpub response into a [`ClassifyTaskPublic`] or
@@ -438,6 +447,55 @@ fn classify_response(
     serde_json::from_slice::<ClassifyTaskPublic>(&capped.body).map_err(|err| {
         ClientError::UndecodableSuccess { url: url.to_string(), message: err.to_string() }
     })
+}
+
+/// Read a perchpub response under the size cap and classify it, emitting the
+/// `delivery.upload_response_framing` diagnostic when a 2xx body fails to
+/// decode. `upload_clip` and `get_classify_task` share this so an undecodable
+/// success records its wire framing identically on both paths (PS-06).
+async fn read_and_classify(
+    response: reqwest::Response,
+    now: DateTime<Utc>,
+    url: &str,
+) -> Result<ClassifyTaskPublic, ClientError> {
+    let capped = read_capped(response, now, url).await?;
+    let result = classify_response(&capped, url);
+    if matches!(result, Err(ClientError::UndecodableSuccess { .. })) {
+        log_undecodable_response(&capped, url);
+    }
+    result
+}
+
+/// Log the wire framing + received body of a 2xx whose body could not be
+/// decoded (PS-06 `UndecodableSuccess`). The clip is already stored
+/// server-side; the failure is either a truncated/mis-framed response or — as
+/// seen live 2026-06-24 — a complete body that diverges from the expected
+/// schema (a timestamp the station could not parse, whose chrono error reads
+/// "premature end of input" and masquerades as truncation). Recording the HTTP
+/// version, framing headers, `received_bytes`, and the body itself tells the
+/// two apart from journald alone — no packet capture. The body display is
+/// bounded to 2 KiB; `received_bytes` always carries the true length.
+fn log_undecodable_response(capped: &CappedResponse, url: &str) {
+    let value = |name: &header::HeaderName| -> String {
+        capped.headers.get(name).map_or_else(
+            || "<absent>".to_owned(),
+            |v| String::from_utf8_lossy(v.as_bytes()).into_owned(),
+        )
+    };
+    let body_snippet: String = String::from_utf8_lossy(&capped.body).chars().take(2048).collect();
+    tracing::warn!(
+        event = obs_tracing::events::DELIVERY_UPLOAD_RESPONSE_FRAMING,
+        url = url,
+        status = capped.status.as_u16(),
+        version = %capped.version,
+        content_length = %value(&header::CONTENT_LENGTH),
+        transfer_encoding = %value(&header::TRANSFER_ENCODING),
+        connection = %value(&header::CONNECTION),
+        server = %value(&header::SERVER),
+        received_bytes = capped.body.len(),
+        body = %body_snippet,
+        "undecodable 2xx response: wire framing + received body for diagnosis (PS-06)",
+    );
 }
 
 /// Parse a `Retry-After` header into a delay relative to `now`.
@@ -757,7 +815,13 @@ mod tests {
     }
 
     fn capped(status: u16, body: Vec<u8>) -> CappedResponse {
-        CappedResponse { status: StatusCode::from_u16(status).unwrap(), retry_after: None, body }
+        CappedResponse {
+            status: StatusCode::from_u16(status).unwrap(),
+            retry_after: None,
+            version: "HTTP/1.1".to_owned(),
+            headers: header::HeaderMap::new(),
+            body,
+        }
     }
 
     #[test]
@@ -797,6 +861,8 @@ mod tests {
         let c = CappedResponse {
             status: StatusCode::SERVICE_UNAVAILABLE,
             retry_after: Some(Duration::from_secs(7)),
+            version: "HTTP/1.1".to_owned(),
+            headers: header::HeaderMap::new(),
             body: b"down".to_vec(),
         };
         match classify_response(&c, "https://p/x") {

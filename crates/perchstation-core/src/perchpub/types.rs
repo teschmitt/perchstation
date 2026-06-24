@@ -8,6 +8,55 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Lenient `DateTime<Utc>` deserialisers for perchpub response bodies.
+///
+/// perchpub serialises its timestamps from naive (timezone-less) DB values,
+/// e.g. `2026-06-24T09:16:24.658315` — structurally valid JSON, but a strict
+/// `DateTime<Utc>` rejects the missing offset: chrono's RFC3339 parser runs off
+/// the end looking for the zone and returns `TOO_SHORT`, whose Display is
+/// "premature end of input" — which the station otherwise mistakes for a
+/// truncated/undecodable response (PS-06, observed live 2026-06-24). These
+/// accept either an offset-bearing RFC3339 timestamp (the contract's
+/// `date-time`) or a tz-less one interpreted as UTC, so the station tolerates
+/// both regardless of how perchpub is configured.
+mod flexible_datetime {
+    use chrono::{DateTime, NaiveDateTime, Utc};
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer};
+
+    /// Naive (offset-less, UTC-assumed) timestamp layouts perchpub emits.
+    const NAIVE_FORMATS: [&str; 3] =
+        ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S%.f"];
+
+    fn parse(raw: &str) -> Option<DateTime<Utc>> {
+        // Prefer a timezone-aware RFC3339 timestamp (the contract's `date-time`).
+        if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+            return Some(dt.with_timezone(&Utc));
+        }
+        // Fall back to a tz-less timestamp, interpreted as UTC.
+        NAIVE_FORMATS
+            .iter()
+            .find_map(|fmt| NaiveDateTime::parse_from_str(raw, fmt).ok())
+            .map(|naive| DateTime::from_naive_utc_and_offset(naive, Utc))
+    }
+
+    pub(super) fn required<'de, D: Deserializer<'de>>(d: D) -> Result<DateTime<Utc>, D::Error> {
+        let raw = String::deserialize(d)?;
+        parse(&raw).ok_or_else(|| D::Error::custom(format!("unrecognised datetime `{raw}`")))
+    }
+
+    pub(super) fn optional<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<DateTime<Utc>>, D::Error> {
+        match Option::<String>::deserialize(d)? {
+            Some(raw) => parse(&raw)
+                .map(Some)
+                .ok_or_else(|| D::Error::custom(format!("unrecognised datetime `{raw}`"))),
+            None => Ok(None),
+        }
+    }
+}
+
 /// `POST /api/v1/enrollment/confirm/{session_id}` request body.
 ///
 /// `EnrollmentRequest` in `references/openapi.json`.
@@ -91,9 +140,9 @@ pub struct UploadPublic {
     pub object_name: String,
     #[serde(default)]
     pub id: Option<Uuid>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flexible_datetime::optional")]
     pub created_at: Option<DateTime<Utc>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "flexible_datetime::optional")]
     pub updated_at: Option<DateTime<Utc>>,
 }
 
@@ -112,6 +161,7 @@ pub struct ObservationPublic {
     pub id: Uuid,
     pub species: Option<serde_json::Value>,
     pub station: serde_json::Value,
+    #[serde(deserialize_with = "flexible_datetime::required")]
     pub observed_at: DateTime<Utc>,
     pub object_name: String,
 }
@@ -148,6 +198,51 @@ mod tests {
         assert!(!ClassifyTaskStatus::Queued.is_terminal());
         assert!(!ClassifyTaskStatus::Processing.is_terminal());
         assert!(!ClassifyTaskStatus::Unknown.is_terminal());
+    }
+
+    /// Real `POST /api/v1/upload/` 200 body captured live on 2026-06-24:
+    /// perchpub serialises `created_at`/`updated_at` **without a timezone**
+    /// (`...658315`, no `Z`). The body is complete and valid JSON, but a strict
+    /// `DateTime<Utc>` cannot parse a tz-less timestamp — chrono returns its
+    /// `TOO_SHORT` error whose Display is "premature end of input", which the
+    /// station previously mistook for a truncated/undecodable response (PS-06).
+    /// The station must tolerate naive (UTC-assumed) timestamps.
+    const LIVE_UPLOAD_BODY_NAIVE_TS: &str = r#"{"object_name":"f3/41/f34162a311610fbbafbc1d47780198e70a9b56926927c199acc1c0f58ed7930e.mp4","status":"Prepared","id":"59371497-d528-404d-a653-2c3bf694d526","upload":{"station_id":"50d40ccc-0ba4-4614-b2ef-ac002ede62d7","object_name":"f3/41/f34162a311610fbbafbc1d47780198e70a9b56926927c199acc1c0f58ed7930e.mp4","id":"5a0bf864-ea7c-452e-95ae-b2fd4922685d","created_at":"2026-06-24T09:16:24.658315","updated_at":"2026-06-24T09:16:24.658322"},"observation":null}"#;
+
+    #[test]
+    fn upload_response_with_timezoneless_timestamps_decodes() {
+        let task: ClassifyTaskPublic = serde_json::from_str(LIVE_UPLOAD_BODY_NAIVE_TS)
+            .expect("a complete 200 body with naive UTC timestamps must decode");
+        assert_eq!(task.status, ClassifyTaskStatus::Prepared);
+        let created = task.upload.created_at.expect("created_at present");
+        // The naive timestamp is interpreted as UTC.
+        assert_eq!(created.to_rfc3339(), "2026-06-24T09:16:24.658315+00:00");
+        assert!(task.upload.updated_at.is_some());
+    }
+
+    #[test]
+    fn upload_response_with_offset_timestamps_still_decodes() {
+        // A timezone-aware (`Z`) timestamp — the contract's `date-time` — must
+        // keep working, so the fix tolerates *both* formats.
+        let json = r#"{"object_name":"c.mp4","status":"Prepared","id":"00000000-0000-0000-0000-000000000010","upload":{"station_id":"00000000-0000-0000-0000-000000000001","object_name":"c.mp4","created_at":"2026-06-24T09:16:24.658315Z"},"observation":null}"#;
+        let task: ClassifyTaskPublic =
+            serde_json::from_str(json).expect("offset timestamp decodes");
+        assert_eq!(
+            task.upload.created_at.unwrap().to_rfc3339(),
+            "2026-06-24T09:16:24.658315+00:00"
+        );
+    }
+
+    #[test]
+    fn classify_poll_observation_with_naive_observed_at_decodes() {
+        // The classify poller reads the same naive-timestamp serialisation in
+        // the (required) `observation.observed_at` — it must decode too, or a
+        // successful classification would be unreadable for the same reason.
+        let json = r#"{"object_name":"c.mp4","status":"Success","id":"00000000-0000-0000-0000-000000000010","upload":{"station_id":"00000000-0000-0000-0000-000000000001","object_name":"c.mp4"},"observation":{"confidence_score":0.93,"classification_result":null,"id":"00000000-0000-0000-0000-000000000020","species":null,"station":{},"observed_at":"2026-06-24T07:27:01.306942","object_name":"c.mp4"}}"#;
+        let task: ClassifyTaskPublic = serde_json::from_str(json)
+            .expect("populated observation with naive observed_at decodes");
+        let obs = task.observation.expect("observation present");
+        assert_eq!(obs.observed_at.to_rfc3339(), "2026-06-24T07:27:01.306942+00:00");
     }
 
     #[test]

@@ -154,6 +154,14 @@ pub mod events {
     /// classify status. Distinct from `delivery.upload_succeeded` because it
     /// carries no `classify_task_id`/`duration_ms`.
     pub const DELIVERY_UPLOAD_UNDECODABLE: &str = "delivery.upload_undecodable";
+    /// Diagnostic companion to `delivery.upload_undecodable`: the wire framing
+    /// (HTTP version, `Content-Length`, `Transfer-Encoding`, `Connection`,
+    /// `Server`), the bytes actually received, and the body itself for a 2xx
+    /// whose body would not decode (PS-06). Emitted from the perchpub client,
+    /// where the response headers are still in scope, so a truncated/mis-framed
+    /// response is told apart from a complete-but-schema-divergent one (e.g. an
+    /// unparseable timestamp) from journald alone — no packet capture.
+    pub const DELIVERY_UPLOAD_RESPONSE_FRAMING: &str = "delivery.upload_response_framing";
     pub const DELIVERY_UPLOAD_TRANSIENT: &str = "delivery.upload_transient";
     pub const DELIVERY_UPLOAD_TERMINAL: &str = "delivery.upload_terminal";
     pub const DELIVERY_ATTEMPTS_EXHAUSTED: &str = "delivery.attempts_exhausted";
