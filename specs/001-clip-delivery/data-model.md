@@ -158,17 +158,19 @@ Never written to disk.
 | ------------ | ----------- | ------------------------------------------------------ |
 | `session_id` | UUID        | From the QR payload; matches perchpub's `EnrollmentSession.session_id` |
 | `auth_token` | string      | From the QR payload; passed in the body of `/enrollment/confirm`       |
+| `ca_chain_pem` | string    | From the QR payload; the device-CA (step-ca) chain — pins the issuer of the returned leaf and seeds the additive upload trust anchor (`enrollment/confirm.rs`) |
 | `decoded_at` | UTC instant | Used for an in-process "session is stale" sanity check; not authoritative |
 
-**QR payload format** (proposed): `application/json` text embedded in the
-QR, exactly the perchpub `EnrollmentSession` shape minus `expires_at` (the
-station doesn't need to enforce expiry — perchpub does):
+**QR payload format**: UTF-8 JSON text embedded in the QR. Three fields are
+required — `session_id`, `auth_token`, and `ca_chain_pem` (the device-CA
+chain); `expires_at` may be present and is ignored (the station doesn't
+enforce expiry — perchpub does), as are any other unknown fields. The full
+generation/decode contract lives in
+[`docs/perchstation-enrollment-qr-contract.md`](../../docs/perchstation-enrollment-qr-contract.md).
 
 ```json
-{"session_id":"…","auth_token":"…"}
+{"session_id":"…","auth_token":"…","ca_chain_pem":"-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----\n"}
 ```
-
-`expires_at` may be present and is ignored by the station.
 
 ---
 

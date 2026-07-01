@@ -11,7 +11,7 @@ Keywords **MUST / MUST NOT / SHOULD / SHOULD NOT / MAY** are used per RFC 2119.
 
 A station proves its identity to perchpub with an **mTLS client certificate**. The flow:
 
-1. An operator creates an enrollment session on perchpub and hands the station a **QR code** carrying `session_id`, `auth_token`, the perchpub base URL, and the device-CA chain.
+1. An operator creates an enrollment session on perchpub and hands the station a **QR code** carrying `session_id`, `auth_token`, and the device-CA chain. (The perchpub base URL is **not** in the QR — the station reads it from its local config, `config.toml::perchpub_url`. See the [enrollment-QR contract](./perchstation-enrollment-qr-contract.md) for the full QR payload.)
 2. The station **generates its own keypair**, builds a **CSR**, and POSTs the CSR to perchpub's enrollment endpoint.
 3. perchpub asks its step-ca CA to sign the CSR and returns the **leaf certificate** + CA chain.
 4. Forever after, the station presents that leaf (with its private key) on every media upload over mTLS.
